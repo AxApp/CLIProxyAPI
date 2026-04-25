@@ -579,6 +579,24 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 	if v, ok := metadata["access_token"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
+	if tokensRaw, ok := metadata["tokens"]; ok && tokensRaw != nil {
+		switch typed := tokensRaw.(type) {
+		case map[string]any:
+			if v, ok := typed["access_token"].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+			if v, ok := typed["accessToken"].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		case map[string]string:
+			if v := strings.TrimSpace(typed["access_token"]); v != "" {
+				return v
+			}
+			if v := strings.TrimSpace(typed["accessToken"]); v != "" {
+				return v
+			}
+		}
+	}
 	if tokenRaw, ok := metadata["token"]; ok && tokenRaw != nil {
 		switch typed := tokenRaw.(type) {
 		case string:

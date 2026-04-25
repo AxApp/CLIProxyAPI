@@ -210,3 +210,53 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }
+
+func TestTokenValueFromMetadataSupportsNestedTokens(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     string
+	}{
+		{
+			name: "tokens access_token map any",
+			metadata: map[string]any{
+				"tokens": map[string]any{
+					"access_token": "tok-any",
+				},
+			},
+			want: "tok-any",
+		},
+		{
+			name: "tokens accessToken map any",
+			metadata: map[string]any{
+				"tokens": map[string]any{
+					"accessToken": "tok-camel",
+				},
+			},
+			want: "tok-camel",
+		},
+		{
+			name: "tokens map string",
+			metadata: map[string]any{
+				"tokens": map[string]string{
+					"access_token": "tok-string-map",
+				},
+			},
+			want: "tok-string-map",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := tokenValueFromMetadata(tc.metadata)
+			if got != tc.want {
+				t.Fatalf("tokenValueFromMetadata() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
