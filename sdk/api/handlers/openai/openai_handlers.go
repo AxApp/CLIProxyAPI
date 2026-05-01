@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -62,6 +63,13 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
+	if shouldReturnCodexModels(c) {
+		c.JSON(http.StatusOK, gin.H{
+			"models": buildCodexModelsPayload(allModels),
+		})
+		return
+	}
+
 	// Filter to only include the 4 required fields: id, object, created, owned_by
 	filteredModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
@@ -87,6 +95,131 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 		"object": "list",
 		"data":   filteredModels,
 	})
+}
+
+func shouldReturnCodexModels(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if strings.TrimSpace(c.Query("client_version")) != "" {
+		return true
+	}
+	userAgent := strings.ToLower(strings.TrimSpace(c.GetHeader("User-Agent")))
+	return strings.Contains(userAgent, "codex")
+}
+
+func buildCodexModelsPayload(allModels []map[string]any) []map[string]any {
+	models := make([]map[string]any, 0, len(allModels))
+	for index, model := range allModels {
+		id := strings.TrimSpace(toStringValue(model["id"]))
+		if id == "" {
+			continue
+		}
+
+		info := registry.LookupModelInfo(id, "openai")
+		displayName := id
+		description := ""
+		contextWindow := 0
+		if info != nil {
+			if strings.TrimSpace(info.DisplayName) != "" {
+				displayName = strings.TrimSpace(info.DisplayName)
+			}
+			if strings.TrimSpace(info.Description) != "" {
+				description = strings.TrimSpace(info.Description)
+			}
+			contextWindow = info.ContextLength
+		}
+
+		visibility := "list"
+		if strings.Contains(strings.ToLower(id), "image") {
+			visibility = "hidden"
+		}
+
+		priority := index
+		switch id {
+		case "gpt-5.5":
+			priority = -2
+		case "gpt-5.4":
+			priority = -1
+		}
+
+		modelPayload := map[string]any{
+			"slug":                        id,
+			"display_name":                displayName,
+			"description":                 description,
+			"default_reasoning_level":     "medium",
+			"supported_reasoning_levels":  defaultCodexReasoningLevels(),
+			"shell_type":                  "shell_command",
+			"visibility":                  visibility,
+			"supported_in_api":            true,
+			"priority":                    priority,
+			"additional_speed_tiers":      []string{},
+			"availability_nux":            nil,
+			"upgrade":                     nil,
+			"base_instructions":           defaultCodexBaseInstructions(),
+			"model_messages":              nil,
+			"supports_reasoning_summaries": true,
+			"default_reasoning_summary":   "none",
+			"support_verbosity":           true,
+			"default_verbosity":           "medium",
+			"apply_patch_tool_type":       "freeform",
+			"web_search_tool_type":        "text_and_image",
+			"truncation_policy": map[string]any{
+				"mode":  "tokens",
+				"limit": 10000,
+			},
+			"supports_parallel_tool_calls":  true,
+			"supports_image_detail_original": true,
+			"max_context_window":             nil,
+			"auto_compact_token_limit":       nil,
+			"effective_context_window_percent": 95,
+			"experimental_supported_tools":     []string{},
+			"input_modalities":                 []string{"text", "image"},
+			"supports_search_tool":             true,
+		}
+		if contextWindow > 0 {
+			modelPayload["context_window"] = contextWindow
+			modelPayload["max_context_window"] = contextWindow
+		} else {
+			modelPayload["context_window"] = nil
+		}
+		models = append(models, modelPayload)
+	}
+	return models
+}
+
+func defaultCodexReasoningLevels() []map[string]any {
+	return []map[string]any{
+		{
+			"effort":      "low",
+			"description": "Fast responses with lighter reasoning",
+		},
+		{
+			"effort":      "medium",
+			"description": "Balances speed and reasoning depth for everyday tasks",
+		},
+		{
+			"effort":      "high",
+			"description": "Greater reasoning depth for complex problems",
+		},
+		{
+			"effort":      "xhigh",
+			"description": "Extra high reasoning depth for complex problems",
+		},
+	}
+}
+
+func defaultCodexBaseInstructions() string {
+	return "You are Codex, a coding agent. Help the user complete software engineering tasks in the current environment."
+}
+
+func toStringValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	default:
+		return fmt.Sprint(value)
+	}
 }
 
 // ChatCompletions handles the /v1/chat/completions endpoint.
