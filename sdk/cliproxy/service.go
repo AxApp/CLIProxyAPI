@@ -1716,11 +1716,6 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 		key := strings.ToLower(id)
 		entries := forward[key]
 		if len(entries) == 0 {
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, model)
 			continue
 		}
 

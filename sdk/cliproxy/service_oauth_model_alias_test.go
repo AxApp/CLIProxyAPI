@@ -30,6 +30,28 @@ func TestApplyOAuthModelAlias_Rename(t *testing.T) {
 	}
 }
 
+func TestApplyOAuthModelAlias_DropsUnmappedModelsWhenAliasConfigured(t *testing.T) {
+	cfg := &config.Config{
+		OAuthModelAlias: map[string][]config.OAuthModelAlias{
+			"codex": {
+				{Name: "gpt-5-mini", Alias: "g5-mini"},
+			},
+		},
+	}
+	models := []*ModelInfo{
+		{ID: "gpt-5", Name: "models/gpt-5"},
+		{ID: "gpt-5-mini", Name: "models/gpt-5-mini"},
+	}
+
+	out := applyOAuthModelAlias(cfg, "codex", "oauth", models)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(out))
+	}
+	if out[0].ID != "g5-mini" {
+		t.Fatalf("expected mapped alias %q, got %q", "g5-mini", out[0].ID)
+	}
+}
+
 func TestApplyOAuthModelAlias_ForkAddsAlias(t *testing.T) {
 	cfg := &config.Config{
 		OAuthModelAlias: map[string][]config.OAuthModelAlias{

@@ -331,7 +331,9 @@ nonstream-keepalive-interval: 0
 #       to: "gemini-2.5-flash"
 
 # Global OAuth model name aliases (per channel)
-# These aliases rename model IDs for both model listing and request routing.
+# These aliases rename model IDs for both model listing and request routing. If a channel has
+# aliases configured, only mapped aliases are exposed by default; unmapped original model names are
+# hidden unless an entry sets fork: true.
 # Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
 # NOTE: Aliases do not apply to gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, or ampcode.
 # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
