@@ -270,6 +270,18 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
+	if picked, active := shard.pickRoutePolicyLocked(ctx, RoutePolicyRequest{
+		Provider: providerKey,
+		Model:    model,
+		Options:  opts,
+		Tried:    tried,
+		Now:      time.Now(),
+	}, preferWebsocket, predicate); active {
+		if picked != nil {
+			return picked, nil
+		}
+		return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	}
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		return picked, nil
 	}
@@ -352,6 +364,12 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			bestPriority = priorityReady
 			hasCandidate = true
 		}
+	}
+	if picked, providerKey, active := s.pickMixedRoutePolicyLocked(ctx, normalized, model, opts, tried, candidateShards, predicate); active {
+		if picked != nil {
+			return picked, providerKey, nil
+		}
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
 	if !hasCandidate {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
@@ -460,6 +478,42 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		return newModelCooldownError(model, "", resetIn)
 	}
 	return &Error{Code: "auth_unavailable", Message: "no auth available"}
+}
+
+func (s *authScheduler) pickMixedRoutePolicyLocked(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, shards []*modelScheduler, predicate func(*scheduledAuth) bool) (*Auth, string, bool) {
+	if s == nil || len(shards) == 0 {
+		return nil, "", false
+	}
+	entries := make([]*scheduledAuth, 0)
+	providerByAuthID := make(map[string]string)
+	for index, shard := range shards {
+		if shard == nil || index >= len(providers) {
+			continue
+		}
+		providerKey := providers[index]
+		for _, entry := range shard.readyCandidatesLocked(false, predicate) {
+			if entry == nil || entry.auth == nil {
+				continue
+			}
+			entries = append(entries, entry)
+			providerByAuthID[entry.auth.ID] = providerKey
+		}
+	}
+	rewritten, active := rewriteScheduledAuths(ctx, RoutePolicyRequest{
+		Provider:  "mixed",
+		Providers: append([]string(nil), providers...),
+		Model:     model,
+		Options:   opts,
+		Tried:     tried,
+		Now:       time.Now(),
+	}, entries)
+	if !active {
+		return nil, "", false
+	}
+	if len(rewritten) == 0 || rewritten[0] == nil || rewritten[0].auth == nil {
+		return nil, "", true
+	}
+	return rewritten[0].auth, providerByAuthID[rewritten[0].auth.ID], true
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -767,6 +821,63 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		return nil
 	}
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+}
+
+func (m *modelScheduler) pickRoutePolicyLocked(ctx context.Context, req RoutePolicyRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool) (*Auth, bool) {
+	if m == nil {
+		return nil, false
+	}
+	entries := m.readyCandidatesLocked(preferWebsocket, predicate)
+	rewritten, active := rewriteScheduledAuths(ctx, req, entries)
+	if !active {
+		return nil, false
+	}
+	if len(rewritten) == 0 || rewritten[0] == nil {
+		return nil, true
+	}
+	return rewritten[0].auth, true
+}
+
+func (m *modelScheduler) readyCandidatesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []*scheduledAuth {
+	if m == nil {
+		return nil
+	}
+	m.promoteExpiredLocked(time.Now())
+	out := make([]*scheduledAuth, 0)
+	seen := make(map[string]struct{})
+	appendView := func(view readyView) {
+		for _, entry := range view.flat {
+			if entry == nil || entry.auth == nil || !predicate(entry) {
+				continue
+			}
+			id := strings.TrimSpace(entry.auth.ID)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, entry)
+		}
+	}
+	if preferWebsocket {
+		for _, priority := range m.priorityOrder {
+			bucket := m.readyByPriority[priority]
+			if bucket == nil {
+				continue
+			}
+			appendView(bucket.ws)
+		}
+	}
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+		appendView(bucket.all)
+	}
+	return out
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.

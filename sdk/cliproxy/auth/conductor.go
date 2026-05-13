@@ -104,6 +104,8 @@ type Result struct {
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
+	// Latency records the upstream execution duration when available.
+	Latency time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
 }
@@ -806,7 +808,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, latency time.Duration) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -819,7 +821,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: latency})
 			}
 			if !forward {
 				return false
@@ -849,7 +851,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Latency: latency})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -865,6 +867,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
+		startedAt := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -874,7 +877,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: time.Since(startedAt)}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -885,6 +888,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		latency := time.Since(startedAt)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -895,7 +899,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: latency}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -906,7 +910,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: latency}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -917,7 +921,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: latency}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
@@ -926,7 +930,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Latency: latency}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -941,7 +945,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, latency), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1370,8 +1374,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			startedAt := time.Now()
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Latency: time.Since(startedAt)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1458,8 +1463,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			startedAt := time.Now()
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Latency: time.Since(startedAt)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -3580,8 +3586,9 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, len(models) > 1)
 			execReq := req
 			execReq.Model = upstreamModel
+			startedAt := time.Now()
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil, Latency: time.Since(startedAt)}
 			if errExec != nil {
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
