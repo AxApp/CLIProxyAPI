@@ -50,15 +50,16 @@ import (
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
 
 type serverOptionConfig struct {
-	extraMiddleware      []gin.HandlerFunc
-	engineConfigurator   func(*gin.Engine)
-	routerConfigurator   func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
-	requestLoggerFactory func(*config.Config, string) logging.RequestLogger
-	localPassword        string
-	keepAliveEnabled     bool
-	keepAliveTimeout     time.Duration
-	keepAliveOnTimeout   func()
-	postAuthHook         auth.PostAuthHook
+	extraMiddleware              []gin.HandlerFunc
+	engineConfigurator           func(*gin.Engine)
+	routerConfigurator           func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
+	managementRouterConfigurator func(*gin.RouterGroup, *handlers.BaseAPIHandler, *config.Config)
+	requestLoggerFactory         func(*config.Config, string) logging.RequestLogger
+	localPassword                string
+	keepAliveEnabled             bool
+	keepAliveTimeout             time.Duration
+	keepAliveOnTimeout           func()
+	postAuthHook                 auth.PostAuthHook
 }
 
 // ServerOption customises HTTP server construction.
@@ -90,6 +91,14 @@ func WithEngineConfigurator(fn func(*gin.Engine)) ServerOption {
 func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.routerConfigurator = fn
+	}
+}
+
+// WithManagementRouterConfigurator appends a callback when authenticated
+// management routes are registered.
+func WithManagementRouterConfigurator(fn func(*gin.RouterGroup, *handlers.BaseAPIHandler, *config.Config)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.managementRouterConfigurator = fn
 	}
 }
 
@@ -160,6 +169,8 @@ type Server struct {
 
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
+
+	managementRouterConfigurator func(*gin.RouterGroup, *handlers.BaseAPIHandler, *config.Config)
 
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
@@ -256,16 +267,17 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create server instance
 	s := &Server{
-		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
-		cfg:                 cfg,
-		accessManager:       accessManager,
-		requestLogger:       requestLogger,
-		loggerToggle:        toggle,
-		configFilePath:      configFilePath,
-		currentPath:         wd,
-		envManagementSecret: envManagementSecret,
-		wsRoutes:            make(map[string]struct{}),
+		engine:                       engine,
+		handlers:                     handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
+		cfg:                          cfg,
+		accessManager:                accessManager,
+		requestLogger:                requestLogger,
+		loggerToggle:                 toggle,
+		configFilePath:               configFilePath,
+		managementRouterConfigurator: optionState.managementRouterConfigurator,
+		currentPath:                  wd,
+		envManagementSecret:          envManagementSecret,
+		wsRoutes:                     make(map[string]struct{}),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -561,6 +573,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+
+		if s.managementRouterConfigurator != nil {
+			s.managementRouterConfigurator(mgmt, s.handlers, s.cfg)
+		}
 
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)

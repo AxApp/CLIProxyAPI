@@ -30,6 +30,12 @@ func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *conf
 	return internalapi.WithRouterConfigurator(fn)
 }
 
+// WithManagementRouterConfigurator appends a callback when authenticated
+// management routes are registered.
+func WithManagementRouterConfigurator(fn func(*gin.RouterGroup, *handlers.BaseAPIHandler, *config.Config)) ServerOption {
+	return internalapi.WithManagementRouterConfigurator(fn)
+}
+
 // WithLocalManagementPassword stores a runtime-only management password accepted for localhost requests.
 func WithLocalManagementPassword(password string) ServerOption {
 	return internalapi.WithLocalManagementPassword(password)

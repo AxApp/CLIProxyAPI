@@ -503,6 +503,13 @@ func main() {
 			log.Errorf("failed to install usage persistence hook: %v", err)
 			return
 		}
+		if err = gettokenshooks.InstallUsageAttributionHook(gettokenshooks.UsageAttributionOptions{
+			ConfigFilePath: configFilePath,
+			WritableBase:   writableBase,
+		}); err != nil {
+			log.Errorf("failed to install usage attribution hook: %v", err)
+			return
+		}
 	}
 	gettokenshooks.InstallRoutePolicyHook()
 
