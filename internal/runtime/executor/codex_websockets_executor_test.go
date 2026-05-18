@@ -556,3 +556,16 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
 	}
 }
+
+func TestNewProxyAwareWebsocketDialerUsesSystemProxyWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	dialer := newProxyAwareWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{UseSystemProxy: true}},
+		nil,
+	)
+
+	if dialer.Proxy == nil {
+		t.Fatal("expected websocket dialer to use system proxy function")
+	}
+}

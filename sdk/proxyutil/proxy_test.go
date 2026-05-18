@@ -1,6 +1,8 @@
 package proxyutil
 
 import (
+	"bufio"
+	"net"
 	"net/http"
 	"testing"
 )
@@ -157,5 +159,57 @@ func TestBuildHTTPTransportSOCKS5HProxy(t *testing.T) {
 	}
 	if transport.DialContext == nil {
 		t.Fatal("expected SOCKS5H transport to have custom DialContext")
+	}
+}
+
+func TestBuildDialerHTTPProxyUsesConnect(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("net.Listen returned error: %v", errListen)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	connectCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			errCh <- errAccept
+			return
+		}
+		defer conn.Close()
+
+		req, errRead := http.ReadRequest(bufio.NewReader(conn))
+		if errRead != nil {
+			errCh <- errRead
+			return
+		}
+		connectCh <- req.Host
+		_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}()
+
+	dialer, mode, errBuild := BuildDialer("http://" + listener.Addr().String())
+	if errBuild != nil {
+		t.Fatalf("BuildDialer returned error: %v", errBuild)
+	}
+	if mode != ModeProxy {
+		t.Fatalf("mode = %d, want %d", mode, ModeProxy)
+	}
+
+	conn, errDial := dialer.Dial("tcp", "api.example.com:443")
+	if errDial != nil {
+		t.Fatalf("dialer.Dial returned error: %v", errDial)
+	}
+	_ = conn.Close()
+
+	select {
+	case got := <-connectCh:
+		if got != "api.example.com:443" {
+			t.Fatalf("CONNECT host = %q, want api.example.com:443", got)
+		}
+	case err := <-errCh:
+		t.Fatalf("proxy server returned error: %v", err)
 	}
 }

@@ -23,6 +23,9 @@ func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 	}
+	if transport == nil && cfg.UseSystemProxy {
+		transport = proxyutil.NewSystemTransport()
+	}
 	if transport != nil {
 		httpClient.Transport = transport
 	}

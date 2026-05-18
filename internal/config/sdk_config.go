@@ -9,6 +9,11 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// UseSystemProxy allows outbound requests to follow the operating system proxy
+	// when no auth-level or config-level proxy-url is configured. Explicit "direct"
+	// still bypasses all proxies.
+	UseSystemProxy bool `yaml:"use-system-proxy" json:"use-system-proxy"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:

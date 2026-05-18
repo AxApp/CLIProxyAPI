@@ -25,7 +25,7 @@ type utlsRoundTripper struct {
 	dialer      proxy.Dialer
 }
 
-func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+func newUtlsRoundTripper(proxyURL string, useSystemProxy bool) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
@@ -34,6 +34,8 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
 			dialer = proxyDialer
 		}
+	} else if useSystemProxy {
+		dialer = proxyutil.BuildSystemDialer("https")
 	}
 	return &utlsRoundTripper{
 		connections: make(map[string]*http2.ClientConn),
@@ -161,7 +163,8 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	utlsRT := newUtlsRoundTripper(proxyURL)
+	useSystemProxy := cfg != nil && cfg.UseSystemProxy
+	utlsRT := newUtlsRoundTripper(proxyURL, useSystemProxy)
 
 	var standardTransport http.RoundTripper = &http.Transport{
 		DialContext: (&net.Dialer{
@@ -173,6 +176,8 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		if transport := buildProxyTransport(proxyURL); transport != nil {
 			standardTransport = transport
 		}
+	} else if useSystemProxy {
+		standardTransport = proxyutil.NewSystemTransport()
 	}
 
 	client := &http.Client{

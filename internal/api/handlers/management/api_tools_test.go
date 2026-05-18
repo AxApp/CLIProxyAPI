@@ -157,6 +157,25 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 	}
 }
 
+func TestAPICallTransportUsesSystemProxyWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{UseSystemProxy: true},
+		},
+	}
+
+	transport := h.apiCallTransport(nil)
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy == nil {
+		t.Fatal("expected system proxy transport to provide a proxy function")
+	}
+}
+
 func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	t.Parallel()
 

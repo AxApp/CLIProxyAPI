@@ -739,6 +739,9 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 	if proxyURL == "" {
+		if cfg != nil && cfg.UseSystemProxy {
+			dialer.Proxy = proxyutil.ProxyFromSystem
+		}
 		return dialer
 	}
 

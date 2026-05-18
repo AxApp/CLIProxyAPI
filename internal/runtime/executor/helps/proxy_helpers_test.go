@@ -28,3 +28,22 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 		t.Fatal("expected direct transport to disable proxy function")
 	}
 }
+
+func TestNewProxyAwareHTTPClientUsesSystemProxyWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	client := NewProxyAwareHTTPClient(
+		context.Background(),
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{UseSystemProxy: true}},
+		nil,
+		0,
+	)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("expected system proxy transport to provide a proxy function")
+	}
+}

@@ -16,6 +16,7 @@ import (
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
 // 3. Use RoundTripper from context if neither are configured
+// 4. Use the operating system proxy when cfg.UseSystemProxy is enabled
 //
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
@@ -56,6 +57,11 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
+		return httpClient
+	}
+
+	if cfg != nil && cfg.UseSystemProxy {
+		httpClient.Transport = proxyutil.NewSystemTransport()
 	}
 
 	return httpClient

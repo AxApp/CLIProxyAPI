@@ -1,7 +1,10 @@
 package proxyutil
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,6 +33,12 @@ type Setting struct {
 	Raw  string
 	Mode Mode
 	URL  *url.URL
+}
+
+type dialerFunc func(network, addr string) (net.Conn, error)
+
+func (f dialerFunc) Dial(network, addr string) (net.Conn, error) {
+	return f(network, addr)
 }
 
 // Parse normalizes a proxy configuration value into inherit, direct, or proxy modes.
@@ -80,6 +89,53 @@ func NewDirectTransport() *http.Transport {
 	clone := cloneDefaultTransport()
 	clone.Proxy = nil
 	return clone
+}
+
+// NewSystemTransport returns a transport that follows environment proxies and,
+// on supported platforms, the operating system proxy configuration.
+func NewSystemTransport() *http.Transport {
+	clone := cloneDefaultTransport()
+	clone.Proxy = ProxyFromSystem
+	return clone
+}
+
+// ProxyFromSystem resolves the proxy for req from standard environment
+// variables first, then from the operating system proxy settings when available.
+func ProxyFromSystem(req *http.Request) (*url.URL, error) {
+	if req == nil {
+		return nil, nil
+	}
+	if proxyURL, errProxy := http.ProxyFromEnvironment(req); errProxy != nil || proxyURL != nil {
+		return proxyURL, errProxy
+	}
+	return proxyFromOperatingSystem(req.URL)
+}
+
+// BuildSystemDialer constructs a connection-layer dialer that resolves the
+// current environment or operating-system proxy at dial time.
+func BuildSystemDialer(targetScheme string) proxy.Dialer {
+	scheme := strings.TrimSpace(targetScheme)
+	if scheme == "" {
+		scheme = "https"
+	}
+	return dialerFunc(func(network, addr string) (net.Conn, error) {
+		targetURL := &url.URL{Scheme: scheme, Host: addr}
+		proxyURL, errProxy := ProxyFromSystem(&http.Request{URL: targetURL})
+		if errProxy != nil {
+			return nil, errProxy
+		}
+		if proxyURL == nil {
+			return proxy.Direct.Dial(network, addr)
+		}
+		proxyDialer, mode, errBuild := BuildDialer(proxyURL.String())
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		if mode == ModeDirect || mode == ModeInherit || proxyDialer == nil {
+			return proxy.Direct.Dial(network, addr)
+		}
+		return proxyDialer.Dial(network, addr)
+	})
 }
 
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
@@ -134,12 +190,85 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 	case ModeDirect:
 		return proxy.Direct, setting.Mode, nil
 	case ModeProxy:
-		dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
-		if errDialer != nil {
-			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
+		switch setting.URL.Scheme {
+		case "http", "https":
+			return httpConnectDialer{proxyURL: setting.URL}, setting.Mode, nil
+		default:
+			dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
+			if errDialer != nil {
+				return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
+			}
+			return dialer, setting.Mode, nil
 		}
-		return dialer, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
+	}
+}
+
+type httpConnectDialer struct {
+	proxyURL *url.URL
+}
+
+func (d httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	if d.proxyURL == nil {
+		return proxy.Direct.Dial(network, addr)
+	}
+	conn, errDial := proxy.Direct.Dial(network, httpProxyAddress(d.proxyURL))
+	if errDial != nil {
+		return nil, errDial
+	}
+
+	if d.proxyURL.Scheme == "https" {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
+		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+			_ = conn.Close()
+			return nil, errHandshake
+		}
+		conn = tlsConn
+	}
+
+	request := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: addr},
+		Host:   addr,
+		Header: make(http.Header),
+	}
+	request.Header.Set("Proxy-Connection", "Keep-Alive")
+	if d.proxyURL.User != nil {
+		username := d.proxyURL.User.Username()
+		password, _ := d.proxyURL.User.Password()
+		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
+	}
+	if errWrite := request.Write(conn); errWrite != nil {
+		_ = conn.Close()
+		return nil, errWrite
+	}
+
+	response, errRead := http.ReadResponse(bufio.NewReader(conn), request)
+	if errRead != nil {
+		_ = conn.Close()
+		return nil, errRead
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", response.Status)
+	}
+
+	return conn, nil
+}
+
+func httpProxyAddress(proxyURL *url.URL) string {
+	if proxyURL == nil {
+		return ""
+	}
+	if proxyURL.Port() != "" {
+		return proxyURL.Host
+	}
+	switch proxyURL.Scheme {
+	case "https":
+		return net.JoinHostPort(proxyURL.Hostname(), "443")
+	default:
+		return net.JoinHostPort(proxyURL.Hostname(), "80")
 	}
 }

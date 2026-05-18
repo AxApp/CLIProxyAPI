@@ -88,7 +88,8 @@ type apiCallResponse struct {
 // Proxy selection (highest priority first):
 //  1. Selected credential proxy_url
 //  2. Global config proxy-url
-//  3. Direct connect (environment proxies are not used)
+//  3. System proxy when use-system-proxy is enabled
+//  4. Direct connect
 //
 // Response JSON (returned with HTTP 200 when the APICall itself succeeds):
 //   - status_code: Upstream HTTP status code.
@@ -671,6 +672,10 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 		if transport := buildProxyTransport(proxyStr); transport != nil {
 			return transport
 		}
+	}
+
+	if h != nil && h.cfg != nil && h.cfg.UseSystemProxy {
+		return proxyutil.NewSystemTransport()
 	}
 
 	transport, ok := http.DefaultTransport.(*http.Transport)
