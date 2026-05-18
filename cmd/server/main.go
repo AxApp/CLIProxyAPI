@@ -510,6 +510,13 @@ func main() {
 			log.Errorf("failed to install usage attribution hook: %v", err)
 			return
 		}
+		if err = gettokenshooks.InstallRateLimitHook(gettokenshooks.UsageAttributionOptions{
+			ConfigFilePath: configFilePath,
+			WritableBase:   writableBase,
+		}); err != nil {
+			log.Errorf("failed to install rate limit hook: %v", err)
+			return
+		}
 	}
 	gettokenshooks.InstallRoutePolicyHook()
 

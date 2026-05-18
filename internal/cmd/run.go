@@ -30,7 +30,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword).
-		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureUsageAttributionRoutes))
+		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureGetTokensManagementRoutes))
 
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -64,7 +64,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword).
-		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureUsageAttributionRoutes))
+		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureGetTokensManagementRoutes))
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
