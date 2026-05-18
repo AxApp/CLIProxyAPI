@@ -1,6 +1,54 @@
 package auth
 
-import "testing"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestFileTokenStoreListCodexDoesNotInjectWebsocketsByDefault(t *testing.T) {
+	baseDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(baseDir, "codex.json"), []byte(`{"type":"codex","email":"codex@example.com"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	if got, ok := auths[0].Attributes["websockets"]; ok {
+		t.Fatalf("websockets attribute should be absent by default, got %q", got)
+	}
+}
+
+func TestFileTokenStoreListCodexKeepsExplicitWebsocketsInMetadata(t *testing.T) {
+	baseDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(baseDir, "codex.json"), []byte(`{"type":"codex","email":"codex@example.com","websockets":false}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	if got, ok := auths[0].Attributes["websockets"]; ok {
+		t.Fatalf("websockets attribute should be absent when disabled, got %q", got)
+	}
+	if got, ok := auths[0].Metadata["websockets"].(bool); !ok || got {
+		t.Fatalf("expected websockets=false metadata to be preserved, got %#v", auths[0].Metadata["websockets"])
+	}
+}
 
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()

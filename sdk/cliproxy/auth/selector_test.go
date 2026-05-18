@@ -180,6 +180,90 @@ func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	}
 }
 
+func TestAuthWebsocketsEnabled_CodexAuthFileFollowsDownstreamUnlessExplicitlyDisabled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		auth *Auth
+		want bool
+	}{
+		{
+			name: "codex auth file defaults enabled",
+			auth: &Auth{
+				ID:       "codex-auth.json",
+				Provider: "codex",
+				FileName: "codex-auth.json",
+				Metadata: map[string]any{"type": "codex"},
+			},
+			want: true,
+		},
+		{
+			name: "codex auth file explicit false disables",
+			auth: &Auth{
+				ID:       "codex-auth.json",
+				Provider: "codex",
+				FileName: "codex-auth.json",
+				Metadata: map[string]any{"type": "codex", "websockets": false},
+			},
+			want: false,
+		},
+		{
+			name: "codex api key without explicit websockets stays disabled",
+			auth: &Auth{
+				ID:       "codex-api-key",
+				Provider: "codex",
+				Attributes: map[string]string{
+					"source":  "config:codex[abc]",
+					"api_key": "sk-test",
+				},
+			},
+			want: false,
+		},
+		{
+			name: "codex api key explicit websockets enabled",
+			auth: &Auth{
+				ID:       "codex-api-key",
+				Provider: "codex",
+				Attributes: map[string]string{
+					"source":     "config:codex[abc]",
+					"api_key":    "sk-test",
+					"websockets": "true",
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := authWebsocketsEnabled(tt.auth); got != tt.want {
+				t.Fatalf("authWebsocketsEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWebsocketsAllowedForRequestRequiresDownstreamWebsocket(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		ID:       "codex-auth.json",
+		Provider: "codex",
+		FileName: "codex-auth.json",
+		Metadata: map[string]any{"type": "codex"},
+	}
+
+	if WebsocketsAllowedForRequest(context.Background(), auth) {
+		t.Fatalf("expected non-websocket downstream request to stay on HTTP")
+	}
+	if !WebsocketsAllowedForRequest(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth) {
+		t.Fatalf("expected codex auth-file to follow downstream websocket request")
+	}
+}
+
 func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	t.Parallel()
 

@@ -418,6 +418,72 @@ func TestFileSynthesizer_Synthesize_OAuthExcludedModelsMerged(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_CodexAuthFileDoesNotInjectWebsocketsByDefault(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":  "codex",
+		"email": "codex@example.com",
+	}
+	data, _ := json.Marshal(authData)
+	if errWriteFile := os.WriteFile(filepath.Join(tempDir, "codex-auth.json"), data, 0o600); errWriteFile != nil {
+		t.Fatalf("failed to write auth file: %v", errWriteFile)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, errSynthesize := synth.Synthesize(ctx)
+	if errSynthesize != nil {
+		t.Fatalf("unexpected error: %v", errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if got, ok := auths[0].Attributes["websockets"]; ok {
+		t.Fatalf("expected websockets attribute to be absent by default, got %q", got)
+	}
+}
+
+func TestFileSynthesizer_CodexAuthFileKeepsExplicitWebsocketsInMetadata(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":       "codex",
+		"email":      "codex@example.com",
+		"websockets": false,
+	}
+	data, _ := json.Marshal(authData)
+	if errWriteFile := os.WriteFile(filepath.Join(tempDir, "codex-auth.json"), data, 0o600); errWriteFile != nil {
+		t.Fatalf("failed to write auth file: %v", errWriteFile)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, errSynthesize := synth.Synthesize(ctx)
+	if errSynthesize != nil {
+		t.Fatalf("unexpected error: %v", errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if got, ok := auths[0].Attributes["websockets"]; ok {
+		t.Fatalf("expected websockets attribute to be absent when disabled, got %q", got)
+	}
+	if got, ok := auths[0].Metadata["websockets"].(bool); !ok || got {
+		t.Fatalf("expected websockets=false metadata to be preserved, got %#v", auths[0].Metadata["websockets"])
+	}
+}
+
 func TestSynthesizeGeminiVirtualAuths_NilInputs(t *testing.T) {
 	now := time.Now()
 
