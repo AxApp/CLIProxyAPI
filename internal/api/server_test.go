@@ -240,6 +240,74 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 	}
 }
 
+func TestRootOpenAICompatibilityNoRouteRewritesKnownPaths(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	engine.GET("/v1/models", func(c *gin.Context) {
+		c.String(http.StatusOK, c.Request.URL.Path+"?"+c.Request.URL.RawQuery)
+	})
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		c.String(http.StatusOK, c.Request.URL.Path)
+	})
+	engine.POST("/v1/responses/compact", func(c *gin.Context) {
+		c.String(http.StatusOK, c.Request.URL.Path)
+	})
+	engine.NoRoute(rootOpenAICompatibilityNoRoute(engine))
+
+	testCases := []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "models keeps query",
+			method:     http.MethodGet,
+			path:       "/models?client_version=1",
+			wantStatus: http.StatusOK,
+			wantBody:   "/v1/models?client_version=1",
+		},
+		{
+			name:       "responses post",
+			method:     http.MethodPost,
+			path:       "/responses",
+			wantStatus: http.StatusOK,
+			wantBody:   "/v1/responses",
+		},
+		{
+			name:       "responses compact post",
+			method:     http.MethodPost,
+			path:       "/responses/compact",
+			wantStatus: http.StatusOK,
+			wantBody:   "/v1/responses/compact",
+		},
+		{
+			name:       "unknown path stays not found",
+			method:     http.MethodGet,
+			path:       "/unknown",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			rr := httptest.NewRecorder()
+			engine.ServeHTTP(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, tc.wantStatus, rr.Body.String())
+			}
+			if tc.wantBody != "" && rr.Body.String() != tc.wantBody {
+				t.Fatalf("body = %q, want %q", rr.Body.String(), tc.wantBody)
+			}
+		})
+	}
+}
+
 func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()
 	clientID := "test-client-version-catalog"

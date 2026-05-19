@@ -243,16 +243,24 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 			// Convert tool structure from responses format to chat completions format
 			function := []byte(`{"name":"","description":"","parameters":{}}`)
+			functionSource := tool
+			if nestedFunction := tool.Get("function"); nestedFunction.Exists() && nestedFunction.IsObject() {
+				functionSource = nestedFunction
+			}
 
-			if name := tool.Get("name"); name.Exists() {
+			if name := functionSource.Get("name"); name.Exists() {
 				function, _ = sjson.SetBytes(function, "name", name.String())
 			}
 
-			if description := tool.Get("description"); description.Exists() {
+			if strings.TrimSpace(gjson.GetBytes(function, "name").String()) == "" {
+				return true
+			}
+
+			if description := functionSource.Get("description"); description.Exists() {
 				function, _ = sjson.SetBytes(function, "description", description.String())
 			}
 
-			if parameters := tool.Get("parameters"); parameters.Exists() {
+			if parameters := functionSource.Get("parameters"); parameters.Exists() {
 				function, _ = sjson.SetRawBytes(function, "parameters", []byte(parameters.Raw))
 			}
 

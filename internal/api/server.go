@@ -338,6 +338,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
 	}
 
+	engine.NoRoute(rootOpenAICompatibilityNoRoute(engine))
+
 	// Create HTTP server
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
@@ -367,6 +369,40 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func rootOpenAICompatibilityNoRoute(engine *gin.Engine) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		targetPath, ok := rootOpenAICompatibilityPath(c.Request.Method, c.Request.URL.Path)
+		if !ok {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+
+		c.Request.URL.Path = targetPath
+		c.Request.RequestURI = c.Request.URL.RequestURI()
+		engine.HandleContext(c)
+	}
+}
+
+func rootOpenAICompatibilityPath(method string, path string) (string, bool) {
+	switch method {
+	case http.MethodGet:
+		switch path {
+		case "/models":
+			return "/v1/models", true
+		case "/responses":
+			return "/v1/responses", true
+		}
+	case http.MethodPost:
+		switch path {
+		case "/responses":
+			return "/v1/responses", true
+		case "/responses/compact":
+			return "/v1/responses/compact", true
+		}
+	}
+	return "", false
 }
 
 // setupRoutes configures the API routes for the server.
