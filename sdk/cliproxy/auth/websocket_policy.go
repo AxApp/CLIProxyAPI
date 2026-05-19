@@ -26,7 +26,7 @@ func AuthDataAllowsWebsockets(provider string, fileName string, attributes map[s
 	if enabled, ok := explicitWebsocketsSetting(attributes, metadata); ok {
 		return enabled
 	}
-	return isCodexAuthFileData(provider, fileName, attributes, metadata)
+	return strings.EqualFold(strings.TrimSpace(provider), "codex")
 }
 
 func authWebsocketsEnabled(auth *Auth) bool {
@@ -60,30 +60,4 @@ func explicitWebsocketsSetting(attributes map[string]string, metadata map[string
 	default:
 	}
 	return false, false
-}
-
-func isCodexAuthFileData(provider string, fileName string, attributes map[string]string, metadata map[string]any) bool {
-	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		return false
-	}
-	if metadata != nil {
-		if t, _ := metadata["type"].(string); strings.EqualFold(strings.TrimSpace(t), "codex") {
-			return true
-		}
-	}
-	if len(attributes) > 0 {
-		if strings.TrimSpace(attributes["api_key"]) != "" {
-			return false
-		}
-		for _, key := range []string{"path", "source"} {
-			value := strings.TrimSpace(attributes[key])
-			if value == "" || strings.HasPrefix(strings.ToLower(value), "config:") {
-				continue
-			}
-			if strings.HasSuffix(strings.ToLower(value), ".json") {
-				return true
-			}
-		}
-	}
-	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(fileName)), ".json")
 }

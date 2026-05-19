@@ -180,7 +180,7 @@ func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	}
 }
 
-func TestAuthWebsocketsEnabled_CodexAuthFileFollowsDownstreamUnlessExplicitlyDisabled(t *testing.T) {
+func TestAuthWebsocketsEnabled_CodexProviderFollowsDownstreamUnlessExplicitlyDisabled(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -209,13 +209,26 @@ func TestAuthWebsocketsEnabled_CodexAuthFileFollowsDownstreamUnlessExplicitlyDis
 			want: false,
 		},
 		{
-			name: "codex api key without explicit websockets stays disabled",
+			name: "codex api key defaults enabled",
 			auth: &Auth{
 				ID:       "codex-api-key",
 				Provider: "codex",
 				Attributes: map[string]string{
 					"source":  "config:codex[abc]",
 					"api_key": "sk-test",
+				},
+			},
+			want: true,
+		},
+		{
+			name: "codex api key explicit false disables",
+			auth: &Auth{
+				ID:       "codex-api-key",
+				Provider: "codex",
+				Attributes: map[string]string{
+					"source":     "config:codex[abc]",
+					"api_key":    "sk-test",
+					"websockets": "false",
 				},
 			},
 			want: false,
@@ -261,6 +274,18 @@ func TestWebsocketsAllowedForRequestRequiresDownstreamWebsocket(t *testing.T) {
 	}
 	if !WebsocketsAllowedForRequest(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth) {
 		t.Fatalf("expected codex auth-file to follow downstream websocket request")
+	}
+
+	apiKeyAuth := &Auth{
+		ID:       "codex-api-key",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"source":  "config:codex[abc]",
+			"api_key": "sk-test",
+		},
+	}
+	if !WebsocketsAllowedForRequest(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), apiKeyAuth) {
+		t.Fatalf("expected codex api-key to follow downstream websocket request")
 	}
 }
 

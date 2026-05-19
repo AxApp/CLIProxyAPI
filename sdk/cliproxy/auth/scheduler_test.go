@@ -182,18 +182,18 @@ func TestSchedulerPick_GeminiVirtualParentUsesTwoLevelRotation(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T) {
+func TestSchedulerPick_CodexWebsocketSkipsExplicitlyDisabledAuths(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
 		&RoundRobinSelector{},
-		&Auth{ID: "codex-http", Provider: "codex"},
-		&Auth{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
-		&Auth{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+		&Auth{ID: "codex-disabled", Provider: "codex", Attributes: map[string]string{"websockets": "false"}},
+		&Auth{ID: "codex-api-key-a", Provider: "codex", Attributes: map[string]string{"api_key": "sk-a"}},
+		&Auth{ID: "codex-api-key-b", Provider: "codex", Attributes: map[string]string{"api_key": "sk-b"}},
 	)
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
-	want := []string{"codex-ws-a", "codex-ws-b", "codex-ws-a"}
+	want := []string{"codex-api-key-a", "codex-api-key-b", "codex-api-key-a"}
 	for index, wantID := range want {
 		got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
@@ -208,18 +208,18 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T)
 	}
 }
 
-func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *testing.T) {
+func TestSchedulerPick_CodexWebsocketPreservesPriorityForImplicitWebsocketAuths(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
 		&RoundRobinSelector{},
-		&Auth{ID: "codex-http", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+		&Auth{ID: "codex-api-key", Provider: "codex", Attributes: map[string]string{"priority": "10", "api_key": "sk-high"}},
 		&Auth{ID: "codex-ws-a", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
 		&Auth{ID: "codex-ws-b", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}},
 	)
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
-	want := []string{"codex-ws-a", "codex-ws-b", "codex-ws-a"}
+	want := []string{"codex-api-key", "codex-api-key", "codex-api-key"}
 	for index, wantID := range want {
 		got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
