@@ -59,7 +59,7 @@ func Parse(raw string) (Setting, error) {
 	parsedURL, errParse := url.Parse(trimmed)
 	if errParse != nil {
 		setting.Mode = ModeInvalid
-		return setting, fmt.Errorf("parse proxy URL failed: %w", errParse)
+		return setting, fmt.Errorf("parse proxy URL failed")
 	}
 	if parsedURL.Scheme == "" || parsedURL.Host == "" {
 		setting.Mode = ModeInvalid
@@ -190,16 +190,14 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 	case ModeDirect:
 		return proxy.Direct, setting.Mode, nil
 	case ModeProxy:
-		switch setting.URL.Scheme {
-		case "http", "https":
-			return httpConnectDialer{proxyURL: setting.URL}, setting.Mode, nil
-		default:
-			dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
-			if errDialer != nil {
-				return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
-			}
-			return dialer, setting.Mode, nil
+		if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
+			return &httpConnectDialer{proxyURL: setting.URL, dialer: proxy.Direct}, setting.Mode, nil
 		}
+		dialer, errDialer := proxy.FromURL(setting.URL, proxy.Direct)
+		if errDialer != nil {
+			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
+		}
+		return dialer, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
@@ -207,68 +205,115 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 
 type httpConnectDialer struct {
 	proxyURL *url.URL
+	dialer   proxy.Dialer
 }
 
-func (d httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
-	if d.proxyURL == nil {
-		return proxy.Direct.Dial(network, addr)
-	}
-	conn, errDial := proxy.Direct.Dial(network, httpProxyAddress(d.proxyURL))
+func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	proxyConn, errDial := d.dialer.Dial(network, proxyDialAddr(d.proxyURL))
 	if errDial != nil {
-		return nil, errDial
+		return nil, fmt.Errorf("dial HTTP proxy failed: %w", errDial)
 	}
 
+	conn := proxyConn
 	if d.proxyURL.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: d.proxyURL.Hostname()})
 		if errHandshake := tlsConn.Handshake(); errHandshake != nil {
-			_ = conn.Close()
-			return nil, errHandshake
+			if errClose := conn.Close(); errClose != nil {
+				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w; close failed: %v", errHandshake, errClose)
+			}
+			return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
 		}
 		conn = tlsConn
 	}
 
-	request := &http.Request{
+	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: addr},
 		Host:   addr,
 		Header: make(http.Header),
 	}
-	request.Header.Set("Proxy-Connection", "Keep-Alive")
 	if d.proxyURL.User != nil {
-		username := d.proxyURL.User.Username()
-		password, _ := d.proxyURL.User.Password()
-		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
+		req.Header.Set("Proxy-Authorization", proxyAuthorization(d.proxyURL.User))
 	}
-	if errWrite := request.Write(conn); errWrite != nil {
-		_ = conn.Close()
-		return nil, errWrite
+	if errWrite := req.Write(conn); errWrite != nil {
+		if errClose := conn.Close(); errClose != nil {
+			return nil, fmt.Errorf("write CONNECT request failed: %w; close failed: %v", errWrite, errClose)
+		}
+		return nil, fmt.Errorf("write CONNECT request failed: %w", errWrite)
 	}
 
-	response, errRead := http.ReadResponse(bufio.NewReader(conn), request)
+	reader := bufio.NewReader(conn)
+	resp, errRead := http.ReadResponse(reader, req)
 	if errRead != nil {
-		_ = conn.Close()
-		return nil, errRead
+		if errClose := conn.Close(); errClose != nil {
+			return nil, fmt.Errorf("read CONNECT response failed: %w; close failed: %v", errRead, errClose)
+		}
+		return nil, fmt.Errorf("read CONNECT response failed: %w", errRead)
 	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		_ = conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed: %s", response.Status)
+	if resp.StatusCode != http.StatusOK {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if errClose := conn.Close(); errClose != nil {
+			return nil, fmt.Errorf("proxy CONNECT returned status %s; close failed: %v", resp.Status, errClose)
+		}
+		return nil, fmt.Errorf("proxy CONNECT returned status %s", resp.Status)
 	}
 
+	if reader.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, reader: reader}, nil
+	}
 	return conn, nil
 }
 
-func httpProxyAddress(proxyURL *url.URL) string {
-	if proxyURL == nil {
+func proxyDialAddr(proxyURL *url.URL) string {
+	port := proxyURL.Port()
+	if port == "" {
+		port = "80"
+		if proxyURL.Scheme == "https" {
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(proxyURL.Hostname(), port)
+}
+
+func proxyAuthorization(user *url.Userinfo) string {
+	username := user.Username()
+	password, _ := user.Password()
+	encoded := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return "Basic " + encoded
+}
+
+// Redact returns a log-safe proxy URL with credentials and path-like data removed.
+func Redact(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return ""
 	}
-	if proxyURL.Port() != "" {
-		return proxyURL.Host
+
+	parsedURL, errParse := url.Parse(trimmed)
+	if errParse != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return "<invalid proxy URL>"
 	}
-	switch proxyURL.Scheme {
-	case "https":
-		return net.JoinHostPort(proxyURL.Hostname(), "443")
-	default:
-		return net.JoinHostPort(proxyURL.Hostname(), "80")
+
+	redacted := &url.URL{
+		Scheme: parsedURL.Scheme,
+		Host:   parsedURL.Host,
 	}
+	if parsedURL.User != nil {
+		redacted.User = url.User("redacted")
+	}
+	return redacted.String()
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	if c.reader.Buffered() > 0 {
+		return c.reader.Read(p)
+	}
+	return c.Conn.Read(p)
 }
