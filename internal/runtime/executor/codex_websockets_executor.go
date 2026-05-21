@@ -18,12 +18,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -230,6 +233,21 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	executionSessionID := executionSessionIDFromOptions(opts)
+	liveRequestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
+		ExecutionSessionID:  executionSessionID,
+		Model:               baseModel,
+		AuthID:              authID,
+		AuthLabel:           authLabel,
+		Provider:            e.Identifier(),
+		DownstreamTransport: downstreamTransportName(ctx),
+		UpstreamTransport:   "websocket",
+	})
+	defer func() {
+		if err != nil && liveRequestID != "" {
+			gettokenshooks.RecordCodexLiveRequestCompleted(liveRequestID, coreusage.Detail{}, err)
+		}
+	}()
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
@@ -267,6 +285,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	if liveRequestID != "" {
+		gettokenshooks.RecordCodexLiveUpstreamConnected(liveRequestID)
+	}
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -355,6 +376,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			continue
 		}
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+		if liveRequestID != "" {
+			gettokenshooks.RecordCodexLiveFirstEvent(liveRequestID)
+		}
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
 			if sess != nil {
@@ -369,6 +393,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if eventType == "response.completed" {
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
+				if liveRequestID != "" {
+					gettokenshooks.RecordCodexLiveRequestCompleted(liveRequestID, detail, nil)
+				}
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
@@ -428,6 +455,21 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	authType, authValue = auth.AccountInfo()
 
 	executionSessionID := executionSessionIDFromOptions(opts)
+	liveRequestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
+		ExecutionSessionID:  executionSessionID,
+		Model:               baseModel,
+		AuthID:              authID,
+		AuthLabel:           authLabel,
+		Provider:            e.Identifier(),
+		DownstreamTransport: downstreamTransportName(ctx),
+		UpstreamTransport:   "websocket",
+	})
+	defer func() {
+		if err != nil && liveRequestID != "" {
+			gettokenshooks.RecordCodexLiveRequestCompleted(liveRequestID, coreusage.Detail{}, err)
+		}
+	}()
 	var sess *codexWebsocketSession
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
@@ -473,6 +515,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, errDial
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
+	if liveRequestID != "" {
+		gettokenshooks.RecordCodexLiveUpstreamConnected(liveRequestID)
+	}
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -604,6 +649,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
+			if liveRequestID != "" {
+				gettokenshooks.RecordCodexLiveFirstEvent(liveRequestID)
+			}
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
@@ -622,6 +670,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if eventType == "response.completed" || eventType == "response.done" {
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
+					if liveRequestID != "" {
+						gettokenshooks.RecordCodexLiveRequestCompleted(liveRequestID, detail, nil)
+					}
 				}
 			}
 
@@ -667,6 +718,13 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
 	}
 	return conn.WriteMessage(websocket.TextMessage, payload)
+}
+
+func downstreamTransportName(ctx context.Context) string {
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return "websocket"
+	}
+	return "http"
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {
@@ -1386,6 +1444,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	sess.connMu.Unlock()
 
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
+	gettokenshooks.RecordCodexLiveUpstreamDisconnected(sessionID, err)
 	sess.notifyUpstreamDisconnect(err)
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
@@ -1471,6 +1530,7 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 		return
 	}
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, nil)
+	gettokenshooks.RecordCodexLiveUpstreamDisconnected(sessionID, nil)
 	if errClose := conn.Close(); errClose != nil {
 		log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 	}

@@ -1012,6 +1012,7 @@ func ConfigureRateLimitRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandler
 func ConfigureGetTokensManagementRoutes(group *gin.RouterGroup, handler *handlers.BaseAPIHandler, cfg *config.Config) {
 	ConfigureUsageAttributionRoutes(group, handler, cfg)
 	ConfigureRateLimitRoutes(group, handler, cfg)
+	ConfigureLiveSessionRoutes(group, handler, cfg)
 }
 
 func currentRateLimitRuntime(c *gin.Context) (*rateLimitStore, *RateLimitEvaluator, bool) {

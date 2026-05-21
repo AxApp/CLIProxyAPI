@@ -395,6 +395,7 @@ type usageAttributionPlugin struct {
 }
 
 func (p usageAttributionPlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
+	ObserveCodexLiveUsage(ctx, record)
 	if p.store == nil {
 		return
 	}

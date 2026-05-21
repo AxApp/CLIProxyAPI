@@ -12,7 +12,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -54,6 +56,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientIP := websocketClientAddress(c)
+	gettokenshooks.RecordDownstreamWebsocketConnected(passthroughSessionID, clientIP)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 
 	wsDone := make(chan struct{})
@@ -85,9 +88,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	defer func() {
 		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
+			gettokenshooks.RecordDownstreamWebsocketDisconnected(passthroughSessionID, wsTerminateErr)
 			appendWebsocketTimelineDisconnect(&wsTimelineLog, wsTerminateErr, time.Now())
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
 		} else {
+			gettokenshooks.RecordDownstreamWebsocketDisconnected(passthroughSessionID, nil)
 			log.Infof("responses websocket: session closing id=%s", passthroughSessionID)
 		}
 		if h != nil && h.AuthManager != nil {
@@ -225,7 +230,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
+		liveRequestID := internallogging.GenerateRequestID()
+		gettokenshooks.RecordDownstreamWebsocketRequest(passthroughSessionID, liveRequestID, modelName)
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCtx = internallogging.WithRequestID(cliCtx, liveRequestID)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
 		if pinnedAuthID != "" {
