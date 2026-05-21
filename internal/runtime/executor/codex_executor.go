@@ -13,12 +13,15 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -109,6 +112,29 @@ type CodexExecutor struct {
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+func recordCodexHTTPLiveRequestStarted(ctx context.Context, headers http.Header, body []byte, model string, authID string, authLabel string, provider string, errp *error) func() {
+	identity := gettokenshooks.ExtractCodexLiveSessionIdentity(headers, body)
+	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
+		ConversationID:      identity.ConversationID,
+		ClientRequestID:     identity.ClientRequestID,
+		PromptCacheKey:      identity.PromptCacheKey,
+		CodexWindowID:       identity.CodexWindowID,
+		Model:               model,
+		AuthID:              authID,
+		AuthLabel:           authLabel,
+		Provider:            provider,
+		DownstreamTransport: downstreamTransportName(ctx),
+		UpstreamTransport:   "http",
+	})
+	requestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	return func() {
+		if errp == nil || *errp == nil || requestID == "" {
+			return
+		}
+		gettokenshooks.RecordCodexLiveRequestCompleted(requestID, coreusage.Detail{}, *errp)
+	}
+}
 
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
 func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -201,6 +227,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
@@ -352,6 +379,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
@@ -453,6 +481,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,

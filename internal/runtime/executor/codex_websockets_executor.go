@@ -234,8 +234,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	liveRequestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	liveIdentity := gettokenshooks.ExtractCodexLiveSessionIdentity(wsHeaders, body)
 	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
 		ExecutionSessionID:  executionSessionID,
+		ConversationID:      liveIdentity.ConversationID,
+		ClientRequestID:     liveIdentity.ClientRequestID,
+		PromptCacheKey:      liveIdentity.PromptCacheKey,
+		CodexWindowID:       liveIdentity.CodexWindowID,
 		Model:               baseModel,
 		AuthID:              authID,
 		AuthLabel:           authLabel,
@@ -456,8 +461,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	executionSessionID := executionSessionIDFromOptions(opts)
 	liveRequestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+	liveIdentity := gettokenshooks.ExtractCodexLiveSessionIdentity(wsHeaders, body)
 	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
 		ExecutionSessionID:  executionSessionID,
+		ConversationID:      liveIdentity.ConversationID,
+		ClientRequestID:     liveIdentity.ClientRequestID,
+		PromptCacheKey:      liveIdentity.PromptCacheKey,
+		CodexWindowID:       liveIdentity.CodexWindowID,
 		Model:               baseModel,
 		AuthID:              authID,
 		AuthLabel:           authLabel,

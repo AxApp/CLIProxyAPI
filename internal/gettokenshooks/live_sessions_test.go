@@ -124,6 +124,78 @@ func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testin
 	}
 }
 
+func TestLiveSessionsCoalescesRequestsByCodexConversationID(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	conversationID := "0198f708-8dbf-7c90-a20a-30f4ebf7244f"
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("passthrough-1", "ws-req-1", "gpt-5.5", CodexLiveSessionIdentity{
+		ConversationID:  conversationID,
+		ClientRequestID: conversationID,
+		CodexWindowID:   conversationID + ":0",
+	})
+	RecordDownstreamWebsocketConnected("passthrough-2", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("passthrough-2", "ws-req-2", "gpt-5.5", CodexLiveSessionIdentity{
+		ConversationID:  conversationID,
+		ClientRequestID: conversationID,
+		CodexWindowID:   conversationID + ":0",
+	})
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	session := snapshot.Sessions[0]
+	if session.SessionID != conversationID {
+		t.Fatalf("sessionID = %q, want conversation id %q", session.SessionID, conversationID)
+	}
+	if session.DownstreamSessionID == "" {
+		t.Fatalf("expected passthrough downstream session id to be retained: %#v", session)
+	}
+	if session.CodexWindowID != conversationID+":0" {
+		t.Fatalf("codexWindowID = %q", session.CodexWindowID)
+	}
+	if session.RequestCount != 2 || len(session.Requests) != 2 {
+		t.Fatalf("request count = %d len=%d, want 2: %#v", session.RequestCount, len(session.Requests), session.Requests)
+	}
+	for _, request := range session.Requests {
+		if request.SessionID != conversationID {
+			t.Fatalf("request %s sessionID = %q, want %q", request.RequestID, request.SessionID, conversationID)
+		}
+		if request.ClientRequestID != conversationID {
+			t.Fatalf("request %s clientRequestID = %q, want %q", request.RequestID, request.ClientRequestID, conversationID)
+		}
+	}
+}
+
+func TestExtractCodexLiveSessionIdentityPrefersCodexConversationFields(t *testing.T) {
+	conversationID := "0198f708-8dbf-7c90-a20a-30f4ebf7244f"
+	headers := http.Header{
+		"X-Client-Request-Id": []string{"fallback-client-request"},
+		"X-Codex-Window-Id":   []string{conversationID + ":1"},
+	}
+	payload := []byte(`{
+		"prompt_cache_key": "` + conversationID + `",
+		"client_metadata": {
+			"x-codex-window-id": "` + conversationID + `:2"
+		}
+	}`)
+
+	identity := ExtractCodexLiveSessionIdentity(headers, payload)
+	if identity.ConversationID != conversationID {
+		t.Fatalf("conversationID = %q, want %q", identity.ConversationID, conversationID)
+	}
+	if identity.PromptCacheKey != conversationID {
+		t.Fatalf("promptCacheKey = %q, want %q", identity.PromptCacheKey, conversationID)
+	}
+	if identity.CodexWindowID != conversationID+":1" {
+		t.Fatalf("codexWindowID = %q, want header value", identity.CodexWindowID)
+	}
+	if identity.ClientRequestID != "fallback-client-request" {
+		t.Fatalf("clientRequestID = %q", identity.ClientRequestID)
+	}
+}
+
 func resetLiveSessionTrackerForTest(t *testing.T) {
 	t.Helper()
 	liveSessionsMu.Lock()

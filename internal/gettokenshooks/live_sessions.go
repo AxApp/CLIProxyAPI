@@ -14,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -127,8 +128,19 @@ type LiveTimelineEvent struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
+type CodexLiveSessionIdentity struct {
+	ConversationID  string
+	ClientRequestID string
+	PromptCacheKey  string
+	CodexWindowID   string
+}
+
 type CodexLiveRequestStart struct {
 	ExecutionSessionID  string
+	ConversationID      string
+	ClientRequestID     string
+	PromptCacheKey      string
+	CodexWindowID       string
 	Model               string
 	AuthID              string
 	AuthLabel           string
@@ -181,8 +193,8 @@ func RecordDownstreamWebsocketConnected(sessionID string, clientIP string) {
 	currentLiveSessionTracker().recordDownstreamWebsocketConnected(sessionID, clientIP, time.Now())
 }
 
-func RecordDownstreamWebsocketRequest(sessionID string, requestID string, model string) {
-	currentLiveSessionTracker().recordDownstreamWebsocketRequest(sessionID, requestID, model, time.Now())
+func RecordDownstreamWebsocketRequest(sessionID string, requestID string, model string, identities ...CodexLiveSessionIdentity) {
+	currentLiveSessionTracker().recordDownstreamWebsocketRequest(sessionID, requestID, model, firstCodexLiveSessionIdentity(identities), time.Now())
 }
 
 func RecordDownstreamWebsocketDisconnected(sessionID string, err error) {
@@ -225,6 +237,33 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandl
 	})
 }
 
+func ExtractCodexLiveSessionIdentity(headers http.Header, payload []byte) CodexLiveSessionIdentity {
+	identity := CodexLiveSessionIdentity{}
+	if headers != nil {
+		identity.ClientRequestID = strings.TrimSpace(headers.Get("x-client-request-id"))
+		identity.CodexWindowID = strings.TrimSpace(headers.Get("x-codex-window-id"))
+		identity.ConversationID = strings.TrimSpace(headers.Get("session_id"))
+	}
+	if len(payload) > 0 {
+		if identity.PromptCacheKey == "" {
+			identity.PromptCacheKey = strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String())
+		}
+		if identity.CodexWindowID == "" {
+			identity.CodexWindowID = strings.TrimSpace(gjson.GetBytes(payload, "client_metadata.x-codex-window-id").String())
+		}
+		if identity.ClientRequestID == "" {
+			identity.ClientRequestID = strings.TrimSpace(gjson.GetBytes(payload, "client_metadata.x-client-request-id").String())
+		}
+	}
+	identity.ConversationID = firstNonEmptyString(
+		identity.ConversationID,
+		identity.PromptCacheKey,
+		conversationIDFromCodexWindowID(identity.CodexWindowID),
+		identity.ClientRequestID,
+	)
+	return identity
+}
+
 func currentLiveSessionTracker() *liveSessionTracker {
 	liveSessionsMu.RLock()
 	tracker := defaultLiveSessions
@@ -256,7 +295,7 @@ func (t *liveSessionTracker) recordDownstreamWebsocketConnected(sessionID string
 	t.pruneLocked(now)
 }
 
-func (t *liveSessionTracker) recordDownstreamWebsocketRequest(sessionID string, requestID string, model string, now time.Time) {
+func (t *liveSessionTracker) recordDownstreamWebsocketRequest(sessionID string, requestID string, model string, identity CodexLiveSessionIdentity, now time.Time) {
 	sessionID = strings.TrimSpace(sessionID)
 	requestID = strings.TrimSpace(requestID)
 	if sessionID == "" || requestID == "" {
@@ -264,14 +303,15 @@ func (t *liveSessionTracker) recordDownstreamWebsocketRequest(sessionID string, 
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	session := t.ensureSessionLocked(sessionID, now)
+	session := t.ensureSessionForIdentityLocked(sessionID, identity, now)
 	session.session.Model = firstNonEmptyString(strings.TrimSpace(model), session.session.Model)
 	session.session.ActiveRequestID = requestID
 	session.session.LastRequestID = requestID
 	session.session.Status = "streaming"
 	session.addEvent(t.nextEventIDLocked(), now, "downstream", "request", "Codex WebSocket request received", "info", requestID)
-	t.requestMap[requestID] = sessionID
-	t.ensureRequestLocked(session, requestID, model, now, "websocket", "unknown")
+	t.requestMap[requestID] = session.session.SessionID
+	req := t.ensureRequestLocked(session, requestID, model, now, "websocket", "unknown")
+	req.request.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
 	t.pruneLocked(now)
 }
 
@@ -301,12 +341,18 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 		requestID = t.generatedRequestID(now)
 	}
 	sessionID := firstNonEmptyString(strings.TrimSpace(input.ExecutionSessionID), requestID)
+	identity := CodexLiveSessionIdentity{
+		ConversationID:  input.ConversationID,
+		ClientRequestID: input.ClientRequestID,
+		PromptCacheKey:  input.PromptCacheKey,
+		CodexWindowID:   input.CodexWindowID,
+	}
 	downstream := firstNonEmptyString(strings.TrimSpace(input.DownstreamTransport), "http")
 	upstream := firstNonEmptyString(strings.TrimSpace(input.UpstreamTransport), "unknown")
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	session := t.ensureSessionLocked(sessionID, now)
+	session := t.ensureSessionForIdentityLocked(sessionID, identity, now)
 	session.session.ExecutionSessionID = firstNonEmptyString(strings.TrimSpace(input.ExecutionSessionID), session.session.ExecutionSessionID)
 	session.session.Model = firstNonEmptyString(strings.TrimSpace(input.Model), session.session.Model)
 	session.session.AuthID = firstNonEmptyString(strings.TrimSpace(input.AuthID), session.session.AuthID)
@@ -320,13 +366,14 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 	session.addEvent(t.nextEventIDLocked(), now, "sidecar", "auth_selected", "Account selected for Codex request", "success", input.AuthID)
 
 	reqState := t.ensureRequestLocked(session, requestID, input.Model, now, downstream, upstream)
+	reqState.request.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
 	reqState.request.AuthID = strings.TrimSpace(input.AuthID)
 	reqState.request.AuthLabel = strings.TrimSpace(input.AuthLabel)
 	reqState.request.Provider = strings.TrimSpace(input.Provider)
 	reqState.request.Status = "streaming"
 	reqState.upstreamStarted = now
 	reqState.request.Timeline = append(reqState.request.Timeline, liveEvent(t.nextEventIDLocked(), now, "upstream", "connect_start", "Connecting upstream", "info", upstream))
-	t.requestMap[requestID] = sessionID
+	t.requestMap[requestID] = session.session.SessionID
 	t.pruneLocked(now)
 }
 
@@ -531,9 +578,31 @@ func (t *liveSessionTracker) ensureSessionLocked(sessionID string, now time.Time
 	return session
 }
 
+func (t *liveSessionTracker) ensureSessionForIdentityLocked(fallbackSessionID string, identity CodexLiveSessionIdentity, now time.Time) *liveSessionState {
+	identity = normalizeCodexLiveSessionIdentity(identity)
+	sessionID := firstNonEmptyString(identity.ConversationID, strings.TrimSpace(fallbackSessionID))
+	session := t.ensureSessionLocked(sessionID, now)
+	if fallbackSessionID = strings.TrimSpace(fallbackSessionID); fallbackSessionID != "" && fallbackSessionID != sessionID {
+		if transient := t.sessions[fallbackSessionID]; transient != nil && transient != session {
+			mergeLiveSessionState(session, transient)
+			delete(t.sessions, fallbackSessionID)
+			for requestID, mappedSessionID := range t.requestMap {
+				if mappedSessionID == fallbackSessionID {
+					t.requestMap[requestID] = sessionID
+				}
+			}
+		}
+	}
+	if identity.CodexWindowID != "" {
+		session.session.CodexWindowID = identity.CodexWindowID
+	}
+	return session
+}
+
 func (t *liveSessionTracker) ensureRequestLocked(session *liveSessionState, requestID string, model string, now time.Time, downstream string, upstream string) *liveRequestState {
 	req := session.requests[requestID]
 	if req != nil {
+		req.request.SessionID = session.session.SessionID
 		return req
 	}
 	sequence := len(session.requests) + 1
@@ -553,6 +622,101 @@ func (t *liveSessionTracker) ensureRequestLocked(session *liveSessionState, requ
 	session.requests[requestID] = req
 	session.session.RequestCount = len(session.requests)
 	return req
+}
+
+func normalizeCodexLiveSessionIdentity(identity CodexLiveSessionIdentity) CodexLiveSessionIdentity {
+	identity.ConversationID = strings.TrimSpace(identity.ConversationID)
+	identity.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
+	identity.PromptCacheKey = strings.TrimSpace(identity.PromptCacheKey)
+	identity.CodexWindowID = strings.TrimSpace(identity.CodexWindowID)
+	identity.ConversationID = firstNonEmptyString(
+		identity.ConversationID,
+		identity.PromptCacheKey,
+		conversationIDFromCodexWindowID(identity.CodexWindowID),
+		identity.ClientRequestID,
+	)
+	return identity
+}
+
+func conversationIDFromCodexWindowID(windowID string) string {
+	windowID = strings.TrimSpace(windowID)
+	if windowID == "" {
+		return ""
+	}
+	if before, _, found := strings.Cut(windowID, ":"); found {
+		return strings.TrimSpace(before)
+	}
+	return windowID
+}
+
+func firstCodexLiveSessionIdentity(identities []CodexLiveSessionIdentity) CodexLiveSessionIdentity {
+	for _, identity := range identities {
+		return identity
+	}
+	return CodexLiveSessionIdentity{}
+}
+
+func mergeLiveSessionState(target *liveSessionState, source *liveSessionState) {
+	if target == nil || source == nil || target == source {
+		return
+	}
+	target.session.ExecutionSessionID = firstNonEmptyString(target.session.ExecutionSessionID, source.session.ExecutionSessionID)
+	target.session.DownstreamSessionID = firstNonEmptyString(target.session.DownstreamSessionID, source.session.DownstreamSessionID)
+	target.session.CodexWindowID = firstNonEmptyString(target.session.CodexWindowID, source.session.CodexWindowID)
+	target.session.Model = firstNonEmptyString(target.session.Model, source.session.Model)
+	target.session.AuthID = firstNonEmptyString(target.session.AuthID, source.session.AuthID)
+	target.session.AuthLabel = firstNonEmptyString(target.session.AuthLabel, source.session.AuthLabel)
+	target.session.Provider = firstNonEmptyString(target.session.Provider, source.session.Provider)
+	target.session.DownstreamTransport = mergeTransport(target.session.DownstreamTransport, source.session.DownstreamTransport)
+	target.session.UpstreamTransport = mergeTransport(target.session.UpstreamTransport, source.session.UpstreamTransport)
+	if target.session.ActiveRequestID == "" {
+		target.session.ActiveRequestID = source.session.ActiveRequestID
+	}
+	if source.session.LastRequestID != "" {
+		target.session.LastRequestID = source.session.LastRequestID
+	}
+	if statusRankForMerge(source.session.Status) > statusRankForMerge(target.session.Status) {
+		target.session.Status = source.session.Status
+	}
+	if parseLiveTime(source.session.StartedAt).Before(parseLiveTime(target.session.StartedAt)) {
+		target.session.StartedAt = source.session.StartedAt
+	}
+	if parseLiveTime(source.session.LastEventAt).After(parseLiveTime(target.session.LastEventAt)) {
+		target.session.LastEventAt = source.session.LastEventAt
+		target.session.DurationMs = source.session.DurationMs
+	}
+	target.session.RecentEvents = append(target.session.RecentEvents, source.session.RecentEvents...)
+	if len(target.session.RecentEvents) > 12 {
+		target.session.RecentEvents = target.session.RecentEvents[len(target.session.RecentEvents)-12:]
+	}
+	for requestID, request := range source.requests {
+		if _, exists := target.requests[requestID]; exists {
+			continue
+		}
+		request.request.SessionID = target.session.SessionID
+		request.request.Sequence = len(target.requests) + 1
+		target.requests[requestID] = request
+	}
+	target.session.RequestCount = len(target.requests)
+}
+
+func statusRankForMerge(status string) int {
+	switch status {
+	case "failed", "cancelled":
+		return 6
+	case "upstream_disconnected":
+		return 5
+	case "reconnecting", "degraded_http":
+		return 4
+	case "streaming":
+		return 3
+	case "active":
+		return 2
+	case "completed":
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (t *liveSessionTracker) pruneLocked(now time.Time) {

@@ -231,7 +231,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
 		liveRequestID := internallogging.GenerateRequestID()
-		gettokenshooks.RecordDownstreamWebsocketRequest(passthroughSessionID, liveRequestID, modelName)
+		liveIdentity := gettokenshooks.ExtractCodexLiveSessionIdentity(c.Request.Header, requestJSON)
+		gettokenshooks.RecordDownstreamWebsocketRequest(passthroughSessionID, liveRequestID, modelName, liveIdentity)
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = internallogging.WithRequestID(cliCtx, liveRequestID)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
