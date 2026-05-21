@@ -117,6 +117,67 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 	}
 }
 
+func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) {
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	location := time.FixedZone("UTC+8", 8*60*60)
+	now := time.Date(2026, 5, 22, 14, 30, 0, 0, location)
+	if err := store.upsertRule(RateLimitRule{
+		ID:         "rule-calendar-day",
+		AccountKey: "codex-api-key:stable-001",
+		MatchKey:   "auth-id:codex:apikey:abc123",
+		Strategy:   RateLimitStrategyRequestWindow,
+		Window:     RateLimitWindowCalendarDay,
+		LimitValue: 2,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now); err != nil {
+		t.Fatalf("upsert calendar day rule: %v", err)
+	}
+	events := []struct {
+		id        string
+		timestamp time.Time
+	}{
+		{id: "previous-day", timestamp: time.Date(2026, 5, 21, 23, 59, 0, 0, location)},
+		{id: "day-start", timestamp: time.Date(2026, 5, 22, 0, 5, 0, 0, location)},
+		{id: "midday", timestamp: time.Date(2026, 5, 22, 12, 0, 0, 0, location)},
+	}
+	for _, event := range events {
+		if err := store.insertUsageAttributionEvent(usageAttributionEvent{
+			ID:                event.id,
+			CompletedAtUnixMs: event.timestamp.UTC().UnixMilli(),
+			AttributionKey:    "auth-id:codex:apikey:abc123",
+			AttributionKind:   "auth_id",
+			Provider:          "codex",
+			RequestedModel:    "gpt-5.4",
+			TotalTokens:       25,
+			EvidenceKind:      "auth_id",
+		}); err != nil {
+			t.Fatalf("insert event %s: %v", event.id, err)
+		}
+	}
+
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return now },
+	})
+	if err := evaluator.EvaluateNow(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	if !ok {
+		t.Fatal("missing account state")
+	}
+	if got := state.Rules[0].CurrentUsage; got != 2 {
+		t.Fatalf("calendar day usage = %d, want only same-day requests", got)
+	}
+	if !state.Blocked || state.BlockReason != "00:00-23:59 requests 已满" {
+		t.Fatalf("blocked state = %#v, want calendar day request block", state)
+	}
+}
+
 func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {

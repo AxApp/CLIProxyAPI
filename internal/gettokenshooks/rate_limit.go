@@ -28,6 +28,8 @@ const (
 	RateLimitStrategyTokenWindow   = "token-window"
 	RateLimitStrategyRequestWindow = "request-window"
 
+	RateLimitWindowCalendarDay = "calendar-day"
+
 	RateLimitActionBlock = "block"
 	RateLimitActionWarn  = "warn"
 
@@ -238,18 +240,14 @@ func (rateLimitTokenWindowStrategy) ID() string { return RateLimitStrategyTokenW
 func (rateLimitTokenWindowStrategy) Name() string { return "Token 窗口限流" }
 
 func (rateLimitTokenWindowStrategy) SupportedWindows() []string {
-	return []string{"1h", "6h", "12h", "24h", "7d", "30d"}
+	return []string{"1h", "6h", "12h", "24h", RateLimitWindowCalendarDay, "7d", "30d"}
 }
 
 func (rateLimitTokenWindowStrategy) UsageForRule(ctx context.Context, store *rateLimitStore, rule RateLimitRule, now time.Time) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	window := parseUsageAttributionDuration(rule.Window, defaultUsageAttributionWindow)
-	if window <= 0 {
-		window = defaultUsageAttributionWindow
-	}
-	since := now.Add(-window).UTC().UnixMilli()
+	since := rateLimitRuleWindowStart(rule.Window, now).UnixMilli()
 	matchKey := rateLimitRuleMatchKey(rule)
 	var total sql.NullInt64
 	err := store.db.QueryRowContext(
@@ -278,18 +276,14 @@ func (rateLimitRequestWindowStrategy) ID() string { return RateLimitStrategyRequ
 func (rateLimitRequestWindowStrategy) Name() string { return "请求窗口限流" }
 
 func (rateLimitRequestWindowStrategy) SupportedWindows() []string {
-	return []string{"1h", "6h", "12h", "24h", "7d", "30d"}
+	return []string{"1h", "6h", "12h", "24h", RateLimitWindowCalendarDay, "7d", "30d"}
 }
 
 func (rateLimitRequestWindowStrategy) UsageForRule(ctx context.Context, store *rateLimitStore, rule RateLimitRule, now time.Time) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	window := parseUsageAttributionDuration(rule.Window, defaultUsageAttributionWindow)
-	if window <= 0 {
-		window = defaultUsageAttributionWindow
-	}
-	since := now.Add(-window).UTC().UnixMilli()
+	since := rateLimitRuleWindowStart(rule.Window, now).UnixMilli()
 	matchKey := rateLimitRuleMatchKey(rule)
 	var count int64
 	err := store.db.QueryRowContext(
@@ -706,7 +700,22 @@ func rateLimitRuleWindow(rule RateLimitRule) string {
 	if window == "" {
 		return "window"
 	}
+	if strings.EqualFold(window, RateLimitWindowCalendarDay) {
+		return "00:00-23:59"
+	}
 	return window
+}
+
+func rateLimitRuleWindowStart(window string, now time.Time) time.Time {
+	if strings.EqualFold(strings.TrimSpace(window), RateLimitWindowCalendarDay) {
+		localNow := now.Local()
+		return time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location()).UTC()
+	}
+	duration := parseUsageAttributionDuration(window, defaultUsageAttributionWindow)
+	if duration <= 0 {
+		duration = defaultUsageAttributionWindow
+	}
+	return now.Add(-duration).UTC()
 }
 
 func rateLimitRuleMatchKey(rule RateLimitRule) string {
@@ -872,7 +881,7 @@ func validateRateLimitRule(rule RateLimitRule) error {
 	if !ok {
 		return fmt.Errorf("unsupported strategy %q", rule.Strategy)
 	}
-	if parseUsageAttributionDuration(rule.Window, 0) <= 0 {
+	if !strings.EqualFold(rule.Window, RateLimitWindowCalendarDay) && parseUsageAttributionDuration(rule.Window, 0) <= 0 {
 		return fmt.Errorf("unsupported window %q", rule.Window)
 	}
 	if !rateLimitStrategySupportsWindow(strategy, rule.Window) {
