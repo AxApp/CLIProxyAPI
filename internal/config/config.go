@@ -447,6 +447,9 @@ type CodexKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Disabled prevents this credential from being used for routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 

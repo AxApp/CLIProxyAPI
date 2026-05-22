@@ -194,11 +194,15 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			Label:      "codex-apikey",
 			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
+			Disabled:   ck.Disabled,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
 			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
+		}
+		if ck.Disabled {
+			a.Status = coreauth.StatusDisabled
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
