@@ -1113,6 +1113,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
+	applyCodexKeyDisabledOverrides(original.Content[0], persistCfg)
 	normalizeCollectionNodeStyles(original.Content[0])
 
 	// Write back.
@@ -1776,6 +1777,56 @@ func normalizeCollectionNodeStyles(node *yaml.Node) {
 		}
 	default:
 		// Scalars keep their existing style to preserve quoting
+	}
+}
+
+// applyCodexKeyDisabledOverrides force-syncs the disabled field on codex-api-key items
+// from the in-memory config onto the YAML node tree. The mergeMappingPreserve round-trip
+// may drop new boolean keys in sequence items during the YAML comment-preserving merge,
+// so we explicitly add or remove the disabled node for each codex-api-key item.
+func applyCodexKeyDisabledOverrides(root *yaml.Node, cfg *Config) {
+	if root == nil || root.Kind != yaml.MappingNode || cfg == nil || len(cfg.CodexKey) == 0 {
+		return
+	}
+	idx := findMapKeyIndex(root, "codex-api-key")
+	if idx < 0 {
+		return
+	}
+	seq := root.Content[idx+1]
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, item := range seq.Content {
+		if item == nil || item.Kind != yaml.MappingNode {
+			continue
+		}
+		apiKey := mappingScalarValue(item, "api-key")
+		if apiKey == "" {
+			apiKey = mappingScalarValue(item, "api_key")
+		}
+		if apiKey == "" {
+			continue
+		}
+		expectedDisabled := false
+		for i := range cfg.CodexKey {
+			if strings.TrimSpace(cfg.CodexKey[i].APIKey) == apiKey {
+				expectedDisabled = cfg.CodexKey[i].Disabled
+				break
+			}
+		}
+		disabledIdx := findMapKeyIndex(item, "disabled")
+		if expectedDisabled {
+			if disabledIdx >= 0 {
+				item.Content[disabledIdx+1] = &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"}
+			} else {
+				item.Content = append(item.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "disabled"},
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"},
+				)
+			}
+		} else if disabledIdx >= 0 {
+			item.Content = append(item.Content[:disabledIdx], item.Content[disabledIdx+2:]...)
+		}
 	}
 }
 
