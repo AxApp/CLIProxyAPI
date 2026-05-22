@@ -15,6 +15,9 @@ import (
 )
 
 func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
+	ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit) })
+
 	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {
 		t.Fatalf("new rate limit store: %v", err)
@@ -64,6 +67,9 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 	}
 	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
 		t.Fatalf("deny ids = %#v, want candidate auth id", got)
+	}
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
+		t.Fatalf("route guard deny ids = %#v, want rate-limited candidate auth id", got)
 	}
 }
 

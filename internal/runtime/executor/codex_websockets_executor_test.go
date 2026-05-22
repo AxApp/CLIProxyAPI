@@ -151,6 +151,71 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 	}
 }
 
+func TestCodexWebsocketsExecutionSessionRotatesUpstreamWhenAuthChanges(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	handshakes := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handshakes <- r.Header.Get("Authorization")
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+			completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+			if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","id":"msg-1"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "rotate-auth-session",
+		},
+	}
+	authA := &cliproxyauth.Auth{ID: "auth-a", Attributes: map[string]string{"api_key": "sk-a", "base_url": server.URL}}
+	authB := &cliproxyauth.Auth{ID: "auth-b", Attributes: map[string]string{"api_key": "sk-b", "base_url": server.URL}}
+	t.Cleanup(func() { exec.CloseExecutionSession("rotate-auth-session") })
+
+	for _, auth := range []*cliproxyauth.Auth{authA, authB} {
+		result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+		if err != nil {
+			t.Fatalf("ExecuteStream(%s) error = %v", auth.ID, err)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("ExecuteStream(%s) chunk error = %v", auth.ID, chunk.Err)
+			}
+		}
+	}
+
+	got := []string{}
+	for len(got) < 2 {
+		select {
+		case header := <-handshakes:
+			got = append(got, header)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("handshake headers = %#v, want two upstream handshakes", got)
+		}
+	}
+	if got[0] != "Bearer sk-a" || got[1] != "Bearer sk-b" {
+		t.Fatalf("handshake auth headers = %#v, want [Bearer sk-a Bearer sk-b]", got)
+	}
+}
+
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
 

@@ -673,6 +673,7 @@ func (e *RateLimitEvaluator) EvaluateNow(ctx context.Context) error {
 	e.byAcct = byAcct
 	e.byLookup = byLookup
 	e.mu.Unlock()
+	ReplaceAccountRouteGuardSource(AccountRouteGuardSourceRateLimit, rateLimitRouteGuardBlocks(byKey))
 	return nil
 }
 
@@ -803,6 +804,7 @@ func (e *RateLimitEvaluator) replaceStatesForTest(states []RateLimitState) {
 		e.byAcct[state.AccountKey] = state
 		indexRateLimitLookup(e.byLookup, state)
 	}
+	ReplaceAccountRouteGuardSource(AccountRouteGuardSourceRateLimit, rateLimitRouteGuardBlocks(e.byKey))
 }
 
 func (p rateLimitPolicy) RewriteCandidates(ctx context.Context, req coreauth.RoutePolicyRequest) coreauth.RoutePolicyDecision {
@@ -814,6 +816,25 @@ func (p rateLimitPolicy) RewriteCandidates(ctx context.Context, req coreauth.Rou
 		return coreauth.RoutePolicyDecision{}
 	}
 	return coreauth.RoutePolicyDecision{DenyIDs: deny, Reason: "gettokens rate limit"}
+}
+
+func rateLimitRouteGuardBlocks(states map[string]RateLimitState) []AccountRouteGuardBlock {
+	if len(states) == 0 {
+		return nil
+	}
+	blocks := make([]AccountRouteGuardBlock, 0, len(states))
+	for _, state := range states {
+		if !state.Blocked {
+			continue
+		}
+		blocks = append(blocks, AccountRouteGuardBlock{
+			Source:     AccountRouteGuardSourceRateLimit,
+			AccountKey: state.AccountKey,
+			MatchKey:   state.MatchKey,
+			Reason:     state.BlockReason,
+		})
+	}
+	return blocks
 }
 
 func candidateRateLimitKeys(auth *coreauth.Auth) []string {

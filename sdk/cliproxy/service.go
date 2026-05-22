@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -28,6 +29,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
+
+var closeCodexWebsocketSessionsForAuthID = executor.CloseCodexWebsocketSessionsForAuthID
 
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
 // It manages the complete lifecycle including authentication, file watching, HTTP server,
@@ -293,8 +296,10 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// immediately for API calls, rather than waiting for model registration to complete.
 	op := "register"
 	var err error
+	wasRouteable := false
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
+		wasRouteable = !existing.Disabled && existing.Status != coreauth.StatusDisabled
 		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
@@ -316,6 +321,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		}
 		auth = current
 	}
+	s.applyRouteGuardForAuthUpdate(auth, wasRouteable)
 
 	// Register models after auth is updated in coreManager.
 	// This operation may block on network calls, but the auth configuration
@@ -345,9 +351,24 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 			log.Errorf("failed to disable auth %s: %v", id, err)
 		}
 		if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
-			executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
+			closeCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 			s.ensureExecutorsForAuth(existing)
 		}
+	}
+}
+
+func (s *Service) applyRouteGuardForAuthUpdate(auth *coreauth.Auth, wasRouteable bool) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	disabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
+	if !disabled {
+		gettokenshooks.ClearManualDisabledAuth(auth)
+		return
+	}
+	gettokenshooks.MarkManualDisabledAuth(auth, "account disabled")
+	if wasRouteable && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		closeCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
 	}
 }
 

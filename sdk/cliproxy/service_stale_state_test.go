@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -109,6 +110,59 @@ func TestForceHomeRuntimeConfigEnablesUsageStatistics(t *testing.T) {
 
 	if !cfg.UsageStatisticsEnabled {
 		t.Fatal("expected home runtime config to force usage statistics enabled")
+	}
+}
+
+func TestServiceApplyCoreAuthAddOrUpdate_DisablingCodexAuthGuardsRouteAndClosesWebsocket(t *testing.T) {
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	})
+
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	authID := "codex-disable-route-guard-auth"
+	var closed []string
+	previousClose := closeCodexWebsocketSessionsForAuthID
+	closeCodexWebsocketSessionsForAuthID = func(id string, reason string) {
+		closed = append(closed, id+":"+reason)
+	}
+	t.Cleanup(func() {
+		closeCodexWebsocketSessionsForAuthID = previousClose
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusDisabled,
+		Disabled: true,
+	})
+
+	if got := gettokenshooks.DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{
+		{ID: authID, Provider: "codex"},
+		{ID: "other-codex-auth", Provider: "codex"},
+	}); len(got) != 1 || got[0] != authID {
+		t.Fatalf("manual route guard deny ids = %#v, want disabled auth", got)
+	}
+	if len(closed) != 1 || closed[0] != authID+":auth_disabled" {
+		t.Fatalf("closed websocket sessions = %#v, want disabled auth close", closed)
+	}
+
+	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+	if got := gettokenshooks.DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: authID, Provider: "codex"}}); len(got) != 0 {
+		t.Fatalf("manual route guard deny ids after re-enable = %#v, want empty", got)
 	}
 }
 

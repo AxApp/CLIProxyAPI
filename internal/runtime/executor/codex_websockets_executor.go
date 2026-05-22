@@ -1334,6 +1334,27 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.connMu.Lock()
 	conn := sess.conn
 	readerConn := sess.readerConn
+	currentAuthID := strings.TrimSpace(sess.authID)
+	currentWSURL := strings.TrimSpace(sess.wsURL)
+	sess.connMu.Unlock()
+	if conn != nil {
+		if currentAuthID != strings.TrimSpace(authID) || currentWSURL != strings.TrimSpace(wsURL) {
+			closeCodexWebsocketSession(sess, "auth_rotated")
+		} else {
+			if readerConn != conn {
+				sess.connMu.Lock()
+				sess.readerConn = conn
+				sess.connMu.Unlock()
+				sess.configureConn(conn)
+				go e.readUpstreamLoop(sess, conn)
+			}
+			return conn, nil, nil
+		}
+	}
+
+	sess.connMu.Lock()
+	conn = sess.conn
+	readerConn = sess.readerConn
 	sess.connMu.Unlock()
 	if conn != nil {
 		if readerConn != conn {

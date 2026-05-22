@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -1430,6 +1431,108 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	}
 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
 	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
+		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
+	}
+}
+
+func TestResponsesWebsocketReleasesPinnedAuthAfterRouteGuardBlock(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	})
+
+	selector := &orderedWebsocketSelector{order: []string{"auth-a", "auth-b"}}
+	executor := &websocketPinnedFailoverExecutor{}
+	manager := coreauth.NewManager(nil, selector, nil)
+	manager.RegisterExecutor(executor)
+
+	authA := &coreauth.Auth{
+		ID:         "auth-a",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, err := manager.Register(context.Background(), authA); err != nil {
+		t.Fatalf("Register auth A: %v", err)
+	}
+	authB := &coreauth.Auth{
+		ID:         "auth-b",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, err := manager.Register(context.Background(), authB); err != nil {
+		t.Fatalf("Register auth B: %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(authA.ID, authA.Provider, []*registry.ModelInfo{{ID: "guard-model"}})
+	registry.GetGlobalRegistry().RegisterClient(authB.ID, authB.Provider, []*registry.ModelInfo{{ID: "guard-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+		registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			t.Fatalf("close websocket: %v", errClose)
+		}
+	}()
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"guard-model","input":[{"type":"message","id":"msg-1"}]}`)); errWrite != nil {
+		t.Fatalf("write first websocket message: %v", errWrite)
+	}
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read first websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("first payload type = %s, want %s: %s", got, wsEventTypeCompleted, payload)
+	}
+
+	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
+		Source: gettokenshooks.AccountRouteGuardSourceManualDisabled,
+		AuthID: "auth-a",
+		Reason: "disabled by user",
+	})
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`)); errWrite != nil {
+		t.Fatalf("write second websocket message: %v", errWrite)
+	}
+	_, payload, errReadMessage = conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read second websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("second payload type = %s, want %s: %s", got, wsEventTypeCompleted, payload)
+	}
+
+	if got := executor.AuthIDs(); len(got) != 2 || got[0] != "auth-a" || got[1] != "auth-b" {
+		t.Fatalf("selected auth IDs = %v, want [auth-a auth-b]", got)
+	}
+	authBPayloads := executor.Payloads("auth-b")
+	if len(authBPayloads) != 1 {
+		t.Fatalf("auth-b payload count = %d, want 1", len(authBPayloads))
+	}
+	authBPayload := authBPayloads[0]
+	if gjson.GetBytes(authBPayload, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked after guard failover: %s", authBPayload)
+	}
+	authBInput := gjson.GetBytes(authBPayload, "input").Raw
+	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-2"`) {
 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
 	}
 }

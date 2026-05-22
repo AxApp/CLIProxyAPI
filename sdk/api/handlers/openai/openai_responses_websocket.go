@@ -142,6 +142,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// )
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
+		if pinnedAuthID != "" {
+			if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && gettokenshooks.AccountRouteGuardBlocksAuth(pinnedAuth) {
+				pinnedAuthID = ""
+				forceTranscriptReplayNextRequest = true
+				if h != nil && h.AuthManager != nil {
+					h.AuthManager.CloseExecutionSession(passthroughSessionID)
+				}
+			}
+		}
+
 		allowIncrementalInputWithPreviousResponseID := false
 		if pinnedAuthID != "" {
 			if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && pinnedAuth != nil {
