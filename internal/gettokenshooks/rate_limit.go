@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -816,6 +817,10 @@ func (p rateLimitPolicy) RewriteCandidates(ctx context.Context, req coreauth.Rou
 		return coreauth.RoutePolicyDecision{}
 	}
 	return coreauth.RoutePolicyDecision{DenyIDs: deny, Reason: "gettokens rate limit"}
+}
+
+func (p rateLimitPolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
+	return gettokensrouting.PolicyStageHardFilter
 }
 
 func rateLimitRouteGuardBlocks(states map[string]RateLimitState) []AccountRouteGuardBlock {

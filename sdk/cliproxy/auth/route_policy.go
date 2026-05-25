@@ -2,10 +2,13 @@ package auth
 
 import (
 	"context"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -73,8 +76,14 @@ func RegisterRoutePolicy(policy RoutePolicy) func() {
 func routePolicySnapshot() []RoutePolicy {
 	routePolicies.RLock()
 	defer routePolicies.RUnlock()
-	out := make([]RoutePolicy, 0, len(routePolicies.items))
-	for _, policy := range routePolicies.items {
+	ids := make([]int, 0, len(routePolicies.items))
+	for id := range routePolicies.items {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	out := make([]RoutePolicy, 0, len(ids))
+	for _, id := range ids {
+		policy := routePolicies.items[id]
 		if policy != nil {
 			out = append(out, policy)
 		}
@@ -90,18 +99,118 @@ func rewriteScheduledAuths(ctx context.Context, req RoutePolicyRequest, entries 
 	if len(policies) == 0 {
 		return entries, false
 	}
-	current := append([]*scheduledAuth(nil), entries...)
-	active := false
+	enginePolicies := make([]gettokensrouting.Policy, 0, len(policies))
 	for _, policy := range policies {
-		req.Candidates = cloneAuthCandidates(current)
-		decision, ok := safeEvaluateRoutePolicy(policy, ctx, req)
-		if !ok || !routePolicyDecisionActive(decision) {
+		policy := policy
+		enginePolicies = append(enginePolicies, gettokensrouting.Policy{
+			Stage: routePolicyStage(policy),
+			Name:  routePolicyName(policy),
+			Rewrite: func(ctx context.Context, routeCtx gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
+				req.Provider = routeCtx.Provider
+				req.Providers = append([]string(nil), routeCtx.Providers...)
+				req.Model = routeCtx.Model
+				req.Options = routeCtx.Options
+				req.Candidates = authCandidatesFromRouteCandidates(routeCtx.Candidates)
+				req.Tried = routeCtx.Tried
+				req.Now = routeCtx.Now
+				decision, ok := safeEvaluateRoutePolicy(policy, ctx, req)
+				if !ok {
+					return gettokensrouting.PolicyDecision{}
+				}
+				return gettokensrouting.PolicyDecision{
+					AllowIDs:      decision.AllowIDs,
+					DenyIDs:       decision.DenyIDs,
+					OrderIDs:      decision.OrderIDs,
+					AllowFallback: decision.AllowFallback,
+					Reason:        decision.Reason,
+				}
+			},
+		})
+	}
+	result := gettokensrouting.NewEngine(enginePolicies...).Route(ctx, gettokensrouting.RouteContext{
+		Provider:   req.Provider,
+		Providers:  append([]string(nil), req.Providers...),
+		Model:      req.Model,
+		Options:    req.Options,
+		Candidates: routeCandidatesFromScheduled(entries),
+		Tried:      req.Tried,
+		Now:        req.Now,
+	})
+	active := false
+	for _, step := range result.Trace {
+		if step.Activated {
+			active = true
+			break
+		}
+	}
+	if !active {
+		return entries, false
+	}
+	return scheduledFromRouteCandidates(result.Candidates), true
+}
+
+type stagedRoutePolicy interface {
+	RoutePolicyStage() gettokensrouting.PolicyStage
+}
+
+func routePolicyStage(policy RoutePolicy) gettokensrouting.PolicyStage {
+	if staged, ok := policy.(stagedRoutePolicy); ok {
+		return staged.RoutePolicyStage()
+	}
+	return gettokensrouting.PolicyStageRequest
+}
+
+func routePolicyName(policy RoutePolicy) string {
+	if policy == nil {
+		return ""
+	}
+	name := routePolicyTypeName(policy)
+	if name == "" {
+		return "route-policy"
+	}
+	return name
+}
+
+func routePolicyTypeName(value any) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(reflect.TypeOf(value).String()), "*"), "auth."))
+}
+
+func routeCandidatesFromScheduled(entries []*scheduledAuth) []gettokensrouting.RouteCandidate {
+	out := make([]gettokensrouting.RouteCandidate, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil || strings.TrimSpace(entry.auth.ID) == "" {
 			continue
 		}
-		active = true
-		current = applyRoutePolicyDecision(current, decision)
+		out = append(out, gettokensrouting.RouteCandidate{
+			ID:    strings.TrimSpace(entry.auth.ID),
+			Value: entry,
+		})
 	}
-	return current, active
+	return out
+}
+
+func authCandidatesFromRouteCandidates(candidates []gettokensrouting.RouteCandidate) []*Auth {
+	out := make([]*Auth, 0, len(candidates))
+	for _, candidate := range candidates {
+		entry, ok := candidate.Value.(*scheduledAuth)
+		if !ok || entry == nil || entry.auth == nil {
+			continue
+		}
+		out = append(out, entry.auth.Clone())
+	}
+	return out
+}
+
+func scheduledFromRouteCandidates(candidates []gettokensrouting.RouteCandidate) []*scheduledAuth {
+	out := make([]*scheduledAuth, 0, len(candidates))
+	for _, candidate := range candidates {
+		entry, ok := candidate.Value.(*scheduledAuth)
+		if !ok || entry == nil {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func cloneAuthCandidates(entries []*scheduledAuth) []*Auth {

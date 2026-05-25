@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -258,6 +259,10 @@ func (s *AccountRouteGuardStore) indexLocked(block AccountRouteGuardBlock) {
 
 type accountRouteGuardPolicy struct {
 	store *AccountRouteGuardStore
+}
+
+func (p accountRouteGuardPolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
+	return gettokensrouting.PolicyStageHardFilter
 }
 
 func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req coreauth.RoutePolicyRequest) coreauth.RoutePolicyDecision {

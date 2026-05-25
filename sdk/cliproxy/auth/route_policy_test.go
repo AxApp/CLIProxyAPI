@@ -5,8 +5,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+type namedRoutePolicy struct {
+	reason string
+}
+
+func (p *namedRoutePolicy) RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+	return RoutePolicyDecision{Reason: p.reason}
+}
+
+type stagedTestRoutePolicy struct {
+	stage    gettokensrouting.PolicyStage
+	decision RoutePolicyDecision
+}
+
+func (p stagedTestRoutePolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
+	return p.stage
+}
+
+func (p stagedTestRoutePolicy) RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+	if req.Model != "route-policy-staged-hard-deny-model" {
+		return RoutePolicyDecision{}
+	}
+	return p.decision
+}
 
 func TestSchedulerRoutePolicyOrdersReadyCandidates(t *testing.T) {
 	unregister := RegisterRoutePolicy(RoutePolicyFunc(func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
@@ -124,5 +149,94 @@ func TestSchedulerRoutePolicyOrdersMixedProviderCandidates(t *testing.T) {
 	}
 	if got == nil || got.ID != "claude-auth" || provider != "claude" {
 		t.Fatalf("picked = (%#v, %q), want claude-auth/claude", got, provider)
+	}
+}
+
+func TestRoutePolicySnapshotPreservesRegistrationOrder(t *testing.T) {
+	first := &namedRoutePolicy{reason: "first"}
+	second := &namedRoutePolicy{reason: "second"}
+	unregisterFirst := RegisterRoutePolicy(first)
+	defer unregisterFirst()
+	unregisterSecond := RegisterRoutePolicy(second)
+	defer unregisterSecond()
+
+	snapshot := routePolicySnapshot()
+	if len(snapshot) < 2 {
+		t.Fatalf("routePolicySnapshot length = %d, want at least 2", len(snapshot))
+	}
+	if snapshot[len(snapshot)-2] != first || snapshot[len(snapshot)-1] != second {
+		t.Fatalf("latest snapshot policies are not in registration order")
+	}
+}
+
+func TestSchedulerRoutePolicyDenyCannotBeBypassedByLaterAllow(t *testing.T) {
+	unregisterDeny := RegisterRoutePolicy(RoutePolicyFunc(func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+		if req.Model != "route-policy-hard-deny-model" {
+			return RoutePolicyDecision{}
+		}
+		return RoutePolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"}
+	}))
+	defer unregisterDeny()
+	allowFallback := true
+	unregisterAllow := RegisterRoutePolicy(RoutePolicyFunc(func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+		if req.Model != "route-policy-hard-deny-model" {
+			return RoutePolicyDecision{}
+		}
+		return RoutePolicyDecision{
+			AllowIDs:      []string{"blocked"},
+			OrderIDs:      []string{"blocked", "fallback"},
+			AllowFallback: &allowFallback,
+			Reason:        "request allow",
+		}
+	}))
+	defer unregisterAllow()
+	registerSchedulerModels(t, "codex", "route-policy-hard-deny-model", "blocked", "fallback")
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "blocked", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "fallback", Provider: "codex", Status: StatusActive},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "route-policy-hard-deny-model", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle: %v", err)
+	}
+	if got == nil || got.ID != "fallback" {
+		t.Fatalf("picked auth = %#v, want fallback", got)
+	}
+}
+
+func TestSchedulerRoutePolicyHardFilterRunsBeforeEarlierRequestPolicy(t *testing.T) {
+	allowFallback := true
+	unregisterAllow := RegisterRoutePolicy(stagedTestRoutePolicy{
+		stage: gettokensrouting.PolicyStageRequest,
+		decision: RoutePolicyDecision{
+			AllowIDs:      []string{"blocked"},
+			OrderIDs:      []string{"blocked", "fallback"},
+			AllowFallback: &allowFallback,
+			Reason:        "request allow",
+		},
+	})
+	defer unregisterAllow()
+	unregisterDeny := RegisterRoutePolicy(stagedTestRoutePolicy{
+		stage:    gettokensrouting.PolicyStageHardFilter,
+		decision: RoutePolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"},
+	})
+	defer unregisterDeny()
+	registerSchedulerModels(t, "codex", "route-policy-staged-hard-deny-model", "blocked", "fallback")
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "blocked", Provider: "codex", Status: StatusActive},
+		&Auth{ID: "fallback", Provider: "codex", Status: StatusActive},
+	)
+
+	got, err := scheduler.pickSingle(context.Background(), "codex", "route-policy-staged-hard-deny-model", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickSingle: %v", err)
+	}
+	if got == nil || got.ID != "fallback" {
+		t.Fatalf("picked auth = %#v, want fallback", got)
 	}
 }

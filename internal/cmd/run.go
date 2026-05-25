@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword).
+		WithHooks(buildGetTokensStartupHooks(configPath)).
 		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureGetTokensManagementRoutes))
 
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -64,6 +66,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword).
+		WithHooks(buildGetTokensStartupHooks(configPath)).
 		WithServerOptions(api.WithManagementRouterConfigurator(gettokenshooks.ConfigureGetTokensManagementRoutes))
 
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -84,6 +87,38 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 	}()
 
 	return cancelFn, doneCh
+}
+
+func buildGetTokensStartupHooks(configPath string) cliproxy.Hooks {
+	var once sync.Once
+	return cliproxy.Hooks{
+		OnBeforeStart: func(cfg *config.Config) {
+			var installErr error
+			once.Do(func() {
+				installErr = installGetTokensHooks(cfg, configPath)
+			})
+			if installErr != nil {
+				log.Errorf("failed to install gettokens startup hooks: %v", installErr)
+			}
+		},
+	}
+}
+
+func installGetTokensHooks(cfg *config.Config, configPath string) error {
+	gettokenshooks.InstallRoutePolicyHook()
+	if cfg == nil || !cfg.UsageStatisticsEnabled {
+		return nil
+	}
+	opts := gettokenshooks.UsageAttributionOptions{
+		ConfigFilePath: configPath,
+	}
+	if err := gettokenshooks.InstallUsageAttributionHook(opts); err != nil {
+		return err
+	}
+	if err := gettokenshooks.InstallRateLimitHook(opts); err != nil {
+		return err
+	}
+	return nil
 }
 
 // WaitForCloudDeploy waits indefinitely for shutdown signals in cloud deploy mode
