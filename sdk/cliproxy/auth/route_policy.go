@@ -92,10 +92,19 @@ func routePolicySnapshot() []RoutePolicy {
 }
 
 func rewriteScheduledAuths(ctx context.Context, req RoutePolicyRequest, entries []*scheduledAuth) ([]*scheduledAuth, bool) {
+	return rewriteScheduledAuthsWithPolicies(ctx, req, entries, nil)
+}
+
+func rewriteScheduledAuthsWithPolicies(ctx context.Context, req RoutePolicyRequest, entries []*scheduledAuth, extraPolicies []RoutePolicy) ([]*scheduledAuth, bool) {
 	if len(entries) == 0 {
 		return entries, false
 	}
 	policies := routePolicySnapshot()
+	for _, policy := range extraPolicies {
+		if policy != nil {
+			policies = append(policies, policy)
+		}
+	}
 	if len(policies) == 0 {
 		return entries, false
 	}
@@ -147,6 +156,93 @@ func rewriteScheduledAuths(ctx context.Context, req RoutePolicyRequest, entries 
 		return entries, false
 	}
 	return scheduledFromRouteCandidates(result.Candidates), true
+}
+
+func (s *SessionAffinitySelector) RoutePolicyStage() gettokensrouting.PolicyStage {
+	return gettokensrouting.PolicyStageSticky
+}
+
+func (s *SessionAffinitySelector) RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+	if s == nil || s.cache == nil || len(req.Candidates) == 0 {
+		return RoutePolicyDecision{}
+	}
+	primaryID, fallbackID := extractSessionIDs(req.Options.Headers, req.Options.OriginalRequest, req.Options.Metadata)
+	if strings.TrimSpace(primaryID) == "" {
+		return RoutePolicyDecision{}
+	}
+	providerKey := sessionAffinityProviderKey(req.Provider)
+	modelKey := req.Model
+	candidateIDs := make(map[string]struct{}, len(req.Candidates))
+	for _, candidate := range req.Candidates {
+		if candidate == nil || strings.TrimSpace(candidate.ID) == "" {
+			continue
+		}
+		candidateIDs[strings.TrimSpace(candidate.ID)] = struct{}{}
+	}
+	cacheKey := sessionAffinityCacheKey(providerKey, primaryID, modelKey)
+	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		if _, exists := candidateIDs[cachedAuthID]; exists {
+			return RoutePolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity cache hit"}
+		}
+	}
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey := sessionAffinityCacheKey(providerKey, fallbackID, modelKey)
+		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+			if _, exists := candidateIDs[cachedAuthID]; exists {
+				s.cache.Set(cacheKey, cachedAuthID)
+				return RoutePolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity fallback cache hit"}
+			}
+		}
+	}
+	return RoutePolicyDecision{}
+}
+
+func (s *SessionAffinitySelector) BindRouteResult(req RoutePolicyRequest, auth *Auth) {
+	if s == nil || s.cache == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	primaryID, _ := extractSessionIDs(req.Options.Headers, req.Options.OriginalRequest, req.Options.Metadata)
+	if strings.TrimSpace(primaryID) == "" {
+		return
+	}
+	s.cache.Set(sessionAffinityCacheKey(sessionAffinityProviderKey(req.Provider), primaryID, req.Model), strings.TrimSpace(auth.ID))
+}
+
+func sessionAffinityProviderKey(provider string) string {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if provider == "" {
+		return "mixed"
+	}
+	return provider
+}
+
+func sessionAffinityCacheKey(provider, sessionID, model string) string {
+	return sessionAffinityProviderKey(provider) + "::" + strings.TrimSpace(sessionID) + "::" + strings.TrimSpace(model)
+}
+
+func rewriteAuthCandidates(ctx context.Context, req RoutePolicyRequest, auths []*Auth) ([]*Auth, bool) {
+	if len(auths) == 0 {
+		return auths, false
+	}
+	entries := make([]*scheduledAuth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		entries = append(entries, &scheduledAuth{auth: auth})
+	}
+	rewritten, active := rewriteScheduledAuths(ctx, req, entries)
+	if !active {
+		return auths, false
+	}
+	out := make([]*Auth, 0, len(rewritten))
+	for _, entry := range rewritten {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		out = append(out, entry.auth)
+	}
+	return out, true
 }
 
 type stagedRoutePolicy interface {

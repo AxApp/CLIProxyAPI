@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -168,16 +167,11 @@ var (
 	rateLimitMu              sync.RWMutex
 	defaultRateLimitStore    *rateLimitStore
 	defaultRateLimitEval     *RateLimitEvaluator
-	defaultRateLimitCleanup  func()
 	defaultRateLimitRegistry = NewRateLimitStrategyRegistry(
 		rateLimitTokenWindowStrategy{},
 		rateLimitRequestWindowStrategy{},
 	)
 )
-
-type rateLimitPolicy struct {
-	evaluator *RateLimitEvaluator
-}
 
 func NewRateLimitStrategyRegistry(strategies ...RateLimitStrategy) *RateLimitStrategyRegistry {
 	registry := &RateLimitStrategyRegistry{
@@ -322,12 +316,8 @@ func InstallRateLimitHook(opts UsageAttributionOptions) error {
 	if defaultRateLimitEval != nil {
 		defaultRateLimitEval.Stop()
 	}
-	if defaultRateLimitCleanup != nil {
-		defaultRateLimitCleanup()
-	}
 	defaultRateLimitStore = store
 	defaultRateLimitEval = evaluator
-	defaultRateLimitCleanup = coreauth.RegisterRoutePolicy(rateLimitPolicy{evaluator: evaluator})
 	rateLimitMu.Unlock()
 
 	log.Infof("gettokenshooks: rate limit store ready at %s", dbPath)
@@ -806,21 +796,6 @@ func (e *RateLimitEvaluator) replaceStatesForTest(states []RateLimitState) {
 		indexRateLimitLookup(e.byLookup, state)
 	}
 	ReplaceAccountRouteGuardSource(AccountRouteGuardSourceRateLimit, rateLimitRouteGuardBlocks(e.byKey))
-}
-
-func (p rateLimitPolicy) RewriteCandidates(ctx context.Context, req coreauth.RoutePolicyRequest) coreauth.RoutePolicyDecision {
-	if p.evaluator == nil {
-		return coreauth.RoutePolicyDecision{}
-	}
-	deny := p.evaluator.DenyIDsForCandidates(req.Candidates)
-	if len(deny) == 0 {
-		return coreauth.RoutePolicyDecision{}
-	}
-	return coreauth.RoutePolicyDecision{DenyIDs: deny, Reason: "gettokens rate limit"}
-}
-
-func (p rateLimitPolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
-	return gettokensrouting.PolicyStageHardFilter
 }
 
 func rateLimitRouteGuardBlocks(states map[string]RateLimitState) []AccountRouteGuardBlock {

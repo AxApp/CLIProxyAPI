@@ -1537,6 +1537,36 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterRouteGuardBlock(t *testing.T) 
 	}
 }
 
+func TestResponsesWebsocketRequestBoundaryReleaseUsesRouteGuard(t *testing.T) {
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	})
+
+	auth := &coreauth.Auth{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive}
+	resolve := func(authID string) (*coreauth.Auth, bool) {
+		if authID == auth.ID {
+			return auth, true
+		}
+		return nil, false
+	}
+
+	next, forceReplay, released := responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve)
+	if released || forceReplay || next != auth.ID {
+		t.Fatalf("unguarded release = (%q, %v, %v), want unchanged", next, forceReplay, released)
+	}
+
+	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
+		Source: gettokenshooks.AccountRouteGuardSourceManualDisabled,
+		AuthID: auth.ID,
+		Reason: "disabled by user",
+	})
+	next, forceReplay, released = responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve)
+	if !released || !forceReplay || next != "" {
+		t.Fatalf("guarded release = (%q, %v, %v), want released replay", next, forceReplay, released)
+	}
+}
+
 func TestNormalizeResponsesWebsocketRequestTreatsTranscriptReplacementAsReset(t *testing.T) {
 	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"},{"type":"function_call","id":"fc-1","call_id":"call-1"},{"type":"function_call_output","id":"tool-out-1","call_id":"call-1"},{"type":"message","id":"assistant-1","role":"assistant"}]}`)
 	lastResponseOutput := []byte(`[

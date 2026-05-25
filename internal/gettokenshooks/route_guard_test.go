@@ -2,6 +2,7 @@ package gettokenshooks
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -59,6 +60,67 @@ func TestAccountRouteGuardSourcesDoNotUnblockEachOther(t *testing.T) {
 
 	store.ClearAuth(AccountRouteGuardSourceManualDisabled, authID)
 	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: authID}}); len(got) != 0 {
+		t.Fatalf("DenyIDs after clearing manual-disabled = %#v, want empty", got)
+	}
+}
+
+func TestAccountRouteGuardResultHookBlocksAndClearsTransientFailure(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	hook := AccountRouteGuardResultHook{Store: store}
+	retryAfter := 2 * time.Minute
+
+	hook.OnResult(context.Background(), coreauth.Result{
+		AuthID:     "codex-auth-1",
+		Provider:   "codex",
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota window exhausted"},
+	})
+
+	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex-auth-1", Provider: "codex"}}); len(got) != 1 || got[0] != "codex-auth-1" {
+		t.Fatalf("DenyIDs after 429 = %#v, want transient block", got)
+	}
+
+	hook.OnResult(context.Background(), coreauth.Result{
+		AuthID:   "codex-auth-1",
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  true,
+	})
+
+	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex-auth-1", Provider: "codex"}}); len(got) != 0 {
+		t.Fatalf("DenyIDs after success = %#v, want transient block cleared", got)
+	}
+}
+
+func TestAccountRouteGuardResultHookDoesNotClearManualDisabled(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	hook := AccountRouteGuardResultHook{Store: store}
+	authID := "codex-auth-1"
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source: AccountRouteGuardSourceManualDisabled,
+		AuthID: authID,
+		Reason: "disabled by user",
+	})
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:    AccountRouteGuardSourceUpstreamTransientErr,
+		AuthID:    authID,
+		Reason:    "temporary upstream failure",
+		ExpiresAt: time.Now().Add(time.Minute),
+	})
+
+	hook.OnResult(context.Background(), coreauth.Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Success:  true,
+	})
+
+	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: authID, Provider: "codex"}}); len(got) != 1 || got[0] != authID {
+		t.Fatalf("DenyIDs after success = %#v, want manual-disabled block to remain", got)
+	}
+	store.ClearAuth(AccountRouteGuardSourceManualDisabled, authID)
+	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: authID, Provider: "codex"}}); len(got) != 0 {
 		t.Fatalf("DenyIDs after clearing manual-disabled = %#v, want empty", got)
 	}
 }

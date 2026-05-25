@@ -408,6 +408,18 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
 	}
+
+	sessionSelector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Hour,
+	})
+	manager.SetSelector(sessionSelector)
+	if manager.scheduler.strategy != schedulerStrategyFillFirst {
+		t.Fatalf("session-affinity scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
+	if manager.scheduler.sessionAffinity != sessionSelector {
+		t.Fatalf("session-affinity policy was not attached to scheduler")
+	}
 }
 
 func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {

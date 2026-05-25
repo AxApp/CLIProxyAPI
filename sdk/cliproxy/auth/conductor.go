@@ -221,9 +221,11 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 }
 
 func isBuiltInSelector(selector Selector) bool {
-	switch selector.(type) {
+	switch typed := selector.(type) {
 	case *RoundRobinSelector, *FillFirstSelector:
 		return true
+	case *SessionAffinitySelector:
+		return typed != nil && isBuiltInSelector(typed.fallback)
 	default:
 		return false
 	}
@@ -3035,6 +3037,20 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
+	if rewritten, active := rewriteAuthCandidates(ctx, RoutePolicyRequest{
+		Provider:   strings.TrimSpace(strings.ToLower(provider)),
+		Model:      model,
+		Options:    opts,
+		Tried:      tried,
+		Now:        time.Now(),
+		Candidates: available,
+	}, available); active {
+		available = rewritten
+		if len(available) == 0 {
+			m.mu.RUnlock()
+			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available after route policy"}
+		}
+	}
 	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
@@ -3128,10 +3144,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 
 	providerSet := make(map[string]struct{}, len(providers))
+	normalizedProviders := make([]string, 0, len(providers))
 	for _, provider := range providers {
 		p := strings.TrimSpace(strings.ToLower(provider))
 		if p == "" {
 			continue
+		}
+		if _, exists := providerSet[p]; !exists {
+			normalizedProviders = append(normalizedProviders, p)
 		}
 		providerSet[p] = struct{}{}
 	}
@@ -3186,6 +3206,21 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
+	}
+	if rewritten, active := rewriteAuthCandidates(ctx, RoutePolicyRequest{
+		Provider:   "mixed",
+		Providers:  normalizedProviders,
+		Model:      model,
+		Options:    opts,
+		Tried:      tried,
+		Now:        time.Now(),
+		Candidates: available,
+	}, available); active {
+		available = rewritten
+		if len(available) == 0 {
+			m.mu.RUnlock()
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available after route policy"}
+		}
 	}
 	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {

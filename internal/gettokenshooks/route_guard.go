@@ -2,6 +2,7 @@ package gettokenshooks
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,9 +14,18 @@ import (
 )
 
 const (
-	AccountRouteGuardSourceManualDisabled = "manual-disabled"
-	AccountRouteGuardSourceRateLimit      = "rate-limit"
+	AccountRouteGuardSourceManualDisabled       = "manual-disabled"
+	AccountRouteGuardSourceRateLimit            = "rate-limit"
+	AccountRouteGuardSourceAuthError            = "auth-error"
+	AccountRouteGuardSourceUpstreamRateLimit    = "upstream-rate-limit"
+	AccountRouteGuardSourceUpstreamTransientErr = "upstream-error"
 )
+
+var accountRouteGuardResultTransientSources = []string{
+	AccountRouteGuardSourceAuthError,
+	AccountRouteGuardSourceUpstreamRateLimit,
+	AccountRouteGuardSourceUpstreamTransientErr,
+}
 
 type AccountRouteGuardBlock struct {
 	Source     string
@@ -85,6 +95,36 @@ func ClearManualDisabledAuth(auth *coreauth.Auth) {
 		return
 	}
 	defaultAccountRouteGuardStore.ClearAuth(AccountRouteGuardSourceManualDisabled, auth.ID)
+}
+
+type AccountRouteGuardResultHook struct {
+	coreauth.NoopHook
+	Store *AccountRouteGuardStore
+}
+
+func (h AccountRouteGuardResultHook) OnResult(_ context.Context, result coreauth.Result) {
+	store := h.Store
+	if store == nil {
+		store = defaultAccountRouteGuardStore
+	}
+	store.MarkResult(result)
+}
+
+func (s *AccountRouteGuardStore) MarkResult(result coreauth.Result) {
+	if s == nil || strings.TrimSpace(result.AuthID) == "" {
+		return
+	}
+	if result.Success {
+		for _, source := range accountRouteGuardResultTransientSources {
+			s.ClearAuth(source, result.AuthID)
+		}
+		return
+	}
+	block, ok := accountRouteGuardBlockForResult(result)
+	if !ok {
+		return
+	}
+	s.MarkBlocked(block)
 }
 
 func (s *AccountRouteGuardStore) MarkBlocked(block AccountRouteGuardBlock) {
@@ -310,6 +350,61 @@ func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteG
 	}
 	block.LookupKeys = keys
 	return block
+}
+
+func accountRouteGuardBlockForResult(result coreauth.Result) (AccountRouteGuardBlock, bool) {
+	authID := strings.TrimSpace(result.AuthID)
+	if authID == "" || result.Error == nil {
+		return AccountRouteGuardBlock{}, false
+	}
+	status := result.Error.StatusCode()
+	source := ""
+	reason := strings.TrimSpace(result.Error.Code)
+	if reason == "" {
+		reason = strings.TrimSpace(result.Error.Message)
+	}
+	cooldown := time.Duration(0)
+	switch {
+	case status == http.StatusUnauthorized:
+		source = AccountRouteGuardSourceAuthError
+		reason = defaultAccountRouteGuardReason(reason, "auth error")
+	case status == http.StatusTooManyRequests:
+		source = AccountRouteGuardSourceUpstreamRateLimit
+		reason = defaultAccountRouteGuardReason(reason, "upstream rate limit")
+		cooldown = time.Minute
+	case status == http.StatusRequestTimeout || (status >= http.StatusInternalServerError && status <= 599):
+		source = AccountRouteGuardSourceUpstreamTransientErr
+		reason = defaultAccountRouteGuardReason(reason, "upstream transient error")
+		cooldown = 30 * time.Second
+	case strings.Contains(strings.ToLower(strings.TrimSpace(result.Error.Code)), "timeout") || strings.Contains(strings.ToLower(strings.TrimSpace(result.Error.Message)), "timeout"):
+		source = AccountRouteGuardSourceUpstreamTransientErr
+		reason = defaultAccountRouteGuardReason(reason, "upstream timeout")
+		cooldown = 30 * time.Second
+	default:
+		return AccountRouteGuardBlock{}, false
+	}
+	if result.RetryAfter != nil && *result.RetryAfter > 0 {
+		cooldown = *result.RetryAfter
+	}
+	block := AccountRouteGuardBlock{
+		Source:     source,
+		AuthID:     authID,
+		AccountKey: "auth-id:" + authID,
+		MatchKey:   "auth-id:" + authID,
+		Reason:     reason,
+	}
+	if cooldown > 0 {
+		block.ExpiresAt = time.Now().UTC().Add(cooldown)
+	}
+	return block, true
+}
+
+func defaultAccountRouteGuardReason(reason string, fallback string) string {
+	reason = strings.TrimSpace(reason)
+	if reason != "" {
+		return reason
+	}
+	return fallback
 }
 
 func accountRouteGuardBlockKey(block AccountRouteGuardBlock) string {

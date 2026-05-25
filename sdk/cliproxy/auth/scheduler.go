@@ -32,11 +32,12 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu              sync.Mutex
+	strategy        schedulerStrategy
+	sessionAffinity *SessionAffinitySelector
+	providers       map[string]*providerScheduler
+	authProviders   map[string]string
+	mixedCursors    map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -166,23 +167,36 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		strategy:        selectorStrategy(selector),
+		sessionAffinity: selectorSessionAffinity(selector),
+		providers:       make(map[string]*providerScheduler),
+		authProviders:   make(map[string]string),
+		mixedCursors:    make(map[string]int),
 	}
 }
 
 // selectorStrategy maps a selector implementation to the scheduler semantics it should emulate.
 func selectorStrategy(selector Selector) schedulerStrategy {
-	switch selector.(type) {
+	switch typed := selector.(type) {
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
+	case *SessionAffinitySelector:
+		if typed == nil {
+			return schedulerStrategyRoundRobin
+		}
+		return selectorStrategy(typed.fallback)
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
 		return schedulerStrategyCustom
 	}
+}
+
+func selectorSessionAffinity(selector Selector) *SessionAffinitySelector {
+	if typed, ok := selector.(*SessionAffinitySelector); ok {
+		return typed
+	}
+	return nil
 }
 
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.
@@ -193,6 +207,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
+	s.sessionAffinity = selectorSessionAffinity(selector)
 	clear(s.mixedCursors)
 }
 
@@ -270,19 +285,22 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked, active := shard.pickRoutePolicyLocked(ctx, RoutePolicyRequest{
+	req := RoutePolicyRequest{
 		Provider: providerKey,
 		Model:    model,
 		Options:  opts,
 		Tried:    tried,
 		Now:      time.Now(),
-	}, preferWebsocket, predicate); active {
+	}
+	if picked, active := shard.pickRoutePolicyLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity); active {
 		if picked != nil {
+			s.sessionAffinity.BindRouteResult(req, picked)
 			return picked, nil
 		}
 		return nil, shard.unavailableErrorLocked(provider, model, predicate)
 	}
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+		s.sessionAffinity.BindRouteResult(req, picked)
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -383,6 +401,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
 			if picked != nil {
+				s.sessionAffinity.BindRouteResult(RoutePolicyRequest{
+					Provider:  "mixed",
+					Providers: append([]string(nil), normalized...),
+					Model:     model,
+					Options:   opts,
+					Tried:     tried,
+					Now:       time.Now(),
+				}, picked)
 				return picked, providerKey, nil
 			}
 		}
@@ -440,6 +466,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			continue
 		}
 		s.mixedCursors[cursorKey] = slot + 1
+		s.sessionAffinity.BindRouteResult(RoutePolicyRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, picked)
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
@@ -499,20 +533,22 @@ func (s *authScheduler) pickMixedRoutePolicyLocked(ctx context.Context, provider
 			providerByAuthID[entry.auth.ID] = providerKey
 		}
 	}
-	rewritten, active := rewriteScheduledAuths(ctx, RoutePolicyRequest{
+	req := RoutePolicyRequest{
 		Provider:  "mixed",
 		Providers: append([]string(nil), providers...),
 		Model:     model,
 		Options:   opts,
 		Tried:     tried,
 		Now:       time.Now(),
-	}, entries)
+	}
+	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []RoutePolicy{s.sessionAffinity})
 	if !active {
 		return nil, "", false
 	}
 	if len(rewritten) == 0 || rewritten[0] == nil || rewritten[0].auth == nil {
 		return nil, "", true
 	}
+	s.sessionAffinity.BindRouteResult(req, rewritten[0].auth)
 	return rewritten[0].auth, providerByAuthID[rewritten[0].auth.ID], true
 }
 
@@ -823,12 +859,12 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
 }
 
-func (m *modelScheduler) pickRoutePolicyLocked(ctx context.Context, req RoutePolicyRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool) (*Auth, bool) {
+func (m *modelScheduler) pickRoutePolicyLocked(ctx context.Context, req RoutePolicyRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, extraPolicies ...RoutePolicy) (*Auth, bool) {
 	if m == nil {
 		return nil, false
 	}
 	entries := m.readyCandidatesLocked(preferWebsocket, predicate)
-	rewritten, active := rewriteScheduledAuths(ctx, req, entries)
+	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, extraPolicies)
 	if !active {
 		return nil, false
 	}

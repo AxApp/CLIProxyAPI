@@ -346,7 +346,10 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 	}
 }
 
-func TestRateLimitPolicyAddsBlockedCandidateToDenyIDs(t *testing.T) {
+func TestRateLimitEvaluatorFeedsAccountRouteGuardPolicy(t *testing.T) {
+	ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit) })
+
 	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {
 		t.Fatalf("new rate limit store: %v", err)
@@ -360,11 +363,14 @@ func TestRateLimitPolicyAddsBlockedCandidateToDenyIDs(t *testing.T) {
 		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
 	}})
 
-	decision := rateLimitPolicy{evaluator: evaluator}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
+	decision := accountRouteGuardPolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
 		Candidates: []*coreauth.Auth{{ID: "openai-compatibility:mi:abc123", Provider: "mi"}},
 	})
 	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "openai-compatibility:mi:abc123" {
 		t.Fatalf("DenyIDs = %#v, want blocked candidate", decision.DenyIDs)
+	}
+	if decision.Reason != "gettokens account route guard" {
+		t.Fatalf("Reason = %q, want account route guard path", decision.Reason)
 	}
 }
 

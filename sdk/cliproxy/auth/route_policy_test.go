@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -238,5 +239,98 @@ func TestSchedulerRoutePolicyHardFilterRunsBeforeEarlierRequestPolicy(t *testing
 	}
 	if got == nil || got.ID != "fallback" {
 		t.Fatalf("picked auth = %#v, want fallback", got)
+	}
+}
+
+func TestLegacySessionAffinityRoutePolicyDenyCannotBeBypassed(t *testing.T) {
+	unregister := RegisterRoutePolicy(RoutePolicyFunc(func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+		return RoutePolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"}
+	}))
+	defer unregister()
+
+	manager := NewManager(nil, NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Hour,
+	}), nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "blocked", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(blocked): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "fallback", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(fallback): %v", err)
+	}
+
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-route-policy-deny"}}}
+	got, _, errPick := manager.pickNext(context.Background(), "codex", "", opts, map[string]struct{}{})
+	if errPick != nil {
+		t.Fatalf("pickNext() error = %v", errPick)
+	}
+	if got == nil || got.ID != "fallback" {
+		t.Fatalf("pickNext() auth = %#v, want fallback", got)
+	}
+}
+
+func TestLegacyMixedSessionAffinityRoutePolicyDenyCannotBeBypassed(t *testing.T) {
+	unregister := RegisterRoutePolicy(RoutePolicyFunc(func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
+		if req.Provider != "mixed" {
+			return RoutePolicyDecision{}
+		}
+		return RoutePolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"}
+	}))
+	defer unregister()
+
+	manager := NewManager(nil, NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &FillFirstSelector{},
+		TTL:      time.Hour,
+	}), nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	manager.executors["claude"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "blocked", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(blocked): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "fallback", Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(fallback): %v", err)
+	}
+
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-route-policy-mixed-deny"}}}
+	got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"codex", "claude"}, "", opts, map[string]struct{}{})
+	if errPick != nil {
+		t.Fatalf("pickNextMixed() error = %v", errPick)
+	}
+	if got == nil || got.ID != "fallback" || provider != "claude" {
+		t.Fatalf("pickNextMixed() = (%#v, %q), want fallback/claude", got, provider)
+	}
+}
+
+func TestSchedulerSessionAffinityStickyPolicyBindsSelectedAuth(t *testing.T) {
+	manager := NewManager(nil, NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Hour,
+	}), nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-sticky-policy"}}}
+	if primaryID, _ := extractSessionIDs(opts.Headers, nil, nil); primaryID != "header:session-sticky-policy" {
+		t.Fatalf("session id = %q, want header:session-sticky-policy", primaryID)
+	}
+	first, _, errFirst := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errFirst != nil {
+		t.Fatalf("first pickNext() error = %v", errFirst)
+	}
+	if cached, ok := manager.scheduler.sessionAffinity.cache.Get("codex::header:session-sticky-policy::"); !ok || first == nil || cached != first.ID {
+		t.Fatalf("sticky cache after first pick = (%q, %v), want %q", cached, ok, first.ID)
+	}
+	second, _, errSecond := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errSecond != nil {
+		t.Fatalf("second pickNext() error = %v", errSecond)
+	}
+	if first == nil || second == nil || first.ID != second.ID {
+		t.Fatalf("sticky picks = (%#v, %#v), want same auth", first, second)
 	}
 }

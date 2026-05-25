@@ -142,14 +142,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// )
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
-		if pinnedAuthID != "" {
-			if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && gettokenshooks.AccountRouteGuardBlocksAuth(pinnedAuth) {
-				pinnedAuthID = ""
-				forceTranscriptReplayNextRequest = true
-				if h != nil && h.AuthManager != nil {
-					h.AuthManager.CloseExecutionSession(passthroughSessionID)
-				}
-			}
+		if nextPinnedAuthID, forceReplay, released := responsesWebsocketReleasePinnedAuthAtRequestBoundary(
+			passthroughSessionID,
+			pinnedAuthID,
+			h.AuthManager,
+			sessionAuthByID,
+		); released {
+			pinnedAuthID = nextPinnedAuthID
+			forceTranscriptReplayNextRequest = forceReplay
 		}
 
 		allowIncrementalInputWithPreviousResponseID := false
@@ -281,6 +281,26 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		lastResponseOutput = completedOutput
 	}
+}
+
+func responsesWebsocketReleasePinnedAuthAtRequestBoundary(
+	sessionID string,
+	pinnedAuthID string,
+	manager *coreauth.Manager,
+	resolveAuth func(string) (*coreauth.Auth, bool),
+) (nextPinnedAuthID string, forceTranscriptReplay bool, released bool) {
+	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
+	if pinnedAuthID == "" || resolveAuth == nil {
+		return pinnedAuthID, false, false
+	}
+	pinnedAuth, ok := resolveAuth(pinnedAuthID)
+	if !ok || pinnedAuth == nil || !gettokenshooks.AccountRouteGuardBlocksAuth(pinnedAuth) {
+		return pinnedAuthID, false, false
+	}
+	if manager != nil {
+		manager.CloseExecutionSession(sessionID)
+	}
+	return "", true, true
 }
 
 func websocketClientAddress(c *gin.Context) string {
