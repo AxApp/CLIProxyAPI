@@ -1,8 +1,12 @@
 package gettokenshooks
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,9 +22,10 @@ import (
 )
 
 const (
-	liveSessionsRetention      = 30 * time.Minute
-	liveSessionsRetentionLabel = "30m / 200"
-	liveSessionsMaxItems       = 200
+	liveSessionsRetention       = 30 * time.Minute
+	liveSessionsRetentionLabel  = "30m / 200"
+	liveSessionsMaxItems        = 200
+	liveSessionProjectLookupTTL = 10 * time.Second
 )
 
 type LiveSessionsSnapshot struct {
@@ -43,6 +48,7 @@ type LiveSessionSummary struct {
 
 type LiveSession struct {
 	SessionID           string              `json:"sessionID"`
+	ProjectName         string              `json:"projectName,omitempty"`
 	ExecutionSessionID  string              `json:"executionSessionID,omitempty"`
 	DownstreamSessionID string              `json:"downstreamSessionID,omitempty"`
 	CodexWindowID       string              `json:"codexWindowID,omitempty"`
@@ -150,10 +156,13 @@ type CodexLiveRequestStart struct {
 }
 
 type liveSessionTracker struct {
-	mu         sync.RWMutex
-	sessions   map[string]*liveSessionState
-	requestMap map[string]string
-	seq        int64
+	mu                       sync.RWMutex
+	sessions                 map[string]*liveSessionState
+	requestMap               map[string]string
+	projectLookupCodexHome   string
+	projectLookup            map[string]string
+	projectLookupLastRefresh time.Time
+	seq                      int64
 }
 
 type liveSessionState struct {
@@ -170,6 +179,18 @@ type liveRequestState struct {
 	longestEventGap   int64
 	upstreamStarted   time.Time
 	upstreamConnected time.Time
+}
+
+type codexSessionMetaEnvelope struct {
+	ID  string `json:"id"`
+	Cwd string `json:"cwd"`
+	Git struct {
+		RepositoryURL string `json:"repository_url"`
+	} `json:"git"`
+}
+
+type codexTurnContextEnvelope struct {
+	Cwd string `json:"cwd"`
 }
 
 var (
@@ -521,6 +542,7 @@ func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
 	sort.SliceStable(items, func(i, j int) bool {
 		return items[i].LastEventAt > items[j].LastEventAt
 	})
+	t.enrichSnapshotProjectNames(items, now)
 	summary := LiveSessionSummary{}
 	for _, session := range items {
 		if session.Status == "active" || session.Status == "streaming" {
@@ -550,6 +572,236 @@ func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
 		Summary:      summary,
 		Sessions:     items,
 	}
+}
+
+func (t *liveSessionTracker) enrichSnapshotProjectNames(items []LiveSession, now time.Time) {
+	needsLookup := false
+	for _, item := range items {
+		if strings.TrimSpace(item.ProjectName) == "" {
+			needsLookup = true
+			break
+		}
+	}
+	if !needsLookup {
+		return
+	}
+
+	codexHome, err := resolveLiveSessionCodexHome()
+	if err != nil || strings.TrimSpace(codexHome) == "" {
+		return
+	}
+	lookup, err := t.liveSessionProjectLookup(codexHome, now)
+	if err != nil || len(lookup) == 0 {
+		return
+	}
+
+	for index := range items {
+		if strings.TrimSpace(items[index].ProjectName) != "" {
+			continue
+		}
+		if projectName := findLiveSessionProjectName(lookup, items[index]); projectName != "" {
+			items[index].ProjectName = projectName
+		}
+	}
+}
+
+func (t *liveSessionTracker) liveSessionProjectLookup(codexHome string, now time.Time) (map[string]string, error) {
+	t.mu.RLock()
+	if t.projectLookupCodexHome == codexHome &&
+		!t.projectLookupLastRefresh.IsZero() &&
+		now.Sub(t.projectLookupLastRefresh) < liveSessionProjectLookupTTL {
+		lookup := cloneLiveSessionProjectLookup(t.projectLookup)
+		t.mu.RUnlock()
+		return lookup, nil
+	}
+	t.mu.RUnlock()
+
+	lookup, err := buildLiveSessionProjectLookup(codexHome)
+	if err != nil {
+		return nil, err
+	}
+
+	t.mu.Lock()
+	t.projectLookupCodexHome = codexHome
+	t.projectLookup = cloneLiveSessionProjectLookup(lookup)
+	t.projectLookupLastRefresh = now
+	t.mu.Unlock()
+	return lookup, nil
+}
+
+func buildLiveSessionProjectLookup(codexHome string) (map[string]string, error) {
+	paths, err := listCodexSessionJSONLPaths(codexHome)
+	if err != nil {
+		return nil, err
+	}
+	lookup := map[string]string{}
+	for _, absolutePath := range paths {
+		relativePath, err := filepath.Rel(codexHome, absolutePath)
+		if err != nil {
+			continue
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		sessionID, projectName := readLiveSessionCodexProjectIdentity(absolutePath, relativePath)
+		if strings.TrimSpace(projectName) == "" {
+			continue
+		}
+		addLiveSessionProjectLookupKey(lookup, relativePath, projectName)
+		addLiveSessionProjectLookupKey(lookup, strings.TrimSuffix(filepath.Base(relativePath), filepath.Ext(relativePath)), projectName)
+		addLiveSessionProjectLookupKey(lookup, sessionID, projectName)
+	}
+	return lookup, nil
+}
+
+func listCodexSessionJSONLPaths(codexHome string) ([]string, error) {
+	roots := []string{
+		filepath.Join(codexHome, "sessions"),
+		filepath.Join(codexHome, "archived_sessions"),
+	}
+	paths := []string{}
+	for _, root := range roots {
+		if _, err := os.Stat(root); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(d.Name(), ".jsonl") {
+				paths = append(paths, path)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func readLiveSessionCodexProjectIdentity(absolutePath string, relativePath string) (string, string) {
+	file, err := os.Open(absolutePath)
+	if err != nil {
+		return "", ""
+	}
+	defer file.Close()
+
+	var meta codexSessionMetaEnvelope
+	currentCWD := ""
+	sessionID := ""
+	projectName := ""
+	scanner := bufio.NewScanner(file)
+	buffer := make([]byte, 0, 64*1024)
+	scanner.Buffer(buffer, 1024*1024)
+	for scanner.Scan() {
+		var envelope struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil {
+			continue
+		}
+		switch envelope.Type {
+		case "session_meta":
+			if err := json.Unmarshal(envelope.Payload, &meta); err == nil {
+				sessionID = strings.TrimSpace(meta.ID)
+				projectName = deriveLiveSessionProjectName(meta, currentCWD)
+			}
+		case "turn_context":
+			var turnContext codexTurnContextEnvelope
+			if err := json.Unmarshal(envelope.Payload, &turnContext); err == nil && strings.TrimSpace(turnContext.Cwd) != "" {
+				currentCWD = turnContext.Cwd
+				projectName = deriveLiveSessionProjectName(meta, currentCWD)
+			}
+		}
+		if sessionID != "" && strings.TrimSpace(projectName) != "" {
+			break
+		}
+	}
+	return sessionID, strings.TrimSpace(projectName)
+}
+
+func deriveLiveSessionProjectName(meta codexSessionMetaEnvelope, cwd string) string {
+	if projectName := liveSessionPathBase(cwd); projectName != "" {
+		return projectName
+	}
+	if projectName := liveSessionPathBase(meta.Cwd); projectName != "" {
+		return projectName
+	}
+	if projectName := liveSessionRepoName(meta.Git.RepositoryURL); projectName != "" {
+		return projectName
+	}
+	return ""
+}
+
+func addLiveSessionProjectLookupKey(lookup map[string]string, key string, projectName string) {
+	key = strings.TrimSpace(key)
+	projectName = strings.TrimSpace(projectName)
+	if key == "" || projectName == "" {
+		return
+	}
+	lookup[key] = projectName
+}
+
+func cloneLiveSessionProjectLookup(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func findLiveSessionProjectName(lookup map[string]string, session LiveSession) string {
+	for _, key := range []string{
+		session.SessionID,
+		session.ExecutionSessionID,
+		session.DownstreamSessionID,
+		session.CodexWindowID,
+		conversationIDFromCodexWindowID(session.CodexWindowID),
+	} {
+		if projectName := lookup[strings.TrimSpace(key)]; projectName != "" {
+			return projectName
+		}
+	}
+	return ""
+}
+
+func resolveLiveSessionCodexHome() (string, error) {
+	if override := strings.TrimSpace(os.Getenv("CODEX_HOME")); override != "" {
+		return override, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func liveSessionPathBase(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	return filepath.Base(cwd)
+}
+
+func liveSessionRepoName(repositoryURL string) string {
+	repositoryURL = strings.TrimSpace(repositoryURL)
+	if repositoryURL == "" {
+		return ""
+	}
+	repositoryURL = strings.TrimSuffix(repositoryURL, ".git")
+	repositoryURL = strings.TrimSuffix(repositoryURL, "/")
+	parts := strings.Split(repositoryURL, "/")
+	return strings.TrimSpace(parts[len(parts)-1])
 }
 
 func (t *liveSessionTracker) ensureSessionLocked(sessionID string, now time.Time) *liveSessionState {
@@ -661,6 +913,7 @@ func mergeLiveSessionState(target *liveSessionState, source *liveSessionState) {
 		return
 	}
 	target.session.ExecutionSessionID = firstNonEmptyString(target.session.ExecutionSessionID, source.session.ExecutionSessionID)
+	target.session.ProjectName = firstNonEmptyString(target.session.ProjectName, source.session.ProjectName)
 	target.session.DownstreamSessionID = firstNonEmptyString(target.session.DownstreamSessionID, source.session.DownstreamSessionID)
 	target.session.CodexWindowID = firstNonEmptyString(target.session.CodexWindowID, source.session.CodexWindowID)
 	target.session.Model = firstNonEmptyString(target.session.Model, source.session.Model)

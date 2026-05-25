@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -165,6 +167,39 @@ func TestLiveSessionsCoalescesRequestsByCodexConversationID(t *testing.T) {
 		if request.ClientRequestID != conversationID {
 			t.Fatalf("request %s clientRequestID = %q, want %q", request.RequestID, request.ClientRequestID, conversationID)
 		}
+	}
+}
+
+func TestLiveSessionsSnapshotEnrichesProjectNameFromLocalCodexSession(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	codexHome := filepath.Join(t.TempDir(), ".codex")
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "05", "25")
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir sessions dir: %v", err)
+	}
+	conversationID := "0198f708-8dbf-7c90-a20a-30f4ebf7244f"
+	sessionPath := filepath.Join(sessionsDir, "rollout-2026-05-25T10-00-00-gettokens.jsonl")
+	payload := "" +
+		"{\"timestamp\":\"2026-05-25T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" + conversationID + "\",\"cwd\":\"/Users/linhey/Desktop/linhay-open-sources/GetTokens\",\"git\":{\"repository_url\":\"git@github.com:linhay/GetTokens.git\"}}}\n" +
+		"{\"timestamp\":\"2026-05-25T10:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"检查 live session 项目名\"}]}}\n"
+	if err := os.WriteFile(sessionPath, []byte(payload), 0600); err != nil {
+		t.Fatalf("write codex session: %v", err)
+	}
+	t.Setenv("CODEX_HOME", codexHome)
+
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("passthrough-1", "ws-req-1", "gpt-5.5", CodexLiveSessionIdentity{
+		ConversationID:  conversationID,
+		ClientRequestID: conversationID,
+		CodexWindowID:   conversationID + ":0",
+	})
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if got := snapshot.Sessions[0].ProjectName; got != "GetTokens" {
+		t.Fatalf("projectName = %q, want GetTokens", got)
 	}
 }
 
