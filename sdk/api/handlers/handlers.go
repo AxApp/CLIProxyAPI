@@ -582,13 +582,15 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		var se interface{ StatusCode() int }
+		if errors.As(err, &se) && se != nil {
 			if code := se.StatusCode(); code > 0 {
 				status = code
 			}
 		}
 		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		var he interface{ Headers() http.Header }
+		if errors.As(err, &he) && he != nil {
 			if hdr := he.Headers(); hdr != nil {
 				addon = hdr.Clone()
 			}
@@ -631,13 +633,15 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		var se interface{ StatusCode() int }
+		if errors.As(err, &se) && se != nil {
 			if code := se.StatusCode(); code > 0 {
 				status = code
 			}
 		}
 		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		var he interface{ Headers() http.Header }
+		if errors.As(err, &he) && he != nil {
 			if hdr := he.Headers(); hdr != nil {
 				addon = hdr.Clone()
 			}
@@ -694,13 +698,15 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		var se interface{ StatusCode() int }
+		if errors.As(err, &se) && se != nil {
 			if code := se.StatusCode(); code > 0 {
 				status = code
 			}
 		}
 		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		var he interface{ Headers() http.Header }
+		if errors.As(err, &he) && he != nil {
 			if hdr := he.Headers(); hdr != nil {
 				addon = hdr.Clone()
 			}
@@ -871,7 +877,8 @@ func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+	var se interface{ StatusCode() int }
+	if errors.As(err, &se) && se != nil {
 		if code := se.StatusCode(); code > 0 {
 			return code
 		}

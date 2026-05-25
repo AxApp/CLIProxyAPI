@@ -1398,9 +1398,8 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 	requests := []string{
 		`{"type":"response.create","model":"quota-model","input":[{"type":"message","id":"msg-1"}]}`,
 		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-2"}]}`,
-		`{"type":"response.create","previous_response_id":"resp-auth-a-1","input":[{"type":"message","id":"msg-3"}]}`,
 	}
-	wantTypes := []string{wsEventTypeCompleted, wsEventTypeError, wsEventTypeCompleted}
+	wantTypes := []string{wsEventTypeCompleted, wsEventTypeCompleted}
 	for i := range requests {
 		if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(requests[i])); errWrite != nil {
 			t.Fatalf("write websocket message %d: %v", i+1, errWrite)
@@ -1411,9 +1410,6 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 		}
 		if got := gjson.GetBytes(payload, "type").String(); got != wantTypes[i] {
 			t.Fatalf("message %d payload type = %s, want %s: %s", i+1, got, wantTypes[i], payload)
-		}
-		if i == 1 && int(gjson.GetBytes(payload, "status").Int()) != http.StatusTooManyRequests {
-			t.Fatalf("quota payload status = %d, want %d: %s", gjson.GetBytes(payload, "status").Int(), http.StatusTooManyRequests, payload)
 		}
 	}
 
@@ -1430,7 +1426,7 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterQuotaError(t *testing.T) {
 		t.Fatalf("previous_response_id leaked after auth failover: %s", authBPayload)
 	}
 	authBInput := gjson.GetBytes(authBPayload, "input").Raw
-	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-3"`) {
+	if !strings.Contains(authBInput, `"id":"msg-1"`) || !strings.Contains(authBInput, `"id":"msg-2"`) {
 		t.Fatalf("auth-b replay input missing expected transcript items: %s", authBInput)
 	}
 }
