@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +47,22 @@ func TestLiveSessionsRouteReturnsWebsocketRequestSnapshot(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
+	var raw map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal raw snapshot: %v", err)
+	}
+	sessionsAny, ok := raw["sessions"].([]any)
+	if !ok || len(sessionsAny) != 1 {
+		t.Fatalf("raw sessions = %#v", raw["sessions"])
+	}
+	firstSession, ok := sessionsAny[0].(map[string]any)
+	if !ok {
+		t.Fatalf("raw session type = %#v", sessionsAny[0])
+	}
+	if _, exists := firstSession["requests"]; exists {
+		t.Fatalf("snapshot row unexpectedly exposed requests: %#v", firstSession)
+	}
+
 	var snapshot LiveSessionsSnapshot
 	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
 		t.Fatalf("unmarshal snapshot: %v", err)
@@ -60,11 +77,8 @@ func TestLiveSessionsRouteReturnsWebsocketRequestSnapshot(t *testing.T) {
 	if session.SessionID != "ws-session-1" || session.DownstreamTransport != "websocket" || session.UpstreamTransport != "websocket" {
 		t.Fatalf("unexpected session transport: %#v", session)
 	}
-	if len(session.Requests) != 1 {
-		t.Fatalf("requests = %d, want 1", len(session.Requests))
-	}
-	if rate := session.Requests[0].Timing.OutputTokensPerSecond; rate <= 0 {
-		t.Fatalf("expected output token rate, got %#v", session.Requests[0].Timing)
+	if len(session.Requests) != 0 {
+		t.Fatalf("requests = %d, want 0 for row feed", len(session.Requests))
 	}
 }
 
@@ -153,9 +167,10 @@ func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testin
 	if snapshot.Sessions[0].DownstreamTransport != "websocket" {
 		t.Fatalf("downstream transport changed: %#v", snapshot.Sessions[0])
 	}
-	usage := snapshot.Sessions[0].Requests[0].Usage
+	detail := currentLiveSessionDetailSnapshotForTest(t, "ws-session-1")
+	usage := detail.Requests[0].Usage
 	if usage == nil || usage.OutputTokens != 60 {
-		t.Fatalf("usage not applied to websocket request: %#v", snapshot.Sessions[0].Requests[0])
+		t.Fatalf("usage not applied to websocket request: %#v", detail.Requests[0])
 	}
 }
 
@@ -190,10 +205,14 @@ func TestLiveSessionsCoalescesRequestsByCodexConversationID(t *testing.T) {
 	if session.CodexWindowID != conversationID+":0" {
 		t.Fatalf("codexWindowID = %q", session.CodexWindowID)
 	}
-	if session.RequestCount != 2 || len(session.Requests) != 2 {
-		t.Fatalf("request count = %d len=%d, want 2: %#v", session.RequestCount, len(session.Requests), session.Requests)
+	if session.RequestCount != 2 {
+		t.Fatalf("request count = %d, want 2: %#v", session.RequestCount, session)
 	}
-	for _, request := range session.Requests {
+	detail := currentLiveSessionDetailSnapshotForTest(t, conversationID)
+	if len(detail.Requests) != 2 {
+		t.Fatalf("detail requests len=%d, want 2: %#v", len(detail.Requests), detail.Requests)
+	}
+	for _, request := range detail.Requests {
 		if request.SessionID != conversationID {
 			t.Fatalf("request %s sessionID = %q, want %q", request.RequestID, request.SessionID, conversationID)
 		}
@@ -227,12 +246,58 @@ func TestLiveSessionsSnapshotEnrichesProjectNameFromLocalCodexSession(t *testing
 		CodexWindowID:   conversationID + ":0",
 	})
 
-	snapshot := CurrentLiveSessionsSnapshot()
-	if len(snapshot.Sessions) != 1 {
-		t.Fatalf("sessions = %d, want 1: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := CurrentLiveSessionsSnapshot()
+		if len(snapshot.Sessions) != 1 {
+			t.Fatalf("sessions = %d, want 1: %#v", len(snapshot.Sessions), snapshot.Sessions)
+		}
+		if got := snapshot.Sessions[0].ProjectName; got == "GetTokens" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if got := snapshot.Sessions[0].ProjectName; got != "GetTokens" {
-		t.Fatalf("projectName = %q, want GetTokens", got)
+	t.Fatalf("projectName was not eventually enriched")
+}
+
+func TestLiveSessionsSnapshotDoesNotBlockOnProjectLookupRefresh(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	t.Setenv("CODEX_HOME", t.TempDir())
+
+	startedLookup := make(chan struct{}, 1)
+	releaseLookup := make(chan struct{})
+	originalBuilder := buildLiveSessionProjectLookupFunc
+	buildLiveSessionProjectLookupFunc = func(codexHome string) (map[string]string, error) {
+		startedLookup <- struct{}{}
+		<-releaseLookup
+		return map[string]string{"conv-no-project": "GetTokens"}, nil
+	}
+	t.Cleanup(func() {
+		buildLiveSessionProjectLookupFunc = originalBuilder
+		close(releaseLookup)
+	})
+
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("passthrough-1", "ws-req-1", "gpt-5.5", CodexLiveSessionIdentity{
+		ConversationID: "conv-no-project",
+	})
+
+	startedAt := time.Now()
+	snapshot := CurrentLiveSessionsSnapshot()
+	elapsed := time.Since(startedAt)
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("snapshot blocked on project lookup for %v", elapsed)
+	}
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(snapshot.Sessions))
+	}
+	if got := strings.TrimSpace(snapshot.Sessions[0].ProjectName); got != "" {
+		t.Fatalf("projectName = %q, want empty while refresh is async", got)
+	}
+	select {
+	case <-startedLookup:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected background project lookup refresh to start")
 	}
 }
 
@@ -251,7 +316,7 @@ func TestLiveSessionsPrunesRequestsWithinLongSession(t *testing.T) {
 	if len(snapshot.Sessions) != 1 {
 		t.Fatalf("sessions = %d, want 1", len(snapshot.Sessions))
 	}
-	requests := snapshot.Sessions[0].Requests
+	requests := currentLiveSessionDetailSnapshotForTest(t, conversationID).Requests
 	if len(requests) != liveSessionMaxRequestsPerSession {
 		t.Fatalf("requests = %d, want %d", len(requests), liveSessionMaxRequestsPerSession)
 	}
@@ -284,7 +349,7 @@ func TestLiveSessionsHistoryPersistsTrimmedRequests(t *testing.T) {
 	}
 
 	snapshot := CurrentLiveSessionsSnapshot()
-	if len(snapshot.Sessions) != 1 || len(snapshot.Sessions[0].Requests) != liveSessionMaxRequestsPerSession {
+	if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].RequestCount != liveSessionMaxRequestsPerSession {
 		t.Fatalf("live snapshot did not trim to recent requests: %#v", snapshot.Sessions)
 	}
 	history, err := store.history(-1, 100, 0, conversationID)
@@ -418,4 +483,18 @@ func installLiveSessionHistoryStoreForTest(t *testing.T) *liveSessionHistoryStor
 	defaultLiveSessionHistory = store
 	liveSessionHistoryMu.Unlock()
 	return store
+}
+
+func currentLiveSessionDetailSnapshotForTest(t *testing.T, sessionID string) LiveSession {
+	t.Helper()
+	tracker := currentLiveSessionTracker()
+	tracker.mu.RLock()
+	state := tracker.sessions[sessionID]
+	if state == nil {
+		tracker.mu.RUnlock()
+		t.Fatalf("session %q not found in tracker", sessionID)
+	}
+	detail := state.clone(time.Now())
+	tracker.mu.RUnlock()
+	return detail
 }

@@ -19,6 +19,7 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -26,7 +27,9 @@ const (
 	liveSessionsRetentionLabel       = "30m / 200 sessions / 50 requests"
 	liveSessionsMaxItems             = 200
 	liveSessionMaxRequestsPerSession = 50
-	liveSessionProjectLookupTTL      = 10 * time.Second
+	liveSessionProjectLookupTTL      = 5 * time.Minute
+	liveSessionPollingSlowThreshold  = 500 * time.Millisecond
+	liveSessionRetainedTimelineCount = 4
 )
 
 type LiveSessionsSnapshot struct {
@@ -69,8 +72,8 @@ type LiveSession struct {
 	FallbackInferred    bool                `json:"fallbackInferred,omitempty"`
 	FallbackConfidence  string              `json:"fallbackConfidence,omitempty"`
 	FallbackReason      string              `json:"fallbackReason,omitempty"`
-	RecentEvents        []LiveTimelineEvent `json:"recentEvents"`
-	Requests            []LiveRequest       `json:"requests"`
+	RecentEvents        []LiveTimelineEvent `json:"recentEvents,omitempty"`
+	Requests            []LiveRequest       `json:"requests,omitempty"`
 }
 
 type LiveRequest struct {
@@ -163,6 +166,8 @@ type liveSessionTracker struct {
 	projectLookupCodexHome   string
 	projectLookup            map[string]string
 	projectLookupLastRefresh time.Time
+	projectLookupRefreshRun  bool
+	projectLookupRefreshSF   singleflight.Group
 	seq                      int64
 }
 
@@ -195,8 +200,9 @@ type codexTurnContextEnvelope struct {
 }
 
 var (
-	liveSessionsMu      sync.RWMutex
-	defaultLiveSessions = newLiveSessionTracker()
+	liveSessionsMu                    sync.RWMutex
+	defaultLiveSessions               = newLiveSessionTracker()
+	buildLiveSessionProjectLookupFunc = buildLiveSessionProjectLookup
 )
 
 func newLiveSessionTracker() *liveSessionTracker {
@@ -281,7 +287,9 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandl
 		return
 	}
 	group.GET("/gettokens/live-sessions", func(c *gin.Context) {
+		startedAt := time.Now()
 		c.JSON(http.StatusOK, CurrentLiveSessionsSnapshot())
+		maybeSkipLiveSessionPollingLog(c, startedAt)
 	})
 	group.GET("/gettokens/live-sessions/history", func(c *gin.Context) {
 		store := currentLiveSessionHistoryStore()
@@ -531,6 +539,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 				req.request.Usage = liveUsage(record.Detail)
 				fillTiming(&req.request, record.Detail, now)
 				persistLiveRequestHistory(session.session, req.request)
+				compactLiveRequestForMemory(req)
 				return
 			}
 		}
@@ -557,6 +566,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 	req.request.Timeline = append(req.request.Timeline, liveEvent(t.nextEventIDLocked(), now, "sidecar", "completed", "HTTP request completed", "success", ""))
 	t.requestMap[requestID] = sessionID
 	persistLiveRequestHistory(session.session, req.request)
+	compactLiveRequestForMemory(req)
 	t.pruneLocked(now)
 }
 
@@ -579,6 +589,7 @@ func (t *liveSessionTracker) updateRequest(requestID string, now time.Time, upda
 	update(session, req)
 	session.touch(now)
 	persistLiveRequestHistory(session.session, req.request)
+	compactLiveRequestForMemory(req)
 }
 
 func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
@@ -586,7 +597,7 @@ func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
 	t.pruneLocked(now)
 	items := make([]LiveSession, 0, len(t.sessions))
 	for _, state := range t.sessions {
-		session := state.clone(now)
+		session := state.cloneRow(now)
 		items = append(items, session)
 	}
 	t.mu.Unlock()
@@ -642,11 +653,7 @@ func (t *liveSessionTracker) enrichSnapshotProjectNames(items []LiveSession, now
 	if err != nil || strings.TrimSpace(codexHome) == "" {
 		return
 	}
-	lookup, err := t.liveSessionProjectLookup(codexHome, now)
-	if err != nil || len(lookup) == 0 {
-		return
-	}
-
+	lookup := t.currentProjectLookup(codexHome)
 	for index := range items {
 		if strings.TrimSpace(items[index].ProjectName) != "" {
 			continue
@@ -655,30 +662,69 @@ func (t *liveSessionTracker) enrichSnapshotProjectNames(items []LiveSession, now
 			items[index].ProjectName = projectName
 		}
 	}
+	for _, item := range items {
+		if strings.TrimSpace(item.ProjectName) == "" {
+			t.refreshProjectLookupAsync(codexHome, now)
+			break
+		}
+	}
 }
 
-func (t *liveSessionTracker) liveSessionProjectLookup(codexHome string, now time.Time) (map[string]string, error) {
+func (t *liveSessionTracker) currentProjectLookup(codexHome string) map[string]string {
 	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.projectLookupCodexHome != codexHome {
+		return map[string]string{}
+	}
+	return cloneLiveSessionProjectLookup(t.projectLookup)
+}
+
+func (t *liveSessionTracker) refreshProjectLookupAsync(codexHome string, now time.Time) {
+	t.mu.Lock()
+	if t.projectLookupRefreshRun {
+		t.mu.Unlock()
+		return
+	}
 	if t.projectLookupCodexHome == codexHome &&
 		!t.projectLookupLastRefresh.IsZero() &&
-		now.Sub(t.projectLookupLastRefresh) < liveSessionProjectLookupTTL {
-		lookup := cloneLiveSessionProjectLookup(t.projectLookup)
-		t.mu.RUnlock()
-		return lookup, nil
+		now.Sub(t.projectLookupLastRefresh) < liveSessionProjectLookupTTL &&
+		len(t.projectLookup) > 0 {
+		t.mu.Unlock()
+		return
 	}
-	t.mu.RUnlock()
-
-	lookup, err := buildLiveSessionProjectLookup(codexHome)
-	if err != nil {
-		return nil, err
-	}
-
-	t.mu.Lock()
-	t.projectLookupCodexHome = codexHome
-	t.projectLookup = cloneLiveSessionProjectLookup(lookup)
-	t.projectLookupLastRefresh = now
+	t.projectLookupRefreshRun = true
 	t.mu.Unlock()
-	return lookup, nil
+
+	go func() {
+		defer func() {
+			t.mu.Lock()
+			t.projectLookupRefreshRun = false
+			t.mu.Unlock()
+		}()
+		lookupAny, err, _ := t.projectLookupRefreshSF.Do(codexHome, func() (any, error) {
+			lookup, err := buildLiveSessionProjectLookupFunc(codexHome)
+			if err != nil {
+				return nil, err
+			}
+			t.mu.Lock()
+			t.projectLookupCodexHome = codexHome
+			t.projectLookup = cloneLiveSessionProjectLookup(lookup)
+			t.projectLookupLastRefresh = time.Now()
+			t.mu.Unlock()
+			return lookup, nil
+		})
+		if err != nil {
+			return
+		}
+		lookup, _ := lookupAny.(map[string]string)
+		if len(lookup) == 0 {
+			t.mu.Lock()
+			t.projectLookupCodexHome = codexHome
+			t.projectLookup = map[string]string{}
+			t.projectLookupLastRefresh = time.Now()
+			t.mu.Unlock()
+		}
+	}()
 }
 
 func buildLiveSessionProjectLookup(codexHome string) (map[string]string, error) {
@@ -1072,6 +1118,8 @@ func (t *liveSessionTracker) clear() {
 	t.projectLookup = nil
 	t.projectLookupCodexHome = ""
 	t.projectLookupLastRefresh = time.Time{}
+	t.projectLookupRefreshRun = false
+	t.projectLookupRefreshSF = singleflight.Group{}
 }
 
 func pruneLiveSessionRequestsLocked(session *liveSessionState, limit int) {
@@ -1125,6 +1173,14 @@ func (s *liveSessionState) touch(now time.Time) {
 	s.session.DurationMs = maxInt64(0, now.Sub(parseLiveTime(s.session.StartedAt)).Milliseconds())
 }
 
+func (s *liveSessionState) cloneRow(now time.Time) LiveSession {
+	session := s.session
+	session.DurationMs = maxInt64(0, now.Sub(parseLiveTime(session.StartedAt)).Milliseconds())
+	session.RecentEvents = nil
+	session.Requests = nil
+	return session
+}
+
 func (s *liveSessionState) clone(now time.Time) LiveSession {
 	session := s.session
 	session.DurationMs = maxInt64(0, now.Sub(parseLiveTime(session.StartedAt)).Milliseconds())
@@ -1141,6 +1197,32 @@ func (s *liveSessionState) clone(now time.Time) LiveSession {
 	})
 	session.Requests = requests
 	return session
+}
+
+func compactLiveRequestForMemory(req *liveRequestState) {
+	if req == nil {
+		return
+	}
+	switch req.request.Status {
+	case "active", "streaming", "reconnecting", "upstream_disconnected":
+		return
+	}
+	if len(req.request.Timeline) > liveSessionRetainedTimelineCount {
+		req.request.Timeline = append([]LiveTimelineEvent(nil), req.request.Timeline[len(req.request.Timeline)-liveSessionRetainedTimelineCount:]...)
+	}
+}
+
+func maybeSkipLiveSessionPollingLog(c *gin.Context, startedAt time.Time) {
+	if c == nil {
+		return
+	}
+	if c.Writer.Status() >= http.StatusBadRequest {
+		return
+	}
+	if time.Since(startedAt) >= liveSessionPollingSlowThreshold {
+		return
+	}
+	internallogging.SkipGinRequestLogging(c)
 }
 
 func liveEvent(id string, now time.Time, lane string, kind string, label string, severity string, detail string) LiveTimelineEvent {
