@@ -24,6 +24,7 @@ const (
 
 // InstallRoutePolicyHook installs GetTokens-specific request route controls.
 func InstallRoutePolicyHook() {
+	coreauth.RegisterRoutePolicy(channelRoutingRoutePolicy{})
 	coreauth.RegisterRoutePolicy(gettokensRoutePolicy{})
 	coreauth.RegisterRoutePolicy(accountRouteGuardPolicy{})
 }

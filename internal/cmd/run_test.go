@@ -42,6 +42,53 @@ func TestInstallGetTokensHooksInstallsRoutePolicy(t *testing.T) {
 	}
 }
 
+func TestInstallGetTokensHooksChannelRoutingBypassesFillFirstStrategy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	channelConfigPath := filepath.Join(home, ".config", "gettokens-data", "channel-routing", "config.json")
+	if err := os.MkdirAll(filepath.Dir(channelConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir channel routing config: %v", err)
+	}
+	if err := os.WriteFile(channelConfigPath, []byte(`{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": ["auth-b", "auth-a"],
+      "channelGroupStates": {},
+      "projectBindings": [],
+      "projectModeFallbackRouteMode": "sequential",
+      "fallbackMode": "fail-closed"
+    }
+  }
+}`), 0o600); err != nil {
+		t.Fatalf("write channel routing config: %v", err)
+	}
+	if err := installGetTokensHooks(&config.Config{}, t.TempDir()); err != nil {
+		t.Fatalf("install hooks: %v", err)
+	}
+
+	mgr := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	exec := &captureExecutor{identifier: "codex"}
+	mgr.RegisterExecutor(exec)
+
+	ctx := context.Background()
+	if _, err := mgr.Register(ctx, &coreauth.Auth{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive}); err != nil {
+		t.Fatalf("register auth-a: %v", err)
+	}
+	if _, err := mgr.Register(ctx, &coreauth.Auth{ID: "auth-b", Provider: "codex", Status: coreauth.StatusActive}); err != nil {
+		t.Fatalf("register auth-b: %v", err)
+	}
+
+	_, err := mgr.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := exec.Selected(); got != "auth-b" {
+		t.Fatalf("selected auth = %q, want auth-b from channel routing, not fill-first auth-a", got)
+	}
+}
+
 func TestInstallGetTokensHooksCreatesUsageLedgerWhenEnabled(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
