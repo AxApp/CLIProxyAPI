@@ -1,0 +1,60 @@
+package gettokenshooks
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+)
+
+func TestChannelRoutingRoutePolicySelectsBalancedAccountWithoutRoutingStrategy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(home, ".config", "gettokens-data", "channel-routing", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("mkdir channel routing config: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "balanced",
+      "orderedAccountIDs": ["auth-a", "auth-b"],
+      "channelGroupStates": {},
+      "projectBindings": [],
+      "projectModeFallbackRouteMode": "sequential",
+      "fallbackMode": "fail-closed"
+    }
+  }
+}`), 0o600); err != nil {
+		t.Fatalf("write channel routing config: %v", err)
+	}
+
+	restoreSessions := channelRoutingActiveSessionsByAuthID
+	channelRoutingActiveSessionsByAuthID = func() map[string]int {
+		return map[string]int{"auth-a": 7, "auth-b": 0}
+	}
+	t.Cleanup(func() {
+		channelRoutingActiveSessionsByAuthID = restoreSessions
+	})
+
+	decision := channelRoutingRoutePolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
+		Provider: "codex",
+		Options: cliproxyexecutor.Options{},
+		Candidates: []*coreauth.Auth{
+			{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive},
+			{ID: "auth-b", Provider: "codex", Status: coreauth.StatusActive},
+		},
+	})
+
+	if len(decision.OrderIDs) == 0 || decision.OrderIDs[0] != "auth-b" {
+		t.Fatalf("OrderIDs = %#v, want auth-b first from balanced channel routing", decision.OrderIDs)
+	}
+	if decision.Reason != "channel-routing:codex:balanced" {
+		t.Fatalf("Reason = %q, want channel-routing:codex:balanced", decision.Reason)
+	}
+}
+
