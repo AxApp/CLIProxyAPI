@@ -4237,9 +4237,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
 	}
+	clearAuthStateOnSuccess(updated, now)
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
 	updated.UpdatedAt = now
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)

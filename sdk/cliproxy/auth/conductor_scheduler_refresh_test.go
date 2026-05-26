@@ -45,6 +45,19 @@ func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
 }
 
+type refreshRecoveryTestExecutor struct {
+	schedulerProviderTestExecutor
+	refreshCalls int
+}
+
+func (e *refreshRecoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.refreshCalls++
+	if e.refreshCalls == 1 {
+		return nil, errors.New("token refresh failed with status 401: invalid_grant")
+	}
+	return auth, nil
+}
+
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -87,6 +100,57 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	}
 	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
 		t.Fatal("expected unauthorized auth to be removed from the auto-refresh schedule")
+	}
+}
+
+func TestManager_RefreshAuthSuccessClearsStaleUnauthorizedState(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(&refreshRecoveryTestExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-recovery",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email": "x@example.com",
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	failed, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh failure", auth.ID)
+	}
+	if failed.Status != StatusError || !failed.Unavailable || failed.StatusMessage == "" {
+		t.Fatalf("refresh failure state = status=%q unavailable=%v message=%q", failed.Status, failed.Unavailable, failed.StatusMessage)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	recovered, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh recovery", auth.ID)
+	}
+	if recovered.Status != StatusActive {
+		t.Fatalf("Status = %q, want %q", recovered.Status, StatusActive)
+	}
+	if recovered.Unavailable {
+		t.Fatal("Unavailable = true, want false after successful refresh")
+	}
+	if recovered.StatusMessage != "" {
+		t.Fatalf("StatusMessage = %q, want empty", recovered.StatusMessage)
+	}
+	if recovered.LastError != nil {
+		t.Fatalf("LastError = %#v, want nil", recovered.LastError)
+	}
+	if !recovered.NextRetryAfter.IsZero() {
+		t.Fatalf("NextRetryAfter = %s, want zero", recovered.NextRetryAfter)
 	}
 }
 
