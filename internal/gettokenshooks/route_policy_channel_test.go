@@ -43,7 +43,7 @@ func TestChannelRoutingRoutePolicySelectsBalancedAccountWithoutRoutingStrategy(t
 
 	decision := channelRoutingRoutePolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
 		Provider: "codex",
-		Options: cliproxyexecutor.Options{},
+		Options:  cliproxyexecutor.Options{},
 		Candidates: []*coreauth.Auth{
 			{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive},
 			{ID: "auth-b", Provider: "codex", Status: coreauth.StatusActive},
@@ -57,4 +57,3 @@ func TestChannelRoutingRoutePolicySelectsBalancedAccountWithoutRoutingStrategy(t
 		t.Fatalf("Reason = %q, want channel-routing:codex:balanced", decision.Reason)
 	}
 }
-
