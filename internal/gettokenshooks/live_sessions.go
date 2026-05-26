@@ -211,6 +211,32 @@ func CurrentLiveSessionsSnapshot() LiveSessionsSnapshot {
 	return tracker.snapshot(time.Now())
 }
 
+func currentLiveSessionActiveAuthCounts() map[string]int {
+	tracker := currentLiveSessionTracker()
+	now := time.Now()
+	tracker.mu.RLock()
+	defer tracker.mu.RUnlock()
+	out := make(map[string]int, len(tracker.sessions))
+	for _, state := range tracker.sessions {
+		if state == nil {
+			continue
+		}
+		session := state.session
+		if session.Status != "active" && session.Status != "streaming" {
+			continue
+		}
+		authID := strings.TrimSpace(session.AuthID)
+		if authID == "" {
+			continue
+		}
+		if now.Sub(parseLiveTime(session.LastEventAt)) > liveSessionsRetention {
+			continue
+		}
+		out[authID]++
+	}
+	return out
+}
+
 func RecordDownstreamWebsocketConnected(sessionID string, clientIP string) {
 	currentLiveSessionTracker().recordDownstreamWebsocketConnected(sessionID, clientIP, time.Now())
 }

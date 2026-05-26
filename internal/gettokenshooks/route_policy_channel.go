@@ -36,7 +36,7 @@ type channelRoutingPolicyAccountGroup struct {
 	AccountIDs []string `json:"accountIDs"`
 }
 
-var channelRoutingActiveSessionsByAuthID = currentChannelRoutingActiveSessionsByAuthID
+var channelRoutingActiveSessionsByAuthID = currentLiveSessionActiveAuthCounts
 
 func (channelRoutingRoutePolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
 	return gettokensrouting.PolicyStagePoolScope
@@ -204,22 +204,6 @@ func channelRoutingOrderIDs(decision gettokensrouting.ChannelRouteDecision) []st
 		}
 		out = append(out, id)
 		seen[id] = struct{}{}
-	}
-	return out
-}
-
-func currentChannelRoutingActiveSessionsByAuthID() map[string]int {
-	snapshot := CurrentLiveSessionsSnapshot()
-	out := map[string]int{}
-	for _, session := range snapshot.Sessions {
-		if session.Status != "active" && session.Status != "streaming" {
-			continue
-		}
-		authID := strings.TrimSpace(session.AuthID)
-		if authID == "" {
-			continue
-		}
-		out[authID]++
 	}
 	return out
 }

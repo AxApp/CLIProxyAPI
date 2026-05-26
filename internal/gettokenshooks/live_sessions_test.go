@@ -97,6 +97,38 @@ func TestLiveSessionsObserveUsageRecordCreatesHTTPCompletedSession(t *testing.T)
 	}
 }
 
+func TestLiveSessionsActiveAuthCountsIncludeOnlyActiveRequests(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	activeCtx := internallogging.WithRequestID(context.Background(), "active-req-1")
+	RecordCodexLiveRequestStarted(activeCtx, CodexLiveRequestStart{
+		ExecutionSessionID:  "active-session-1",
+		Model:               "gpt-5.5",
+		AuthID:              "auth-active",
+		Provider:            "codex",
+		DownstreamTransport: "websocket",
+		UpstreamTransport:   "websocket",
+	})
+
+	completedCtx := internallogging.WithRequestID(context.Background(), "completed-req-1")
+	ObserveCodexLiveUsage(completedCtx, coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.5",
+		AuthID:      "auth-completed",
+		RequestedAt: time.Now().Add(-1 * time.Second),
+		Latency:     time.Second,
+		Detail:      coreusage.Detail{OutputTokens: 12, TotalTokens: 20},
+	})
+
+	counts := currentLiveSessionActiveAuthCounts()
+	if counts["auth-active"] != 1 {
+		t.Fatalf("active auth count = %d, want 1: %#v", counts["auth-active"], counts)
+	}
+	if counts["auth-completed"] != 0 {
+		t.Fatalf("completed auth count = %d, want 0: %#v", counts["auth-completed"], counts)
+	}
+}
+
 func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testing.T) {
 	resetLiveSessionTrackerForTest(t)
 
