@@ -55,6 +55,28 @@ func TestInstallGetTokensHooksCreatesUsageLedgerWhenEnabled(t *testing.T) {
 	if _, err := os.Stat(ledgerPath); err != nil {
 		t.Fatalf("usage attribution ledger missing at %s: %v", ledgerPath, err)
 	}
+	observedPath := filepath.Join(dir, "usage-observed-v2.sqlite")
+	if _, err := os.Stat(observedPath); err != nil {
+		t.Fatalf("usage observed snapshot missing at %s: %v", observedPath, err)
+	}
+	liveSessionsPath := filepath.Join(dir, "live-sessions-v1.sqlite")
+	if _, err := os.Stat(liveSessionsPath); err != nil {
+		t.Fatalf("live sessions history missing at %s: %v", liveSessionsPath, err)
+	}
+}
+
+func TestInstallGetTokensHooksCreatesLiveSessionHistoryWhenUsageDisabled(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+
+	if err := installGetTokensHooks(&config.Config{UsageStatisticsEnabled: false}, configPath); err != nil {
+		t.Fatalf("install hooks: %v", err)
+	}
+
+	liveSessionsPath := filepath.Join(dir, "live-sessions-v1.sqlite")
+	if _, err := os.Stat(liveSessionsPath); err != nil {
+		t.Fatalf("live sessions history missing at %s: %v", liveSessionsPath, err)
+	}
 }
 
 type captureExecutor struct {

@@ -4,6 +4,7 @@ package usage
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -66,7 +67,6 @@ type apiStats struct {
 type modelStats struct {
 	TotalRequests int64
 	TotalTokens   int64
-	Details       []RequestDetail
 }
 
 type RequestDetail struct {
@@ -196,7 +196,6 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	}
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
-	modelStatsValue.Details = append(modelStatsValue.Details, detail)
 }
 
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
@@ -221,12 +220,10 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
 		}
 		for modelName, modelStatsValue := range stats.Models {
-			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
 				TotalTokens:   modelStatsValue.TotalTokens,
-				Details:       requestDetails,
+				Details:       []RequestDetail{},
 			}
 		}
 		result.APIs[apiName] = apiSnapshot
@@ -263,21 +260,8 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	seen := make(map[string]struct{})
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
-		}
-		for modelName, modelStatsValue := range stats.Models {
-			if modelStatsValue == nil {
-				continue
-			}
-			for _, detail := range modelStatsValue.Details {
-				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
-			}
-		}
-	}
-
+	var addedRequests int64
+	var addedTokens int64
 	for apiName, apiSnapshot := range snapshot.APIs {
 		apiName = strings.TrimSpace(apiName)
 		if apiName == "" {
@@ -295,71 +279,59 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			if modelName == "" {
 				modelName = "unknown"
 			}
-			for _, detail := range modelSnapshot.Details {
-				detail.Tokens = normaliseTokenStats(detail.Tokens)
-				if detail.LatencyMs < 0 {
-					detail.LatencyMs = 0
-				}
-				if detail.Timestamp.IsZero() {
-					detail.Timestamp = time.Now()
-				}
-				key := dedupKey(apiName, modelName, detail)
-				if _, exists := seen[key]; exists {
-					result.Skipped++
-					continue
-				}
-				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
-				result.Added++
-			}
+			added, tokens := s.mergeModelAggregate(apiName, modelName, stats, modelSnapshot)
+			addedRequests += added
+			addedTokens += tokens
 		}
 	}
+	if snapshot.TotalRequests > 0 {
+		s.totalRequests += snapshot.TotalRequests
+		result.Added = snapshot.TotalRequests
+	} else {
+		s.totalRequests += addedRequests
+		result.Added = addedRequests
+	}
+	if snapshot.TotalTokens > 0 {
+		s.totalTokens += snapshot.TotalTokens
+	} else {
+		s.totalTokens += addedTokens
+	}
+	s.successCount += snapshot.SuccessCount
+	s.failureCount += snapshot.FailureCount
+	mergeStringInt64Map(s.requestsByDay, snapshot.RequestsByDay)
+	mergeStringInt64MapToHours(s.requestsByHour, snapshot.RequestsByHour)
+	mergeStringInt64Map(s.tokensByDay, snapshot.TokensByDay)
+	mergeStringInt64MapToHours(s.tokensByHour, snapshot.TokensByHour)
 
 	return result
 }
 
-func (s *RequestStatistics) recordImported(apiName, modelName string, stats *apiStats, detail RequestDetail) {
-	totalTokens := detail.Tokens.TotalTokens
-	if totalTokens < 0 {
-		totalTokens = 0
+func (s *RequestStatistics) mergeModelAggregate(apiName, modelName string, stats *apiStats, snapshot ModelSnapshot) (int64, int64) {
+	requests := snapshot.TotalRequests
+	tokens := snapshot.TotalTokens
+	if requests <= 0 && len(snapshot.Details) > 0 {
+		for _, detail := range snapshot.Details {
+			detail.Tokens = normaliseTokenStats(detail.Tokens)
+			requests++
+			tokens += detail.Tokens.TotalTokens
+		}
 	}
-
-	s.totalRequests++
-	if detail.Failed {
-		s.failureCount++
-	} else {
-		s.successCount++
+	if requests <= 0 && tokens <= 0 {
+		return 0, 0
 	}
-	s.totalTokens += totalTokens
-
-	s.updateAPIStats(stats, modelName, detail)
-
-	dayKey := detail.Timestamp.Format("2006-01-02")
-	hourKey := detail.Timestamp.Hour()
-
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
-}
-
-func dedupKey(apiName, modelName string, detail RequestDetail) string {
-	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
-	tokens := normaliseTokenStats(detail.Tokens)
-	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
-		apiName,
-		modelName,
-		timestamp,
-		detail.Source,
-		detail.AuthIndex,
-		detail.Failed,
-		tokens.InputTokens,
-		tokens.OutputTokens,
-		tokens.ReasoningTokens,
-		tokens.CachedTokens,
-		tokens.TotalTokens,
-	)
+	if tokens < 0 {
+		tokens = 0
+	}
+	modelStatsValue, ok := stats.Models[modelName]
+	if !ok || modelStatsValue == nil {
+		modelStatsValue = &modelStats{}
+		stats.Models[modelName] = modelStatsValue
+	}
+	stats.TotalRequests += requests
+	stats.TotalTokens += tokens
+	modelStatsValue.TotalRequests += requests
+	modelStatsValue.TotalTokens += tokens
+	return requests, tokens
 }
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
@@ -446,4 +418,32 @@ func copyStringInt64Map(input map[string]int64) map[string]int64 {
 		output[k] = v
 	}
 	return output
+}
+
+func mergeStringInt64Map(target map[string]int64, source map[string]int64) {
+	if target == nil {
+		return
+	}
+	for key, value := range source {
+		if strings.TrimSpace(key) == "" || value == 0 {
+			continue
+		}
+		target[key] += value
+	}
+}
+
+func mergeStringInt64MapToHours(target map[int]int64, source map[string]int64) {
+	if target == nil {
+		return
+	}
+	for key, value := range source {
+		if value == 0 {
+			continue
+		}
+		hour, err := strconv.Atoi(strings.TrimSpace(key))
+		if err != nil {
+			continue
+		}
+		target[hour%24] += value
+	}
 }

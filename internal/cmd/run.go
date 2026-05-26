@@ -106,11 +106,21 @@ func buildGetTokensStartupHooks(configPath string) cliproxy.Hooks {
 
 func installGetTokensHooks(cfg *config.Config, configPath string) error {
 	gettokenshooks.InstallRoutePolicyHook()
+	if err := gettokenshooks.InstallLiveSessionHistoryHook(gettokenshooks.LiveSessionHistoryOptions{
+		ConfigFilePath: configPath,
+	}); err != nil {
+		return err
+	}
 	if cfg == nil || !cfg.UsageStatisticsEnabled {
 		return nil
 	}
 	opts := gettokenshooks.UsageAttributionOptions{
 		ConfigFilePath: configPath,
+	}
+	if err := gettokenshooks.InstallUsagePersistenceHook(gettokenshooks.UsagePersistenceOptions{
+		ConfigFilePath: configPath,
+	}); err != nil {
+		return err
 	}
 	if err := gettokenshooks.InstallUsageAttributionHook(opts); err != nil {
 		return err

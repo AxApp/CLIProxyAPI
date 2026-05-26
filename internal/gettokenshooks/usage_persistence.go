@@ -61,7 +61,18 @@ func InstallUsagePersistenceHook(opts UsagePersistenceOptions) error {
 			result.Skipped,
 		)
 	} else {
-		log.Infof("gettokenshooks: usage snapshot store ready at %s", dbPath)
+		if legacyRestored, legacyPath, legacyErr := loadLegacyUsageSnapshot(opts); legacyErr != nil {
+			return legacyErr
+		} else if legacyRestored != nil {
+			result := usage.GetRequestStatistics().MergeSnapshot(*legacyRestored)
+			if err := store.save(*legacyRestored); err != nil {
+				log.WithError(err).Warn("gettokenshooks: migrate legacy usage snapshot failed")
+			} else {
+				log.Infof("gettokenshooks: migrated usage snapshot from %s to %s (added=%d skipped=%d)", legacyPath, dbPath, result.Added, result.Skipped)
+			}
+		} else {
+			log.Infof("gettokenshooks: usage snapshot store ready at %s", dbPath)
+		}
 	}
 
 	coreusage.RegisterPlugin(newUsagePersistencePlugin(store))
@@ -73,6 +84,20 @@ func resolveUsageSnapshotPath(opts UsagePersistenceOptions) (string, error) {
 		return fromEnv, nil
 	}
 	if configPath := strings.TrimSpace(opts.ConfigFilePath); configPath != "" {
+		return filepath.Join(filepath.Dir(configPath), "usage-observed-v2.sqlite"), nil
+	}
+	if writableBase := strings.TrimSpace(opts.WritableBase); writableBase != "" {
+		return filepath.Join(writableBase, "usage-observed-v2.sqlite"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "gettokens", "usage-observed-v2.sqlite"), nil
+}
+
+func resolveLegacyUsageSnapshotPath(opts UsagePersistenceOptions) (string, error) {
+	if configPath := strings.TrimSpace(opts.ConfigFilePath); configPath != "" {
 		return filepath.Join(filepath.Dir(configPath), "usage-observed-v1.sqlite"), nil
 	}
 	if writableBase := strings.TrimSpace(opts.WritableBase); writableBase != "" {
@@ -83,6 +108,28 @@ func resolveUsageSnapshotPath(opts UsagePersistenceOptions) (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".config", "gettokens", "usage-observed-v1.sqlite"), nil
+}
+
+func loadLegacyUsageSnapshot(opts UsagePersistenceOptions) (*usage.StatisticsSnapshot, string, error) {
+	legacyPath, err := resolveLegacyUsageSnapshotPath(opts)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, legacyPath, nil
+		}
+		return nil, legacyPath, err
+	}
+	legacyStore, err := newUsageSnapshotStore(legacyPath)
+	if err != nil {
+		return nil, legacyPath, err
+	}
+	restored, err := legacyStore.load()
+	if err != nil {
+		return nil, legacyPath, err
+	}
+	return restored, legacyPath, nil
 }
 
 type usagePersistencePlugin struct {

@@ -2,10 +2,14 @@ package gettokenshooks
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -190,5 +194,93 @@ func TestUsageAttributionStoreSummarySupportsAllWindow(t *testing.T) {
 	}
 	if len(summary.Items) != 2 {
 		t.Fatalf("items = %d, want 2", len(summary.Items))
+	}
+}
+
+func TestUsageAttributionStoreDetailsPaginatesNewestFirst(t *testing.T) {
+	store, err := newUsageAttributionStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Minute)
+	for i := 0; i < 3; i++ {
+		event := usageAttributionEvent{
+			ID:                "event-" + string(rune('a'+i)),
+			RequestID:         "req-" + string(rune('a'+i)),
+			CompletedAtUnixMs: now.Add(time.Duration(i) * time.Minute).UnixMilli(),
+			AttributionKey:    "auth-id:test",
+			AttributionKind:   "auth_id",
+			AccountKey:        "account-1",
+			Provider:          "codex",
+			RequestedModel:    "gpt-5.4",
+			TotalTokens:       int64(10 + i),
+			EvidenceKind:      "auth_id",
+		}
+		if err := store.insert(event); err != nil {
+			t.Fatalf("insert event %d: %v", i, err)
+		}
+	}
+
+	out, err := store.details(24*time.Hour, 2, 1, "account-1", "")
+	if err != nil {
+		t.Fatalf("details: %v", err)
+	}
+	if out.Limit != 2 || out.Offset != 1 {
+		t.Fatalf("pagination = %#v", out)
+	}
+	if len(out.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(out.Items))
+	}
+	if out.Items[0].RequestID != "req-b" || out.Items[1].RequestID != "req-a" {
+		t.Fatalf("unexpected ordering: %#v", out.Items)
+	}
+}
+
+func TestUsageAttributionDetailsRoute(t *testing.T) {
+	store, err := newUsageAttributionStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	usageAttributionMu.Lock()
+	defaultAttributionStore = store
+	usageAttributionMu.Unlock()
+	t.Cleanup(func() {
+		usageAttributionMu.Lock()
+		defaultAttributionStore = nil
+		usageAttributionMu.Unlock()
+	})
+
+	if err := store.insert(usageAttributionEvent{
+		ID:                "event-1",
+		RequestID:         "req-1",
+		CompletedAtUnixMs: time.Now().UTC().UnixMilli(),
+		AttributionKey:    "auth-id:test",
+		AttributionKind:   "auth_id",
+		AccountKey:        "account-1",
+		Provider:          "codex",
+		RequestedModel:    "gpt-5.4",
+		TotalTokens:       11,
+		EvidenceKind:      "auth_id",
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureUsageAttributionRoutes(group, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/usage-attribution/details?limit=1&offset=0&account_key=account-1", nil)
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload UsageAttributionDetailResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, recorder.Body.String())
+	}
+	if len(payload.Items) != 1 || payload.Items[0].RequestID != "req-1" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }

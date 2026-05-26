@@ -114,6 +114,43 @@ type UsageAttributionSummaryResponse struct {
 	Unresolved  []UsageAttributionItem `json:"unresolved,omitempty"`
 }
 
+type UsageAttributionDetailResponse struct {
+	Window      string                      `json:"window"`
+	GeneratedAt string                      `json:"generatedAt"`
+	Limit       int                         `json:"limit"`
+	Offset      int                         `json:"offset"`
+	Items       []UsageAttributionEventItem `json:"items"`
+}
+
+type UsageAttributionEventItem struct {
+	ID                string `json:"id"`
+	RequestID         string `json:"requestId"`
+	AttemptIndex      int64  `json:"attemptIndex"`
+	StartedAt         string `json:"startedAt"`
+	CompletedAt       string `json:"completedAt"`
+	Method            string `json:"method"`
+	Path              string `json:"path"`
+	RequestedModel    string `json:"requestedModel"`
+	RoutedModel       string `json:"routedModel"`
+	Provider          string `json:"provider"`
+	AttributionKey    string `json:"attributionKey"`
+	AttributionKind   string `json:"attributionKind"`
+	AccountKey        string `json:"accountKey"`
+	CredentialKey     string `json:"credentialKey,omitempty"`
+	AuthID            string `json:"authId,omitempty"`
+	AuthIndex         string `json:"authIndex,omitempty"`
+	AuthType          string `json:"authType,omitempty"`
+	StatusCode        int64  `json:"statusCode"`
+	Failed            bool   `json:"failed"`
+	LatencyMs         int64  `json:"latencyMs"`
+	InputTokens       int64  `json:"inputTokens"`
+	CachedInputTokens int64  `json:"cachedInputTokens"`
+	OutputTokens      int64  `json:"outputTokens"`
+	TotalTokens       int64  `json:"totalTokens"`
+	EvidenceKind      string `json:"evidenceKind"`
+	EvidenceRef       string `json:"evidenceRef,omitempty"`
+}
+
 type UsageAttributionItem struct {
 	AttributionKey    string                   `json:"attributionKey"`
 	AttributionKind   string                   `json:"attributionKind"`
@@ -390,6 +427,105 @@ func (s *usageAttributionStore) summary(window, bucket time.Duration, includeUnr
 	return out, nil
 }
 
+func (s *usageAttributionStore) details(window time.Duration, limit int, offset int, accountKey string, attributionKey string) (UsageAttributionDetailResponse, error) {
+	if s == nil || s.db == nil {
+		return UsageAttributionDetailResponse{}, errors.New("usage attribution store is not initialized")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	now := time.Now().UTC()
+	since := int64(0)
+	windowLabel := formatUsageAttributionWindow(window)
+	if window == 0 {
+		window = defaultUsageAttributionWindow
+		windowLabel = defaultUsageAttributionWindow.String()
+	}
+	if window > 0 {
+		since = now.Add(-window).UnixMilli()
+	}
+	query := strings.Builder{}
+	query.WriteString(`SELECT id, request_id, attempt_index, started_at_unix_ms, completed_at_unix_ms, method, path,
+		requested_model, routed_model, provider, attribution_key, attribution_kind, account_key,
+		credential_key, auth_id, auth_index, auth_type, status_code, failed, latency_ms,
+		input_tokens, cached_input_tokens, output_tokens, total_tokens, evidence_kind, evidence_ref
+	  FROM usage_attribution_events
+	 WHERE completed_at_unix_ms >= ?`)
+	args := []any{since}
+	if accountKey = strings.TrimSpace(accountKey); accountKey != "" {
+		query.WriteString(" AND account_key = ?")
+		args = append(args, accountKey)
+	}
+	if attributionKey = strings.TrimSpace(attributionKey); attributionKey != "" {
+		query.WriteString(" AND attribution_key = ?")
+		args = append(args, attributionKey)
+	}
+	query.WriteString(" ORDER BY completed_at_unix_ms DESC, id DESC LIMIT ? OFFSET ?")
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(query.String(), args...)
+	if err != nil {
+		return UsageAttributionDetailResponse{}, err
+	}
+	defer rows.Close()
+
+	out := UsageAttributionDetailResponse{
+		Window:      windowLabel,
+		GeneratedAt: now.Format(time.RFC3339),
+		Limit:       limit,
+		Offset:      offset,
+		Items:       []UsageAttributionEventItem{},
+	}
+	for rows.Next() {
+		var item UsageAttributionEventItem
+		var startedAtUnixMs, completedAtUnixMs int64
+		var failedInt int64
+		if err := rows.Scan(
+			&item.ID,
+			&item.RequestID,
+			&item.AttemptIndex,
+			&startedAtUnixMs,
+			&completedAtUnixMs,
+			&item.Method,
+			&item.Path,
+			&item.RequestedModel,
+			&item.RoutedModel,
+			&item.Provider,
+			&item.AttributionKey,
+			&item.AttributionKind,
+			&item.AccountKey,
+			&item.CredentialKey,
+			&item.AuthID,
+			&item.AuthIndex,
+			&item.AuthType,
+			&item.StatusCode,
+			&failedInt,
+			&item.LatencyMs,
+			&item.InputTokens,
+			&item.CachedInputTokens,
+			&item.OutputTokens,
+			&item.TotalTokens,
+			&item.EvidenceKind,
+			&item.EvidenceRef,
+		); err != nil {
+			return UsageAttributionDetailResponse{}, err
+		}
+		item.StartedAt = time.UnixMilli(startedAtUnixMs).UTC().Format(time.RFC3339)
+		item.CompletedAt = time.UnixMilli(completedAtUnixMs).UTC().Format(time.RFC3339)
+		item.Failed = failedInt != 0
+		out.Items = append(out.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return UsageAttributionDetailResponse{}, err
+	}
+	return out, nil
+}
+
 type usageAttributionPlugin struct {
 	store *usageAttributionStore
 }
@@ -522,6 +658,24 @@ func ConfigureUsageAttributionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPI
 		}
 		c.JSON(http.StatusOK, summary)
 	})
+	group.GET("/gettokens/usage-attribution/details", func(c *gin.Context) {
+		usageAttributionMu.RLock()
+		store := defaultAttributionStore
+		usageAttributionMu.RUnlock()
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage attribution store is not initialized"})
+			return
+		}
+		window := parseUsageAttributionDuration(c.Query("window"), defaultUsageAttributionWindow)
+		limit := parseUsageAttributionInt(c.Query("limit"), 50)
+		offset := parseUsageAttributionInt(c.Query("offset"), 0)
+		details, err := store.details(window, limit, offset, c.Query("account_key"), c.Query("attribution_key"))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, details)
+	})
 }
 
 func parseUsageAttributionDuration(raw string, fallback time.Duration) time.Duration {
@@ -559,6 +713,18 @@ func parseUsageAttributionBool(raw string) bool {
 	default:
 		return false
 	}
+}
+
+func parseUsageAttributionInt(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func floorUnixMilli(value int64, bucket time.Duration) int64 {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -203,6 +204,132 @@ func TestLiveSessionsSnapshotEnrichesProjectNameFromLocalCodexSession(t *testing
 	}
 }
 
+func TestLiveSessionsPrunesRequestsWithinLongSession(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	conversationID := "conv-long"
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	for i := 0; i < liveSessionMaxRequestsPerSession+5; i++ {
+		RecordDownstreamWebsocketRequest("passthrough-1", "req-"+strconv.Itoa(i), "gpt-5.5", CodexLiveSessionIdentity{
+			ConversationID: conversationID,
+		})
+	}
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(snapshot.Sessions))
+	}
+	requests := snapshot.Sessions[0].Requests
+	if len(requests) != liveSessionMaxRequestsPerSession {
+		t.Fatalf("requests = %d, want %d", len(requests), liveSessionMaxRequestsPerSession)
+	}
+	if requests[0].RequestID != "req-5" {
+		t.Fatalf("first retained request = %q, want req-5", requests[0].RequestID)
+	}
+	tracker := currentLiveSessionTracker()
+	tracker.mu.RLock()
+	_, oldRequestMapped := tracker.requestMap["req-0"]
+	requestMapSize := len(tracker.requestMap)
+	tracker.mu.RUnlock()
+	if oldRequestMapped {
+		t.Fatal("trimmed request req-0 is still present in requestMap")
+	}
+	if requestMapSize != liveSessionMaxRequestsPerSession {
+		t.Fatalf("requestMap size = %d, want %d", requestMapSize, liveSessionMaxRequestsPerSession)
+	}
+}
+
+func TestLiveSessionsHistoryPersistsTrimmedRequests(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	store := installLiveSessionHistoryStoreForTest(t)
+
+	conversationID := "conv-history"
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	for i := 0; i < liveSessionMaxRequestsPerSession+5; i++ {
+		RecordDownstreamWebsocketRequest("passthrough-1", "req-"+strconv.Itoa(i), "gpt-5.5", CodexLiveSessionIdentity{
+			ConversationID: conversationID,
+		})
+	}
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 || len(snapshot.Sessions[0].Requests) != liveSessionMaxRequestsPerSession {
+		t.Fatalf("live snapshot did not trim to recent requests: %#v", snapshot.Sessions)
+	}
+	history, err := store.history(-1, 100, 0, conversationID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history.Items) != liveSessionMaxRequestsPerSession+5 {
+		t.Fatalf("history items = %d, want %d", len(history.Items), liveSessionMaxRequestsPerSession+5)
+	}
+	foundOldest := false
+	for _, request := range history.Items {
+		if request.RequestID == "req-0" && request.SessionID == conversationID {
+			foundOldest = true
+		}
+	}
+	if !foundOldest {
+		t.Fatalf("trimmed request req-0 not found in persisted history: %#v", history.Items)
+	}
+}
+
+func TestLiveSessionsDeleteRouteClearsMemoryOnly(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	installLiveSessionHistoryStoreForTest(t)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureLiveSessionRoutes(group, nil, nil)
+
+	RecordDownstreamWebsocketConnected("session-1", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("session-1", "req-1", "gpt-5.5")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/v0/management/gettokens/live-sessions", nil)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if snapshot := CurrentLiveSessionsSnapshot(); len(snapshot.Sessions) != 0 {
+		t.Fatalf("sessions after clear = %d, want 0", len(snapshot.Sessions))
+	}
+
+	historyRecorder := httptest.NewRecorder()
+	historyRequest := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/live-sessions/history?window=all&session_id=session-1", nil)
+	router.ServeHTTP(historyRecorder, historyRequest)
+	if historyRecorder.Code != http.StatusOK {
+		t.Fatalf("history status = %d body=%s", historyRecorder.Code, historyRecorder.Body.String())
+	}
+	var history LiveSessionHistoryResponse
+	if err := json.Unmarshal(historyRecorder.Body.Bytes(), &history); err != nil {
+		t.Fatalf("unmarshal history: %v", err)
+	}
+	if len(history.Items) != 1 || history.Items[0].RequestID != "req-1" {
+		t.Fatalf("history after clear = %#v, want req-1", history.Items)
+	}
+}
+
+func TestLiveSessionsDeleteRouteClearsTracker(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	RecordDownstreamWebsocketConnected("session-1", "127.0.0.1")
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureLiveSessionRoutes(group, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/v0/management/gettokens/live-sessions", nil)
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if snapshot := CurrentLiveSessionsSnapshot(); len(snapshot.Sessions) != 0 {
+		t.Fatalf("sessions after clear = %d, want 0", len(snapshot.Sessions))
+	}
+}
+
 func TestExtractCodexLiveSessionIdentityPrefersCodexConversationFields(t *testing.T) {
 	conversationID := "0198f708-8dbf-7c90-a20a-30f4ebf7244f"
 	headers := http.Header{
@@ -236,9 +363,27 @@ func resetLiveSessionTrackerForTest(t *testing.T) {
 	liveSessionsMu.Lock()
 	defaultLiveSessions = newLiveSessionTracker()
 	liveSessionsMu.Unlock()
+	liveSessionHistoryMu.Lock()
+	defaultLiveSessionHistory = nil
+	liveSessionHistoryMu.Unlock()
 	t.Cleanup(func() {
 		liveSessionsMu.Lock()
 		defaultLiveSessions = newLiveSessionTracker()
 		liveSessionsMu.Unlock()
+		liveSessionHistoryMu.Lock()
+		defaultLiveSessionHistory = nil
+		liveSessionHistoryMu.Unlock()
 	})
+}
+
+func installLiveSessionHistoryStoreForTest(t *testing.T) *liveSessionHistoryStore {
+	t.Helper()
+	store, err := newLiveSessionHistoryStore(filepath.Join(t.TempDir(), "live-sessions-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new live session history store: %v", err)
+	}
+	liveSessionHistoryMu.Lock()
+	defaultLiveSessionHistory = store
+	liveSessionHistoryMu.Unlock()
+	return store
 }

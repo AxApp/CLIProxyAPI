@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	liveSessionsRetention       = 30 * time.Minute
-	liveSessionsRetentionLabel  = "30m / 200"
-	liveSessionsMaxItems        = 200
-	liveSessionProjectLookupTTL = 10 * time.Second
+	liveSessionsRetention            = 30 * time.Minute
+	liveSessionsRetentionLabel       = "30m / 200 sessions / 50 requests"
+	liveSessionsMaxItems             = 200
+	liveSessionMaxRequestsPerSession = 50
+	liveSessionProjectLookupTTL      = 10 * time.Second
 )
 
 type LiveSessionsSnapshot struct {
@@ -256,6 +257,26 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandl
 	group.GET("/gettokens/live-sessions", func(c *gin.Context) {
 		c.JSON(http.StatusOK, CurrentLiveSessionsSnapshot())
 	})
+	group.GET("/gettokens/live-sessions/history", func(c *gin.Context) {
+		store := currentLiveSessionHistoryStore()
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "live session history store is not initialized"})
+			return
+		}
+		window := parseUsageAttributionDuration(c.Query("window"), liveSessionsRetention)
+		limit := parseUsageAttributionInt(c.Query("limit"), 50)
+		offset := parseUsageAttributionInt(c.Query("offset"), 0)
+		history, err := store.history(window, limit, offset, c.Query("session_id"))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, history)
+	})
+	group.DELETE("/gettokens/live-sessions", func(c *gin.Context) {
+		currentLiveSessionTracker().clear()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 }
 
 func ExtractCodexLiveSessionIdentity(headers http.Header, payload []byte) CodexLiveSessionIdentity {
@@ -333,6 +354,7 @@ func (t *liveSessionTracker) recordDownstreamWebsocketRequest(sessionID string, 
 	t.requestMap[requestID] = session.session.SessionID
 	req := t.ensureRequestLocked(session, requestID, model, now, "websocket", "unknown")
 	req.request.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
+	persistLiveRequestHistory(session.session, req.request)
 	t.pruneLocked(now)
 }
 
@@ -395,6 +417,7 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 	reqState.upstreamStarted = now
 	reqState.request.Timeline = append(reqState.request.Timeline, liveEvent(t.nextEventIDLocked(), now, "upstream", "connect_start", "Connecting upstream", "info", upstream))
 	t.requestMap[requestID] = session.session.SessionID
+	persistLiveRequestHistory(session.session, reqState.request)
 	t.pruneLocked(now)
 }
 
@@ -481,6 +504,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 			if req := session.requests[requestID]; req != nil {
 				req.request.Usage = liveUsage(record.Detail)
 				fillTiming(&req.request, record.Detail, now)
+				persistLiveRequestHistory(session.session, req.request)
 				return
 			}
 		}
@@ -506,6 +530,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 	fillTiming(&req.request, record.Detail, now)
 	req.request.Timeline = append(req.request.Timeline, liveEvent(t.nextEventIDLocked(), now, "sidecar", "completed", "HTTP request completed", "success", ""))
 	t.requestMap[requestID] = sessionID
+	persistLiveRequestHistory(session.session, req.request)
 	t.pruneLocked(now)
 }
 
@@ -527,6 +552,7 @@ func (t *liveSessionTracker) updateRequest(requestID string, now time.Time, upda
 	}
 	update(session, req)
 	session.touch(now)
+	persistLiveRequestHistory(session.session, req.request)
 }
 
 func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
@@ -837,6 +863,11 @@ func (t *liveSessionTracker) ensureSessionForIdentityLocked(fallbackSessionID st
 	if fallbackSessionID = strings.TrimSpace(fallbackSessionID); fallbackSessionID != "" && fallbackSessionID != sessionID {
 		if transient := t.sessions[fallbackSessionID]; transient != nil && transient != session {
 			mergeLiveSessionState(session, transient)
+			for _, req := range transient.requests {
+				if req != nil {
+					persistLiveRequestHistory(session.session, req.request)
+				}
+			}
 			delete(t.sessions, fallbackSessionID)
 			for requestID, mappedSessionID := range t.requestMap {
 				if mappedSessionID == fallbackSessionID {
@@ -985,16 +1016,16 @@ func (t *liveSessionTracker) pruneLocked(now time.Time) {
 			delete(t.sessions, id)
 			continue
 		}
+		pruneLiveSessionRequestsLocked(session, liveSessionMaxRequestsPerSession)
 		candidates = append(candidates, candidate{id: id, at: last})
 	}
-	if len(candidates) <= liveSessionsMaxItems {
-		return
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].at.Before(candidates[j].at)
-	})
-	for _, item := range candidates[:len(candidates)-liveSessionsMaxItems] {
-		delete(t.sessions, item.id)
+	if len(candidates) > liveSessionsMaxItems {
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].at.Before(candidates[j].at)
+		})
+		for _, item := range candidates[:len(candidates)-liveSessionsMaxItems] {
+			delete(t.sessions, item.id)
+		}
 	}
 	t.requestMap = map[string]string{}
 	for sessionID, session := range t.sessions {
@@ -1002,6 +1033,42 @@ func (t *liveSessionTracker) pruneLocked(now time.Time) {
 			t.requestMap[requestID] = sessionID
 		}
 	}
+}
+
+func (t *liveSessionTracker) clear() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sessions = map[string]*liveSessionState{}
+	t.requestMap = map[string]string{}
+	t.projectLookup = nil
+	t.projectLookupCodexHome = ""
+	t.projectLookupLastRefresh = time.Time{}
+}
+
+func pruneLiveSessionRequestsLocked(session *liveSessionState, limit int) {
+	if session == nil || limit <= 0 || len(session.requests) <= limit {
+		return
+	}
+	requests := make([]*liveRequestState, 0, len(session.requests))
+	for _, req := range session.requests {
+		if req != nil {
+			requests = append(requests, req)
+		}
+	}
+	sort.SliceStable(requests, func(i, j int) bool {
+		return requests[i].request.Sequence < requests[j].request.Sequence
+	})
+	dropCount := len(requests) - limit
+	for _, req := range requests[:dropCount] {
+		delete(session.requests, req.request.RequestID)
+	}
+	for index, req := range requests[dropCount:] {
+		req.request.Sequence = index + 1
+	}
+	session.session.RequestCount = len(session.requests)
 }
 
 func (t *liveSessionTracker) nextEventIDLocked() string {
