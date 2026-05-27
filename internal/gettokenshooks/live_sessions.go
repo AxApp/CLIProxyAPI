@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -72,6 +73,7 @@ type LiveSession struct {
 	FallbackInferred    bool                `json:"fallbackInferred,omitempty"`
 	FallbackConfidence  string              `json:"fallbackConfidence,omitempty"`
 	FallbackReason      string              `json:"fallbackReason,omitempty"`
+	TimingSummary       *LiveTimingSummary  `json:"timingSummary,omitempty"`
 	RecentEvents        []LiveTimelineEvent `json:"recentEvents,omitempty"`
 	Requests            []LiveRequest       `json:"requests,omitempty"`
 }
@@ -119,6 +121,31 @@ type LiveTimingMetrics struct {
 	ReconnectCount        int     `json:"reconnectCount,omitempty"`
 	OutputTokensPerSecond float64 `json:"outputTokensPerSecond,omitempty"`
 	TotalTokensPerSecond  float64 `json:"totalTokensPerSecond,omitempty"`
+}
+
+type LiveTimingSummary struct {
+	Window         string                    `json:"window"`
+	SampleCount    int                       `json:"sampleCount"`
+	SequenceFrom   int                       `json:"sequenceFrom,omitempty"`
+	SequenceTo     int                       `json:"sequenceTo,omitempty"`
+	ActiveIncluded bool                      `json:"activeIncluded,omitempty"`
+	GeneratedAt    string                    `json:"generatedAt"`
+	Averages       LiveTimingSummaryAverages `json:"averages"`
+}
+
+type LiveTimingSummaryAverages struct {
+	QueueWaitMs           *int64   `json:"queueWaitMs,omitempty"`
+	AuthSelectMs          *int64   `json:"authSelectMs,omitempty"`
+	UpstreamConnectMs     *int64   `json:"upstreamConnectMs,omitempty"`
+	FirstEventMs          *int64   `json:"firstEventMs,omitempty"`
+	FirstTokenMs          *int64   `json:"firstTokenMs,omitempty"`
+	AverageEventGapMs     *int64   `json:"averageEventGapMs,omitempty"`
+	LongestEventGapMs     *int64   `json:"longestEventGapMs,omitempty"`
+	StreamDurationMs      *int64   `json:"streamDurationMs,omitempty"`
+	TotalDurationMs       *int64   `json:"totalDurationMs,omitempty"`
+	ReconnectCount        *int     `json:"reconnectCount,omitempty"`
+	OutputTokensPerSecond *float64 `json:"outputTokensPerSecond,omitempty"`
+	TotalTokensPerSecond  *float64 `json:"totalTokensPerSecond,omitempty"`
 }
 
 type LiveErrorSummary struct {
@@ -1197,6 +1224,7 @@ func (s *liveSessionState) touch(now time.Time) {
 func (s *liveSessionState) cloneRow(now time.Time) LiveSession {
 	session := s.session
 	session.DurationMs = maxInt64(0, now.Sub(parseLiveTime(session.StartedAt)).Milliseconds())
+	session.TimingSummary = buildLiveTimingSummary(liveRequestsFromState(s.requests), session.ActiveRequestID, now)
 	session.RecentEvents = nil
 	session.Requests = nil
 	return session
@@ -1217,7 +1245,22 @@ func (s *liveSessionState) clone(now time.Time) LiveSession {
 		return requests[i].Sequence < requests[j].Sequence
 	})
 	session.Requests = requests
+	session.TimingSummary = buildLiveTimingSummary(requests, session.ActiveRequestID, now)
 	return session
+}
+
+func liveRequestsFromState(states map[string]*liveRequestState) []LiveRequest {
+	requests := make([]LiveRequest, 0, len(states))
+	for _, state := range states {
+		if state == nil {
+			continue
+		}
+		requests = append(requests, state.request)
+	}
+	sort.SliceStable(requests, func(i, j int) bool {
+		return requests[i].Sequence < requests[j].Sequence
+	})
+	return requests
 }
 
 func compactLiveRequestForMemory(req *liveRequestState) {
@@ -1272,6 +1315,181 @@ func liveUsage(detail coreusage.Detail) *LiveTokenUsage {
 		OutputTokens:      detail.OutputTokens,
 		TotalTokens:       total,
 	}
+}
+
+func buildLiveTimingSummary(requests []LiveRequest, activeRequestID string, now time.Time) *LiveTimingSummary {
+	if len(requests) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	summary := &LiveTimingSummary{
+		Window:      "retained_requests",
+		SampleCount: len(requests),
+		GeneratedAt: formatLiveTime(now),
+	}
+
+	var totalDurationValues []int64
+	var firstEventValues []int64
+	var firstTokenValues []int64
+	var streamDurationValues []int64
+	var queueWaitValues []int64
+	var authSelectValues []int64
+	var upstreamConnectValues []int64
+	var averageEventGapValues []int64
+	var longestEventGapValues []int64
+	var reconnectValues []int
+	var outputRateValues []float64
+	var totalRateValues []float64
+
+	for index, request := range requests {
+		if index == 0 || request.Sequence < summary.SequenceFrom {
+			summary.SequenceFrom = request.Sequence
+		}
+		if index == 0 || request.Sequence > summary.SequenceTo {
+			summary.SequenceTo = request.Sequence
+		}
+
+		timing := request.Timing
+		if request.RequestID == activeRequestID {
+			summary.ActiveIncluded = true
+			if projectedTotalMs, ok := liveRequestProjectedTotalDurationMs(request, now); ok {
+				timing.TotalDurationMs = projectedTotalMs
+			}
+		} else if timing.TotalDurationMs == 0 && request.CompletedAt != "" {
+			if completedTotalMs, ok := liveRequestCompletedTotalDurationMs(request); ok {
+				timing.TotalDurationMs = completedTotalMs
+			}
+		}
+
+		if timing.TotalDurationMs > 0 {
+			totalDurationValues = append(totalDurationValues, timing.TotalDurationMs)
+		}
+		if timing.FirstEventMs > 0 {
+			firstEventValues = append(firstEventValues, timing.FirstEventMs)
+		}
+		if timing.FirstTokenMs > 0 {
+			firstTokenValues = append(firstTokenValues, timing.FirstTokenMs)
+		}
+		if timing.StreamDurationMs > 0 {
+			streamDurationValues = append(streamDurationValues, timing.StreamDurationMs)
+		}
+		if timing.QueueWaitMs > 0 {
+			queueWaitValues = append(queueWaitValues, timing.QueueWaitMs)
+		}
+		if timing.AuthSelectMs > 0 {
+			authSelectValues = append(authSelectValues, timing.AuthSelectMs)
+		}
+		if timing.UpstreamConnectMs > 0 {
+			upstreamConnectValues = append(upstreamConnectValues, timing.UpstreamConnectMs)
+		}
+		if timing.AverageEventGapMs > 0 {
+			averageEventGapValues = append(averageEventGapValues, timing.AverageEventGapMs)
+		}
+		if timing.LongestEventGapMs > 0 {
+			longestEventGapValues = append(longestEventGapValues, timing.LongestEventGapMs)
+		}
+		if hasLiveTimingValue(timing) {
+			reconnectValues = append(reconnectValues, timing.ReconnectCount)
+		}
+		if timing.OutputTokensPerSecond > 0 {
+			outputRateValues = append(outputRateValues, timing.OutputTokensPerSecond)
+		}
+		if timing.TotalTokensPerSecond > 0 {
+			totalRateValues = append(totalRateValues, timing.TotalTokensPerSecond)
+		}
+	}
+
+	summary.Averages = LiveTimingSummaryAverages{
+		TotalDurationMs:       averageLiveInt64Values(totalDurationValues),
+		FirstEventMs:          averageLiveInt64Values(firstEventValues),
+		FirstTokenMs:          averageLiveInt64Values(firstTokenValues),
+		StreamDurationMs:      averageLiveInt64Values(streamDurationValues),
+		QueueWaitMs:           averageLiveInt64Values(queueWaitValues),
+		AuthSelectMs:          averageLiveInt64Values(authSelectValues),
+		UpstreamConnectMs:     averageLiveInt64Values(upstreamConnectValues),
+		AverageEventGapMs:     averageLiveInt64Values(averageEventGapValues),
+		LongestEventGapMs:     averageLiveInt64Values(longestEventGapValues),
+		ReconnectCount:        averageLiveIntValues(reconnectValues),
+		OutputTokensPerSecond: averageLiveFloat64Values(outputRateValues),
+		TotalTokensPerSecond:  averageLiveFloat64Values(totalRateValues),
+	}
+
+	return summary
+}
+
+func liveRequestProjectedTotalDurationMs(request LiveRequest, now time.Time) (int64, bool) {
+	started := parseLiveTime(request.StartedAt)
+	if started.IsZero() || now.Before(started) {
+		return 0, false
+	}
+	elapsedMs := maxInt64(0, now.Sub(started).Milliseconds())
+	if request.Timing.TotalDurationMs > elapsedMs {
+		return request.Timing.TotalDurationMs, true
+	}
+	return elapsedMs, true
+}
+
+func liveRequestCompletedTotalDurationMs(request LiveRequest) (int64, bool) {
+	started := parseLiveTime(request.StartedAt)
+	completed := parseLiveTime(request.CompletedAt)
+	if started.IsZero() || completed.IsZero() || completed.Before(started) {
+		return 0, false
+	}
+	return maxInt64(0, completed.Sub(started).Milliseconds()), true
+}
+
+func hasLiveTimingValue(timing LiveTimingMetrics) bool {
+	return timing.TotalDurationMs > 0 ||
+		timing.FirstEventMs > 0 ||
+		timing.FirstTokenMs > 0 ||
+		timing.StreamDurationMs > 0 ||
+		timing.QueueWaitMs > 0 ||
+		timing.AuthSelectMs > 0 ||
+		timing.UpstreamConnectMs > 0 ||
+		timing.AverageEventGapMs > 0 ||
+		timing.LongestEventGapMs > 0 ||
+		timing.OutputTokensPerSecond > 0 ||
+		timing.TotalTokensPerSecond > 0 ||
+		timing.ReconnectCount > 0
+}
+
+func averageLiveInt64Values(values []int64) *int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	average := int64(math.Round(float64(total) / float64(len(values))))
+	return &average
+}
+
+func averageLiveIntValues(values []int) *int {
+	if len(values) == 0 {
+		return nil
+	}
+	var total int
+	for _, value := range values {
+		total += value
+	}
+	average := int(math.Round(float64(total) / float64(len(values))))
+	return &average
+}
+
+func averageLiveFloat64Values(values []float64) *float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	var total float64
+	for _, value := range values {
+		total += value
+	}
+	average := total / float64(len(values))
+	return &average
 }
 
 func fillTiming(req *LiveRequest, detail coreusage.Detail, now time.Time) {

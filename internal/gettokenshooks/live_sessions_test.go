@@ -393,6 +393,174 @@ func TestLiveSessionsHistoryPersistsTrimmedRequests(t *testing.T) {
 	}
 }
 
+func TestLiveSessionsTimingSummaryAveragesRetainedRequests(t *testing.T) {
+	now := time.Date(2026, 5, 27, 15, 30, 0, 0, time.UTC)
+	requests := []LiveRequest{
+		{
+			RequestID:   "req-a",
+			SessionID:   "session-1",
+			Sequence:    4,
+			Status:      "completed",
+			StartedAt:   formatLiveTime(now.Add(-10 * time.Second)),
+			CompletedAt: formatLiveTime(now.Add(-8 * time.Second)),
+			Timing: LiveTimingMetrics{
+				TotalDurationMs:       2000,
+				FirstEventMs:          400,
+				FirstTokenMs:          650,
+				StreamDurationMs:      1350,
+				QueueWaitMs:           20,
+				AuthSelectMs:          40,
+				UpstreamConnectMs:     100,
+				AverageEventGapMs:     80,
+				LongestEventGapMs:     300,
+				ReconnectCount:        0,
+				OutputTokensPerSecond: 20,
+				TotalTokensPerSecond:  200,
+			},
+		},
+		{
+			RequestID:   "req-b",
+			SessionID:   "session-1",
+			Sequence:    5,
+			Status:      "completed",
+			StartedAt:   formatLiveTime(now.Add(-8 * time.Second)),
+			CompletedAt: formatLiveTime(now.Add(-5 * time.Second)),
+			Timing: LiveTimingMetrics{
+				TotalDurationMs:       3000,
+				FirstEventMs:          500,
+				FirstTokenMs:          850,
+				StreamDurationMs:      2150,
+				QueueWaitMs:           40,
+				AuthSelectMs:          80,
+				UpstreamConnectMs:     200,
+				AverageEventGapMs:     120,
+				LongestEventGapMs:     500,
+				ReconnectCount:        2,
+				OutputTokensPerSecond: 40,
+				TotalTokensPerSecond:  400,
+			},
+		},
+	}
+
+	summary := buildLiveTimingSummary(requests, "", now)
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if summary.Window != "retained_requests" || summary.SampleCount != 2 || summary.SequenceFrom != 4 || summary.SequenceTo != 5 {
+		t.Fatalf("unexpected summary window/count/range: %#v", summary)
+	}
+	if summary.ActiveIncluded {
+		t.Fatalf("activeIncluded = true, want false")
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.TotalDurationMs); got != 2500 {
+		t.Fatalf("avg total = %d, want 2500", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.FirstEventMs); got != 450 {
+		t.Fatalf("avg first event = %d, want 450", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.FirstTokenMs); got != 750 {
+		t.Fatalf("avg first token = %d, want 750", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.QueueWaitMs); got != 30 {
+		t.Fatalf("avg queue = %d, want 30", got)
+	}
+	if got := liveTimingSummaryIntValue(t, summary.Averages.ReconnectCount); got != 1 {
+		t.Fatalf("avg reconnect = %d, want 1", got)
+	}
+	if got := liveTimingSummaryFloat64Value(t, summary.Averages.OutputTokensPerSecond); got != 30 {
+		t.Fatalf("avg output rate = %v, want 30", got)
+	}
+}
+
+func TestLiveSessionsTimingSummaryProjectsOnlyActiveRequest(t *testing.T) {
+	now := time.Date(2026, 5, 27, 15, 30, 0, 0, time.UTC)
+	requests := []LiveRequest{
+		{
+			RequestID: "req-stale",
+			SessionID: "session-1",
+			Sequence:  1,
+			Status:    "streaming",
+			StartedAt: formatLiveTime(now.Add(-30 * time.Second)),
+			Timing: LiveTimingMetrics{
+				TotalDurationMs: 1800,
+				FirstEventMs:    400,
+			},
+		},
+		{
+			RequestID: "req-live",
+			SessionID: "session-1",
+			Sequence:  2,
+			Status:    "streaming",
+			StartedAt: formatLiveTime(now.Add(-7 * time.Second)),
+			Timing: LiveTimingMetrics{
+				FirstEventMs: 420,
+			},
+		},
+	}
+
+	summary := buildLiveTimingSummary(requests, "req-live", now)
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if !summary.ActiveIncluded {
+		t.Fatalf("activeIncluded = false, want true")
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.TotalDurationMs); got != 4400 {
+		t.Fatalf("avg total = %d, want 4400", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.FirstEventMs); got != 410 {
+		t.Fatalf("avg first event = %d, want 410", got)
+	}
+	if summary.Averages.FirstTokenMs != nil {
+		t.Fatalf("first token was invented: %#v", *summary.Averages.FirstTokenMs)
+	}
+
+	later := buildLiveTimingSummary(requests, "req-live", now.Add(3*time.Second))
+	if later == nil {
+		t.Fatal("later summary is nil")
+	}
+	if got := liveTimingSummaryInt64Value(t, later.Averages.TotalDurationMs); got != 5900 {
+		t.Fatalf("later avg total = %d, want 5900", got)
+	}
+}
+
+func TestLiveSessionsTimingSummaryIgnoresMissingTimingValues(t *testing.T) {
+	now := time.Date(2026, 5, 27, 15, 30, 0, 0, time.UTC)
+	requests := []LiveRequest{
+		{
+			RequestID: "req-empty",
+			SessionID: "session-1",
+			Sequence:  10,
+			Status:    "completed",
+			StartedAt: formatLiveTime(now.Add(-10 * time.Second)),
+		},
+		{
+			RequestID: "req-timed",
+			SessionID: "session-1",
+			Sequence:  11,
+			Status:    "completed",
+			StartedAt: formatLiveTime(now.Add(-5 * time.Second)),
+			Timing: LiveTimingMetrics{
+				FirstTokenMs: 900,
+			},
+		},
+	}
+
+	summary := buildLiveTimingSummary(requests, "", now)
+	if summary == nil {
+		t.Fatal("summary is nil")
+	}
+	if summary.SampleCount != 2 || summary.SequenceFrom != 10 || summary.SequenceTo != 11 {
+		t.Fatalf("unexpected summary count/range: %#v", summary)
+	}
+	if summary.Averages.TotalDurationMs != nil {
+		t.Fatalf("total duration should be absent: %#v", *summary.Averages.TotalDurationMs)
+	}
+	if got := liveTimingSummaryInt64Value(t, summary.Averages.FirstTokenMs); got != 900 {
+		t.Fatalf("first token avg = %d, want 900", got)
+	}
+}
+
 func TestLiveSessionsDeleteRouteClearsMemoryOnly(t *testing.T) {
 	resetLiveSessionTrackerForTest(t)
 	installLiveSessionHistoryStoreForTest(t)
@@ -520,4 +688,28 @@ func currentLiveSessionDetailSnapshotForTest(t *testing.T, sessionID string) Liv
 	detail := state.clone(time.Now())
 	tracker.mu.RUnlock()
 	return detail
+}
+
+func liveTimingSummaryInt64Value(t *testing.T, value *int64) int64 {
+	t.Helper()
+	if value == nil {
+		t.Fatal("expected int64 timing summary value")
+	}
+	return *value
+}
+
+func liveTimingSummaryIntValue(t *testing.T, value *int) int {
+	t.Helper()
+	if value == nil {
+		t.Fatal("expected int timing summary value")
+	}
+	return *value
+}
+
+func liveTimingSummaryFloat64Value(t *testing.T, value *float64) float64 {
+	t.Helper()
+	if value == nil {
+		t.Fatal("expected float64 timing summary value")
+	}
+	return *value
 }
