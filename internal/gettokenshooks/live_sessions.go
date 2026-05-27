@@ -172,8 +172,9 @@ type liveSessionTracker struct {
 }
 
 type liveSessionState struct {
-	session  LiveSession
-	requests map[string]*liveRequestState
+	session             LiveSession
+	requests            map[string]*liveRequestState
+	nextRequestSequence int
 }
 
 type liveRequestState struct {
@@ -960,7 +961,7 @@ func (t *liveSessionTracker) ensureRequestLocked(session *liveSessionState, requ
 		req.request.SessionID = session.session.SessionID
 		return req
 	}
-	sequence := len(session.requests) + 1
+	sequence := nextLiveRequestSequenceLocked(session)
 	req = &liveRequestState{
 		request: LiveRequest{
 			RequestID:           requestID,
@@ -1050,8 +1051,16 @@ func mergeLiveSessionState(target *liveSessionState, source *liveSessionState) {
 			continue
 		}
 		request.request.SessionID = target.session.SessionID
-		request.request.Sequence = len(target.requests) + 1
+		if request.request.Sequence <= 0 {
+			request.request.Sequence = nextLiveRequestSequenceLocked(target)
+		}
 		target.requests[requestID] = request
+		if request.request.Sequence > target.nextRequestSequence {
+			target.nextRequestSequence = request.request.Sequence
+		}
+	}
+	if source.nextRequestSequence > target.nextRequestSequence {
+		target.nextRequestSequence = source.nextRequestSequence
 	}
 	target.session.RequestCount = len(target.requests)
 }
@@ -1139,10 +1148,22 @@ func pruneLiveSessionRequestsLocked(session *liveSessionState, limit int) {
 	for _, req := range requests[:dropCount] {
 		delete(session.requests, req.request.RequestID)
 	}
-	for index, req := range requests[dropCount:] {
-		req.request.Sequence = index + 1
-	}
 	session.session.RequestCount = len(session.requests)
+}
+
+func nextLiveRequestSequenceLocked(session *liveSessionState) int {
+	if session == nil {
+		return 1
+	}
+	if session.nextRequestSequence <= 0 {
+		for _, req := range session.requests {
+			if req != nil && req.request.Sequence > session.nextRequestSequence {
+				session.nextRequestSequence = req.request.Sequence
+			}
+		}
+	}
+	session.nextRequestSequence++
+	return session.nextRequestSequence
 }
 
 func (t *liveSessionTracker) nextEventIDLocked() string {

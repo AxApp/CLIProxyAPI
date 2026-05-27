@@ -323,6 +323,16 @@ func TestLiveSessionsPrunesRequestsWithinLongSession(t *testing.T) {
 	if requests[0].RequestID != "req-5" {
 		t.Fatalf("first retained request = %q, want req-5", requests[0].RequestID)
 	}
+	if requests[0].Sequence != 6 {
+		t.Fatalf("first retained sequence = %d, want 6", requests[0].Sequence)
+	}
+	lastRequest := requests[len(requests)-1]
+	if lastRequest.RequestID != "req-54" {
+		t.Fatalf("last retained request = %q, want req-54", lastRequest.RequestID)
+	}
+	if lastRequest.Sequence != 55 {
+		t.Fatalf("last retained sequence = %d, want 55", lastRequest.Sequence)
+	}
 	tracker := currentLiveSessionTracker()
 	tracker.mu.RLock()
 	_, oldRequestMapped := tracker.requestMap["req-0"]
@@ -360,13 +370,26 @@ func TestLiveSessionsHistoryPersistsTrimmedRequests(t *testing.T) {
 		t.Fatalf("history items = %d, want %d", len(history.Items), liveSessionMaxRequestsPerSession+5)
 	}
 	foundOldest := false
+	foundLatest := false
 	for _, request := range history.Items {
 		if request.RequestID == "req-0" && request.SessionID == conversationID {
+			if request.Sequence != 1 {
+				t.Fatalf("history req-0 sequence = %d, want 1", request.Sequence)
+			}
 			foundOldest = true
+		}
+		if request.RequestID == "req-54" && request.SessionID == conversationID {
+			if request.Sequence != 55 {
+				t.Fatalf("history req-54 sequence = %d, want 55", request.Sequence)
+			}
+			foundLatest = true
 		}
 	}
 	if !foundOldest {
 		t.Fatalf("trimmed request req-0 not found in persisted history: %#v", history.Items)
+	}
+	if !foundLatest {
+		t.Fatalf("latest request req-54 not found in persisted history: %#v", history.Items)
 	}
 }
 
