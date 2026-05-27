@@ -3,7 +3,9 @@ package executor
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
 
@@ -114,5 +116,40 @@ func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) 
 	}
 	if gjson.GetBytes(result, "tools").Exists() {
 		t.Fatalf("expected no tools for free codex auth, got %s", gjson.GetBytes(result, "tools").Raw)
+	}
+}
+
+func TestCodexOpenAIImageBodyUsesConfiguredBaseModel(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{GPTImage2BaseModel: " gpt-5.5-mini "},
+	})
+	body := []byte(`{"model":"gpt-image-2","prompt":"draw","previous_response_id":"prev","stream_options":{"include_usage":true}}`)
+
+	out, err := executor.prepareCodexOpenAIImageBody(body, cliproxyexecutor.Request{Model: "gpt-image-2"}, cliproxyexecutor.Options{}, executor.resolveGPTImage2BaseModel())
+	if err != nil {
+		t.Fatalf("prepare image body failed: %v", err)
+	}
+
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.5-mini" {
+		t.Fatalf("model = %q, want configured base model; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "stream").Bool(); !got {
+		t.Fatalf("stream = false, want true; body=%s", string(out))
+	}
+	if gjson.GetBytes(out, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id should be removed from image body: %s", string(out))
+	}
+	if gjson.GetBytes(out, "stream_options").Exists() {
+		t.Fatalf("stream_options should be removed from image body: %s", string(out))
+	}
+}
+
+func TestCodexOpenAIImageBaseModelFallsBackWhenInvalid(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{GPTImage2BaseModel: "claude-sonnet"},
+	})
+
+	if got := executor.resolveGPTImage2BaseModel(); got != codexOpenAIImagesMainModel {
+		t.Fatalf("resolved base model = %q, want %q", got, codexOpenAIImagesMainModel)
 	}
 }

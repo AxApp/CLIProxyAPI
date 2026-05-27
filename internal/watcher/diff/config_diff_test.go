@@ -108,6 +108,15 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_GPTImage2BaseModel(t *testing.T) {
+	oldCfg := &config.Config{SDKConfig: config.SDKConfig{GPTImage2BaseModel: "gpt-5.4-mini"}}
+	newCfg := &config.Config{SDKConfig: config.SDKConfig{GPTImage2BaseModel: " gpt-5.5-mini "}}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+
+	expectContains(t, details, "gpt-image-2-base-model: gpt-5.4-mini -> gpt-5.5-mini")
+}
+
 func TestBuildConfigChangeDetails_GeminiVertexHeadersAndForceMappings(t *testing.T) {
 	oldCfg := &config.Config{
 		GeminiKey: []config.GeminiKey{
