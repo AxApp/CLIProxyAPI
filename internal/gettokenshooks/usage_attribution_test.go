@@ -36,6 +36,7 @@ func TestUsageAttributionEventPrefersAuthIDOverSource(t *testing.T) {
 		Source:      "sk-upstream-secret",
 		APIKey:      "relay-key-should-not-be-used",
 		AuthID:      "codex:apikey:abc123",
+		AccountKey:  "codex-api-key:stable-001",
 		AuthIndex:   "auth-index-should-not-win",
 		AuthType:    "api-key",
 		RequestedAt: time.Date(2026, 5, 15, 10, 0, 0, 0, time.UTC),
@@ -49,6 +50,9 @@ func TestUsageAttributionEventPrefersAuthIDOverSource(t *testing.T) {
 	event := buildUsageAttributionEvent(context.Background(), record)
 	if event.AttributionKey != "auth-id:codex:apikey:abc123" {
 		t.Fatalf("attribution key = %q, want auth-id", event.AttributionKey)
+	}
+	if event.AccountKey != "codex-api-key:stable-001" {
+		t.Fatalf("account key = %q, want account-card id", event.AccountKey)
 	}
 	if event.APIKeyHash != "" {
 		t.Fatalf("api key hash = %q, want empty because record APIKey is relay key", event.APIKeyHash)

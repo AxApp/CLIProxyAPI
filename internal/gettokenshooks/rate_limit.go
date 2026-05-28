@@ -39,7 +39,6 @@ const (
 CREATE TABLE IF NOT EXISTS rate_limit_rules (
   id TEXT PRIMARY KEY,
   account_key TEXT NOT NULL,
-  match_key TEXT NOT NULL DEFAULT '',
   strategy TEXT NOT NULL,
   window TEXT NOT NULL,
   limit_value INTEGER NOT NULL,
@@ -52,13 +51,10 @@ CREATE TABLE IF NOT EXISTS rate_limit_rules (
 
 CREATE INDEX IF NOT EXISTS idx_rate_limit_rules_account
   ON rate_limit_rules(account_key);
-CREATE INDEX IF NOT EXISTS idx_rate_limit_rules_match
-  ON rate_limit_rules(match_key);
 
 CREATE TABLE IF NOT EXISTS rate_limit_events (
   id TEXT PRIMARY KEY,
   account_key TEXT NOT NULL,
-  match_key TEXT NOT NULL DEFAULT '',
   rule_id TEXT NOT NULL,
   strategy TEXT NOT NULL,
   window TEXT NOT NULL,
@@ -83,7 +79,6 @@ type RateLimitStrategyMeta struct {
 type RateLimitRule struct {
 	ID         string `json:"id"`
 	AccountKey string `json:"account_key"`
-	MatchKey   string `json:"match_key,omitempty"`
 	Strategy   string `json:"strategy"`
 	Window     string `json:"window"`
 	LimitValue int64  `json:"limit_value"`
@@ -104,7 +99,6 @@ type RateLimitRuleState struct {
 
 type RateLimitState struct {
 	AccountKey  string               `json:"account_key"`
-	MatchKey    string               `json:"match_key,omitempty"`
 	Blocked     bool                 `json:"blocked"`
 	BlockReason string               `json:"block_reason"`
 	Rules       []RateLimitRuleState `json:"rules"`
@@ -114,7 +108,6 @@ type RateLimitState struct {
 type RateLimitEvent struct {
 	ID          string `json:"id"`
 	AccountKey  string `json:"account_key"`
-	MatchKey    string `json:"match_key,omitempty"`
 	RuleID      string `json:"rule_id"`
 	Strategy    string `json:"strategy"`
 	Window      string `json:"window"`
@@ -243,16 +236,14 @@ func (rateLimitTokenWindowStrategy) UsageForRule(ctx context.Context, store *rat
 		ctx = context.Background()
 	}
 	since := rateLimitRuleWindowStart(rule.Window, now).UnixMilli()
-	matchKey := rateLimitRuleMatchKey(rule)
 	var total sql.NullInt64
 	err := store.db.QueryRowContext(
 		ctx,
 		`SELECT COALESCE(SUM(total_tokens), 0) FROM usage_attribution_events
 		  WHERE completed_at_unix_ms >= ?
-		    AND (account_key = ? OR attribution_key = ?)`,
+		    AND account_key = ?`,
 		since,
 		rule.AccountKey,
-		matchKey,
 	).Scan(&total)
 	if err != nil {
 		return 0, err
@@ -279,16 +270,14 @@ func (rateLimitRequestWindowStrategy) UsageForRule(ctx context.Context, store *r
 		ctx = context.Background()
 	}
 	since := rateLimitRuleWindowStart(rule.Window, now).UnixMilli()
-	matchKey := rateLimitRuleMatchKey(rule)
 	var count int64
 	err := store.db.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM usage_attribution_events
 		  WHERE completed_at_unix_ms >= ?
-		    AND (account_key = ? OR attribution_key = ?)`,
+		    AND account_key = ?`,
 		since,
 		rule.AccountKey,
-		matchKey,
 	).Scan(&count)
 	return count, err
 }
@@ -335,11 +324,58 @@ func newRateLimitStore(path string) (*rateLimitStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := dropDeprecatedRateLimitIdentityTables(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(usageAttributionSchema + "\n" + rateLimitSchema); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &rateLimitStore{db: db}, nil
+}
+
+func dropDeprecatedRateLimitIdentityTables(db *sql.DB) error {
+	deprecatedColumn := "match" + "_key"
+	for _, table := range []string{"rate_limit_events", "rate_limit_rules"} {
+		hasDeprecatedColumn, err := sqliteTableHasColumn(db, table, deprecatedColumn)
+		if err != nil {
+			return err
+		}
+		if !hasDeprecatedColumn {
+			continue
+		}
+		if _, err := db.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+			return fmt.Errorf("drop legacy %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func sqliteTableHasColumn(db *sql.DB, table string, column string) (bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, fmt.Errorf("inspect %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, fmt.Errorf("scan %s schema: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate %s schema: %w", table, err)
+	}
+	return false, nil
 }
 
 func ensureParentDir(path string) error {
@@ -365,22 +401,20 @@ func (s *rateLimitStore) upsertRule(rule RateLimitRule, now time.Time) error {
 	rule.UpdatedAt = nowMs
 	_, err := s.db.Exec(
 		`INSERT INTO rate_limit_rules (
-		 id, account_key, match_key, strategy, window, limit_value, action,
-		 enabled, label, created_at_unix_ms, updated_at_unix_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-		 account_key = excluded.account_key,
-		 match_key = excluded.match_key,
-		 strategy = excluded.strategy,
-		 window = excluded.window,
-		 limit_value = excluded.limit_value,
+			 id, account_key, strategy, window, limit_value, action,
+			 enabled, label, created_at_unix_ms, updated_at_unix_ms
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+			 account_key = excluded.account_key,
+			 strategy = excluded.strategy,
+			 window = excluded.window,
+			 limit_value = excluded.limit_value,
 		 action = excluded.action,
 		 enabled = excluded.enabled,
 		 label = excluded.label,
 		 updated_at_unix_ms = excluded.updated_at_unix_ms`,
 		rule.ID,
 		rule.AccountKey,
-		rule.MatchKey,
 		rule.Strategy,
 		rule.Window,
 		rule.LimitValue,
@@ -408,9 +442,9 @@ func (s *rateLimitStore) listRules(accountKey string) ([]RateLimitRule, error) {
 	var rows *sql.Rows
 	var err error
 	if strings.TrimSpace(accountKey) == "" {
-		rows, err = s.db.Query(`SELECT id, account_key, match_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules ORDER BY account_key, window, strategy`)
+		rows, err = s.db.Query(`SELECT id, account_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules ORDER BY account_key, window, strategy`)
 	} else {
-		rows, err = s.db.Query(`SELECT id, account_key, match_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules WHERE account_key = ? ORDER BY window, strategy`, strings.TrimSpace(accountKey))
+		rows, err = s.db.Query(`SELECT id, account_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules WHERE account_key = ? ORDER BY window, strategy`, strings.TrimSpace(accountKey))
 	}
 	if err != nil {
 		return nil, err
@@ -423,7 +457,7 @@ func (s *rateLimitStore) listEnabledRules() ([]RateLimitRule, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("rate limit store is not initialized")
 	}
-	rows, err := s.db.Query(`SELECT id, account_key, match_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules WHERE enabled = 1 ORDER BY account_key, window, strategy`)
+	rows, err := s.db.Query(`SELECT id, account_key, strategy, window, limit_value, action, enabled, label, created_at_unix_ms, updated_at_unix_ms FROM rate_limit_rules WHERE enabled = 1 ORDER BY account_key, window, strategy`)
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +470,7 @@ func scanRateLimitRules(rows *sql.Rows) ([]RateLimitRule, error) {
 	for rows.Next() {
 		var rule RateLimitRule
 		var enabled int64
-		if err := rows.Scan(&rule.ID, &rule.AccountKey, &rule.MatchKey, &rule.Strategy, &rule.Window, &rule.LimitValue, &rule.Action, &enabled, &rule.Label, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.AccountKey, &rule.Strategy, &rule.Window, &rule.LimitValue, &rule.Action, &enabled, &rule.Label, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
 			return nil, err
 		}
 		rule.Enabled = enabled != 0
@@ -454,12 +488,11 @@ func (s *rateLimitStore) insertEvent(state RateLimitState, ruleState RateLimitRu
 	}
 	_, err := s.db.Exec(
 		`INSERT OR IGNORE INTO rate_limit_events (
-		 id, account_key, match_key, rule_id, strategy, window, action,
-		 usage_value, limit_value, blocked, reason, triggered_at_unix_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 id, account_key, rule_id, strategy, window, action,
+			 usage_value, limit_value, blocked, reason, triggered_at_unix_ms
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		randomID("rle"),
 		state.AccountKey,
-		state.MatchKey,
 		ruleState.Rule.ID,
 		ruleState.Rule.Strategy,
 		ruleState.Rule.Window,
@@ -484,7 +517,7 @@ func (s *rateLimitStore) listEvents(accountKey string, limit int) ([]RateLimitEv
 	var err error
 	if strings.TrimSpace(accountKey) == "" {
 		rows, err = s.db.Query(
-			`SELECT id, account_key, match_key, rule_id, strategy, window, action,
+			`SELECT id, account_key, rule_id, strategy, window, action,
 			        usage_value, limit_value, blocked, reason, triggered_at_unix_ms
 			   FROM rate_limit_events
 			  ORDER BY triggered_at_unix_ms DESC
@@ -493,7 +526,7 @@ func (s *rateLimitStore) listEvents(accountKey string, limit int) ([]RateLimitEv
 		)
 	} else {
 		rows, err = s.db.Query(
-			`SELECT id, account_key, match_key, rule_id, strategy, window, action,
+			`SELECT id, account_key, rule_id, strategy, window, action,
 			        usage_value, limit_value, blocked, reason, triggered_at_unix_ms
 			   FROM rate_limit_events
 			  WHERE account_key = ?
@@ -515,7 +548,6 @@ func (s *rateLimitStore) listEvents(accountKey string, limit int) ([]RateLimitEv
 		if err := rows.Scan(
 			&event.ID,
 			&event.AccountKey,
-			&event.MatchKey,
 			&event.RuleID,
 			&event.Strategy,
 			&event.Window,
@@ -617,12 +649,10 @@ func (e *RateLimitEvaluator) EvaluateNow(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		matchKey := rateLimitRuleMatchKey(rule)
-		stateKey := rateLimitStateKey(rule.AccountKey, matchKey)
+		stateKey := rateLimitStateKey(rule.AccountKey)
 		state := stateMap[stateKey]
 		if state.AccountKey == "" {
 			state.AccountKey = rule.AccountKey
-			state.MatchKey = matchKey
 			state.UpdatedAt = now.Format(time.RFC3339)
 		}
 		ruleState := evaluateRateLimitRule(strategy, rule, usage)
@@ -710,14 +740,6 @@ func rateLimitRuleWindowStart(window string, now time.Time) time.Time {
 	return now.Add(-duration).UTC()
 }
 
-func rateLimitRuleMatchKey(rule RateLimitRule) string {
-	matchKey := strings.TrimSpace(rule.MatchKey)
-	if matchKey == "" {
-		matchKey = strings.TrimSpace(rule.AccountKey)
-	}
-	return matchKey
-}
-
 func (e *RateLimitEvaluator) StateForAccount(accountKey string) (RateLimitState, bool) {
 	if e == nil {
 		return RateLimitState{}, false
@@ -780,7 +802,6 @@ func indexRateLimitLookup(index map[string]RateLimitState, state RateLimitState)
 		}
 	}
 	add(state.AccountKey)
-	add(state.MatchKey)
 }
 
 func (e *RateLimitEvaluator) replaceStatesForTest(states []RateLimitState) {
@@ -790,7 +811,7 @@ func (e *RateLimitEvaluator) replaceStatesForTest(states []RateLimitState) {
 	e.byAcct = map[string]RateLimitState{}
 	e.byLookup = map[string]RateLimitState{}
 	for _, state := range states {
-		key := rateLimitStateKey(state.AccountKey, state.MatchKey)
+		key := rateLimitStateKey(state.AccountKey)
 		e.byKey[key] = state
 		e.byAcct[state.AccountKey] = state
 		indexRateLimitLookup(e.byLookup, state)
@@ -810,7 +831,6 @@ func rateLimitRouteGuardBlocks(states map[string]RateLimitState) []AccountRouteG
 		blocks = append(blocks, AccountRouteGuardBlock{
 			Source:     AccountRouteGuardSourceRateLimit,
 			AccountKey: state.AccountKey,
-			MatchKey:   state.MatchKey,
 			Reason:     state.BlockReason,
 		})
 	}
@@ -834,30 +854,17 @@ func candidateRateLimitKeys(auth *coreauth.Auth) []string {
 		}
 		keys = append(keys, value)
 	}
-	add(auth.ID)
-	add("auth-id:" + auth.ID)
-	add(auth.Index)
-	add("auth-index:" + auth.Index)
-	add("provider:" + strings.ToLower(strings.TrimSpace(auth.Provider)))
-	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
-		add("auth-file:" + filepath.Base(fileName))
-	}
+	add(auth.AccountKey)
 	return keys
 }
 
-func rateLimitStateKey(accountKey string, matchKey string) string {
-	accountKey = strings.TrimSpace(accountKey)
-	matchKey = strings.TrimSpace(matchKey)
-	if matchKey == "" {
-		matchKey = accountKey
-	}
-	return accountKey + "\x00" + matchKey
+func rateLimitStateKey(accountKey string) string {
+	return strings.TrimSpace(accountKey)
 }
 
 func normalizeRateLimitRule(rule RateLimitRule) RateLimitRule {
 	rule.ID = strings.TrimSpace(rule.ID)
 	rule.AccountKey = strings.TrimSpace(rule.AccountKey)
-	rule.MatchKey = strings.TrimSpace(rule.MatchKey)
 	rule.Strategy = strings.ToLower(strings.TrimSpace(rule.Strategy))
 	rule.Window = strings.ToLower(strings.TrimSpace(rule.Window))
 	rule.Action = strings.ToLower(strings.TrimSpace(rule.Action))

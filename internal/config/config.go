@@ -6,6 +6,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,6 +149,7 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+	codexLocalIDPending    bool `yaml:"-" json:"-"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -440,6 +443,10 @@ func (m ClaudeModel) GetAlias() string { return m.Alias }
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
+	// LocalID is the stable GetTokens account-card identifier for this credential.
+	// It must not change when APIKey/BaseURL/Prefix changes.
+	LocalID string `yaml:"local-id,omitempty" json:"local-id,omitempty"`
+
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
@@ -746,20 +753,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// NOTE: Legacy migration persistence is intentionally disabled together with
-	// startup legacy migration to keep startup read-only for config.yaml.
-	// Re-enable the block below if automatic startup migration is needed again.
-	// if cfg.legacyMigrationPending {
-	// 	fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
-	// 	if !optional && configFile != "" {
-	// 		if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
-	// 			return nil, fmt.Errorf("failed to persist migrated legacy config: %w", err)
-	// 		}
-	// 		fmt.Println("Legacy configuration normalized and persisted.")
-	// 	} else {
-	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
-	// 	}
-	// }
+	if cfg.codexLocalIDPending && !optional && configFile != "" {
+		if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
+			return nil, fmt.Errorf("failed to persist codex api key local ids: %w", err)
+		}
+	}
 
 	// Return the populated configuration struct.
 	return &cfg, nil
@@ -914,6 +912,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 	out := make([]CodexKey, 0, len(cfg.CodexKey))
 	for i := range cfg.CodexKey {
 		e := cfg.CodexKey[i]
+		e.LocalID = strings.TrimSpace(e.LocalID)
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
@@ -921,9 +920,24 @@ func (cfg *Config) SanitizeCodexKeys() {
 		if e.BaseURL == "" {
 			continue
 		}
+		if e.LocalID == "" {
+			e.LocalID = buildLegacyCodexKeyLocalID(e, i)
+			cfg.codexLocalIDPending = true
+		}
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+func buildLegacyCodexKeyLocalID(entry CodexKey, index int) string {
+	material := strings.Join([]string{
+		strings.TrimSpace(entry.APIKey),
+		strings.TrimSpace(entry.BaseURL),
+		normalizeModelPrefix(entry.Prefix),
+		fmt.Sprintf("%d", index),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(material))
+	return "codex-api-key:legacy-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

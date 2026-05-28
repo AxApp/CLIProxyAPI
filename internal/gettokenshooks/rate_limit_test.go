@@ -26,7 +26,6 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-1",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 2,
@@ -42,6 +41,7 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 			CompletedAtUnixMs: now.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
+			AccountKey:        "codex-api-key:stable-001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       50,
@@ -65,10 +65,10 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 	if !state.Blocked || state.BlockReason != "1h requests 已满" {
 		t.Fatalf("blocked state = %#v, want 1h request block", state)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
 		t.Fatalf("deny ids = %#v, want candidate auth id", got)
 	}
-	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
 		t.Fatalf("route guard deny ids = %#v, want rate-limited candidate auth id", got)
 	}
 }
@@ -82,7 +82,6 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-token",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyTokenWindow,
 		Window:     "24h",
 		LimitValue: 100,
@@ -96,6 +95,7 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 		CompletedAtUnixMs: now.Add(2 * time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
+		AccountKey:        "codex-api-key:stable-001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       100,
@@ -133,7 +133,6 @@ func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) 
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-calendar-day",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     RateLimitWindowCalendarDay,
 		LimitValue: 2,
@@ -156,6 +155,7 @@ func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) 
 			CompletedAtUnixMs: event.timestamp.UTC().UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
+			AccountKey:        "codex-api-key:stable-001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       25,
@@ -193,7 +193,6 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-warn",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 1,
@@ -207,6 +206,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 		CompletedAtUnixMs: now.Add(time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
+		AccountKey:        "codex-api-key:stable-001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       25,
@@ -232,7 +232,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 	if len(state.Rules) != 1 || !state.Rules[0].Exceeded {
 		t.Fatalf("rules = %#v, want exceeded warning rule", state.Rules)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 0 {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 0 {
 		t.Fatalf("deny ids = %#v, warn rule should not deny", got)
 	}
 }
@@ -247,7 +247,6 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-slide",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 2,
@@ -262,6 +261,7 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 			CompletedAtUnixMs: base.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
+			AccountKey:        "codex-api-key:stable-001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       25,
@@ -292,7 +292,7 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 	if state.Blocked || len(state.Rules) != 1 || state.Rules[0].CurrentUsage != 0 {
 		t.Fatalf("recovered state = %#v, want unblocked zero usage", state)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123"}}); len(got) != 0 {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 0 {
 		t.Fatalf("deny ids = %#v, recovered account should not deny", got)
 	}
 }
@@ -306,7 +306,6 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-disabled",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 1,
@@ -320,6 +319,7 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 		CompletedAtUnixMs: now.Add(time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
+		AccountKey:        "codex-api-key:stable-001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       25,
@@ -357,14 +357,13 @@ func TestRateLimitEvaluatorFeedsAccountRouteGuardPolicy(t *testing.T) {
 	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{})
 	evaluator.replaceStatesForTest([]RateLimitState{{
 		AccountKey:  "openai-compatible:MI",
-		MatchKey:    "auth-id:openai-compatibility:mi:abc123",
 		Blocked:     true,
 		BlockReason: "24h tokens 已满",
 		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
 	}})
 
 	decision := accountRouteGuardPolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
-		Candidates: []*coreauth.Auth{{ID: "openai-compatibility:mi:abc123", Provider: "mi"}},
+		Candidates: []*coreauth.Auth{{ID: "openai-compatibility:mi:abc123", AccountKey: "openai-compatible:MI", Provider: "mi"}},
 	})
 	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "openai-compatibility:mi:abc123" {
 		t.Fatalf("DenyIDs = %#v, want blocked candidate", decision.DenyIDs)
@@ -389,7 +388,6 @@ func TestRateLimitEvaluatorUsesRegisteredStrategy(t *testing.T) {
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-custom",
 		AccountKey: "codex-api-key:stable-001",
-		MatchKey:   "auth-id:codex:apikey:abc123",
 		Strategy:   "test-window",
 		Window:     "1h",
 		LimitValue: 5,
@@ -460,7 +458,6 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 
 	createBody := `{
 		"account_key":"codex-api-key:stable-001",
-		"match_key":"auth-id:codex:apikey:abc123",
 		"strategy":"request-window",
 		"window":"1h",
 		"limit_value":2,
@@ -486,6 +483,7 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 			CompletedAtUnixMs: now.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
+			AccountKey:        "codex-api-key:stable-001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       50,

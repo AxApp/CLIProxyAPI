@@ -190,6 +190,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
+			AccountKey: strings.TrimSpace(ck.LocalID),
 			Provider:   "codex",
 			Label:      "codex-apikey",
 			Prefix:     prefix,
@@ -263,6 +264,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
+				AccountKey: openAICompatAccountKey(compat.Name),
 				Provider:   providerName,
 				Label:      compat.Name,
 				Prefix:     prefix,
@@ -302,6 +304,7 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
+				AccountKey: openAICompatAccountKey(compat.Name),
 				Provider:   providerName,
 				Label:      compat.Name,
 				Prefix:     prefix,
@@ -318,6 +321,14 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 		}
 	}
 	return out
+}
+
+func openAICompatAccountKey(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		trimmed = "openai-compatibility"
+	}
+	return "openai-compatible:" + trimmed
 }
 
 // synthesizeVertexCompat creates Auth entries for Vertex-compatible providers.

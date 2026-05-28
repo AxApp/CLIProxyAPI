@@ -114,6 +114,9 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
 	}
+	if auths[0].AccountKey != "auth-file:claude-auth.json" {
+		t.Errorf("expected account_key auth-file:claude-auth.json, got %s", auths[0].AccountKey)
+	}
 	if got := auths[0].Attributes["header:X-Test"]; got != "value" {
 		t.Errorf("expected header:X-Test value, got %q", got)
 	}

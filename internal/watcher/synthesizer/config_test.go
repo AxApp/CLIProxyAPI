@@ -250,6 +250,7 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 		Config: &config.Config{
 			CodexKey: []config.CodexKey{
 				{
+					LocalID:        "codex-api-key:stable-001",
 					APIKey:         "codex-key-123",
 					Prefix:         "dev",
 					BaseURL:        "https://api.openai.com",
@@ -285,6 +286,45 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	}
 	if v, ok := auths[0].Metadata["disable_cooling"].(bool); !ok || !v {
 		t.Errorf("expected disable_cooling=true, got %v", auths[0].Metadata["disable_cooling"])
+	}
+	if auths[0].AccountKey != "codex-api-key:stable-001" {
+		t.Errorf("expected account_key codex-api-key:stable-001, got %s", auths[0].AccountKey)
+	}
+}
+
+func TestConfigSynthesizer_CodexKeys_RequiresStableAccountKey(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			CodexKey: []config.CodexKey{
+				{
+					LocalID: "codex-api-key:first",
+					APIKey:  "shared-codex-key",
+					BaseURL: "https://api.openai.com",
+				},
+				{
+					LocalID: "codex-api-key:second",
+					APIKey:  "shared-codex-key",
+					BaseURL: "https://api.openai.com",
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 auths, got %d", len(auths))
+	}
+	if auths[0].AccountKey != "codex-api-key:first" || auths[1].AccountKey != "codex-api-key:second" {
+		t.Fatalf("account keys = %q / %q, want stable local ids", auths[0].AccountKey, auths[1].AccountKey)
+	}
+	if auths[0].ID == auths[1].ID {
+		t.Fatalf("runtime ids must remain distinct for duplicated credential cards, got %q", auths[0].ID)
 	}
 }
 
@@ -424,6 +464,9 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 				for i := range auths {
 					if v, ok := auths[i].Metadata["disable_cooling"].(bool); !ok || !v {
 						t.Fatalf("expected auth[%d].disable_cooling=true, got %v", i, auths[i].Metadata["disable_cooling"])
+					}
+					if auths[i].AccountKey != "openai-compatible:CustomProvider" {
+						t.Fatalf("expected auth[%d].account_key openai-compatible:CustomProvider, got %q", i, auths[i].AccountKey)
 					}
 				}
 			}

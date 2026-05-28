@@ -47,6 +47,8 @@ func GetRequestInfo(ctx context.Context) *RequestInfo {
 type Auth struct {
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
+	// AccountKey is the stable GetTokens account-card identifier that owns this runtime auth.
+	AccountKey string `json:"account_key,omitempty"`
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).
 	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").

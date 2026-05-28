@@ -122,12 +122,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 
 	a := &coreauth.Auth{
-		ID:       id,
-		Provider: provider,
-		Label:    label,
-		Prefix:   prefix,
-		Status:   status,
-		Disabled: disabled,
+		ID:         id,
+		AccountKey: authFileAccountKey(fullPath),
+		Provider:   provider,
+		Label:      label,
+		Prefix:     prefix,
+		Status:     status,
+		Disabled:   disabled,
 		Attributes: map[string]string{
 			"source": fullPath,
 			"path":   fullPath,
@@ -262,6 +263,7 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		}
 		virtual := &coreauth.Auth{
 			ID:         buildGeminiVirtualID(primary.ID, projectID),
+			AccountKey: primary.AccountKey,
 			Provider:   originalProvider,
 			Label:      fmt.Sprintf("%s [%s]", label, projectID),
 			Status:     coreauth.StatusActive,
@@ -276,6 +278,17 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		virtuals = append(virtuals, virtual)
 	}
 	return virtuals
+}
+
+func authFileAccountKey(path string) string {
+	name := strings.TrimSpace(filepath.Base(path))
+	if name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	if name == "" {
+		return ""
+	}
+	return "auth-file:" + name
 }
 
 // splitGeminiProjectIDs extracts and deduplicates project IDs from metadata.

@@ -16,7 +16,6 @@ func TestAccountRouteGuardManualDisabledDeniesCandidate(t *testing.T) {
 		Source:     AccountRouteGuardSourceManualDisabled,
 		AuthID:     auth.ID,
 		AccountKey: "auth-file:codex-auth.json",
-		MatchKey:   "auth-id:codex-auth-1",
 		Reason:     "disabled by user",
 	})
 

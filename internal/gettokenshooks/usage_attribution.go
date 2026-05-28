@@ -586,6 +586,7 @@ func buildUsageAttributionEvent(ctx context.Context, record coreusage.Record) us
 		Provider:          strings.TrimSpace(record.Provider),
 		AttributionKey:    attributionKey,
 		AttributionKind:   attributionKind,
+		AccountKey:        strings.TrimSpace(record.AccountKey),
 		AuthID:            strings.TrimSpace(record.AuthID),
 		AuthIndex:         strings.TrimSpace(record.AuthIndex),
 		AuthType:          strings.TrimSpace(record.AuthType),

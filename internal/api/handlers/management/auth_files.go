@@ -1091,6 +1091,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	auth := &coreauth.Auth{
 		ID:         authID,
+		AccountKey: "auth-file:" + filepath.Base(path),
 		Provider:   provider,
 		FileName:   filepath.Base(path),
 		Label:      label,

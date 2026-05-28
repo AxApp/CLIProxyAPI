@@ -25,6 +25,7 @@ type UsageReporter struct {
 	model       string
 	alias       string
 	authID      string
+	accountKey  string
 	authIndex   string
 	authType    string
 	apiKey      string
@@ -58,6 +59,7 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
+		reporter.accountKey = auth.AccountKey
 		reporter.authIndex = auth.EnsureIndex()
 	}
 	return reporter
@@ -248,6 +250,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Source:          r.source,
 		APIKey:          r.apiKey,
 		AuthID:          r.authID,
+		AccountKey:      r.accountKey,
 		AuthIndex:       r.authIndex,
 		AuthType:        r.authType,
 		ReasoningEffort: r.reasoning,

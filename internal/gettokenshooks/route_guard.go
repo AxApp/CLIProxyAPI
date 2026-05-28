@@ -31,7 +31,6 @@ type AccountRouteGuardBlock struct {
 	Source     string
 	AuthID     string
 	AccountKey string
-	MatchKey   string
 	LookupKeys []string
 	Reason     string
 	ExpiresAt  time.Time
@@ -84,7 +83,6 @@ func MarkManualDisabledAuth(auth *coreauth.Auth, reason string) {
 		Source:     AccountRouteGuardSourceManualDisabled,
 		AuthID:     strings.TrimSpace(auth.ID),
 		AccountKey: "auth-id:" + strings.TrimSpace(auth.ID),
-		MatchKey:   "auth-id:" + strings.TrimSpace(auth.ID),
 		LookupKeys: accountRouteGuardIdentityKeysForAuth(auth),
 		Reason:     reason,
 	})
@@ -321,7 +319,6 @@ func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteG
 	block.Source = strings.TrimSpace(block.Source)
 	block.AuthID = strings.TrimSpace(block.AuthID)
 	block.AccountKey = strings.TrimSpace(block.AccountKey)
-	block.MatchKey = strings.TrimSpace(block.MatchKey)
 	block.Reason = strings.TrimSpace(block.Reason)
 	if block.UpdatedAt.IsZero() {
 		block.UpdatedAt = time.Now().UTC()
@@ -344,7 +341,6 @@ func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteG
 		add("auth-id:" + block.AuthID)
 	}
 	add(block.AccountKey)
-	add(block.MatchKey)
 	for _, key := range block.LookupKeys {
 		add(key)
 	}
@@ -390,7 +386,6 @@ func accountRouteGuardBlockForResult(result coreauth.Result) (AccountRouteGuardB
 		Source:     source,
 		AuthID:     authID,
 		AccountKey: "auth-id:" + authID,
-		MatchKey:   "auth-id:" + authID,
 		Reason:     reason,
 	}
 	if cooldown > 0 {
@@ -410,9 +405,6 @@ func defaultAccountRouteGuardReason(reason string, fallback string) string {
 func accountRouteGuardBlockKey(block AccountRouteGuardBlock) string {
 	if block.AuthID != "" {
 		return block.AuthID
-	}
-	if block.MatchKey != "" {
-		return block.MatchKey
 	}
 	return block.AccountKey
 }
@@ -435,6 +427,7 @@ func accountRouteGuardKeysForAuth(auth *coreauth.Auth) []string {
 		keys = append(keys, value)
 	}
 	add(auth.ID)
+	add(auth.AccountKey)
 	add("auth-id:" + auth.ID)
 	add(auth.Index)
 	add("auth-index:" + auth.Index)
