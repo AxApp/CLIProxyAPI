@@ -29,3 +29,17 @@ func TestExtractReasoningEffortMissingConfigIsEmpty(t *testing.T) {
 		t.Fatalf("ExtractReasoningEffort() = %q, want empty", got)
 	}
 }
+
+func TestExtractTranslatedReasoningEffortUsesCodexShape(t *testing.T) {
+	got := ExtractTranslatedReasoningEffort([]byte(`{"reasoning":{"effort":"high"}}`), "codex")
+	if got != "high" {
+		t.Fatalf("ExtractTranslatedReasoningEffort() = %q, want %q", got, "high")
+	}
+}
+
+func TestExtractTranslatedReasoningEffortMissingConfigIsEmpty(t *testing.T) {
+	got := ExtractTranslatedReasoningEffort([]byte(`{"messages":[{"role":"user","content":"hi"}]}`), "codex")
+	if got != "" {
+		t.Fatalf("ExtractTranslatedReasoningEffort() = %q, want empty", got)
+	}
+}

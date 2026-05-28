@@ -184,6 +184,30 @@ func TestUsageReporterTrackHTTPClientStartsTTFTBeforeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUsageReporterObserveResponseMarksTTFTOnFirstRead(t *testing.T) {
+	delay := 40 * time.Millisecond
+	reporter := NewUsageReporter(context.Background(), "openai", "gpt-5.4", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("ok")),
+	}
+
+	reporter.ObserveResponse(resp)
+	time.Sleep(delay)
+
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if errClose := resp.Body.Close(); errClose != nil {
+		t.Fatalf("response body close error = %v", errClose)
+	}
+	if got := reporter.ttftDuration(); got < delay {
+		t.Fatalf("ttft = %v, want >= %v", got, delay)
+	}
+}
+
 func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
 	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
@@ -204,6 +228,30 @@ func TestUsageReporterBuildRecordIncludesReasoningEffort(t *testing.T) {
 	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
 	if record.ReasoningEffort != "medium" {
 		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "medium")
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortPreservesContextWhenTranslationMissing(t *testing.T) {
+	ctx := usage.WithReasoningEffort(context.Background(), "medium")
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	reporter.SetTranslatedReasoningEffort([]byte(`{"messages":[{"role":"user","content":"hi"}]}`), "codex")
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ReasoningEffort != "medium" {
+		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "medium")
+	}
+}
+
+func TestUsageReporterSetTranslatedReasoningEffortOverridesContextWhenTranslated(t *testing.T) {
+	ctx := usage.WithReasoningEffort(context.Background(), "medium")
+	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+
+	reporter.SetTranslatedReasoningEffort([]byte(`{"reasoning":{"effort":"high"}}`), "codex")
+
+	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	if record.ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want %q", record.ReasoningEffort, "high")
 	}
 }
 

@@ -77,7 +77,9 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 	if r == nil {
 		return
 	}
-	r.reasoning = thinking.ExtractTranslatedReasoningEffort(payload, format)
+	if effort := thinking.ExtractTranslatedReasoningEffort(payload, format); effort != "" {
+		r.reasoning = effort
+	}
 }
 
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
@@ -101,6 +103,13 @@ func (r *UsageReporter) ObserveResponse(resp *http.Response) {
 		return
 	}
 	r.StartResponseTTFT()
+	r.observeResponseBody(resp)
+}
+
+func (r *UsageReporter) observeResponseBody(resp *http.Response) {
+	if r == nil || resp == nil || resp.Body == nil {
+		return
+	}
 	resp.Body = &usageTTFTReadCloser{
 		ReadCloser: resp.Body,
 		mark: func() {
@@ -314,7 +323,7 @@ func (t usageTTFTRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 	if errRoundTrip != nil {
 		return resp, errRoundTrip
 	}
-	t.reporter.ObserveResponse(resp)
+	t.reporter.observeResponseBody(resp)
 	return resp, nil
 }
 
