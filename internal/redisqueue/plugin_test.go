@@ -33,6 +33,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 			AuthType:        "apikey",
 			Source:          "user@example.com",
 			ReasoningEffort: "medium",
+			ServiceTier:     "priority",
 			RequestedAt:     time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC),
 			Latency:         1500 * time.Millisecond,
 			TTFT:            1200 * time.Millisecond,
@@ -55,6 +56,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		requireStringField(t, payload, "request_id", "ctx-request-id")
 		requireStringField(t, payload, "reasoning_effort", "medium")
 		requireIntField(t, payload, "ttft_ms", 1200)
+		requireStringField(t, payload, "service_tier", "priority")
 		requireHeaderField(t, payload, "response_headers", "X-Upstream-Request-Id", []string{"upstream-req-1"})
 		requireHeaderField(t, payload, "response_headers", "Retry-After", []string{"30"})
 		requireBoolField(t, payload, "failed", false)
