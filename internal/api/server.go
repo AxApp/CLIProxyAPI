@@ -349,6 +349,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	return s
 }
 
+func (s *Server) SetAccountStoreApplyHook(hook func(context.Context) error) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetAccountStoreApplyHook(hook)
+}
+
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s == nil || s.cfg == nil || !s.cfg.Home.Enabled {
@@ -725,6 +732,17 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
+
+		mgmt.GET("/accounts", s.mgmt.ListAccounts)
+		mgmt.GET("/accounts/:account_key", s.mgmt.GetAccount)
+		mgmt.POST("/accounts", s.mgmt.CreateAccount)
+		mgmt.PATCH("/accounts/:account_key", s.mgmt.PatchAccount)
+		mgmt.DELETE("/accounts/:account_key", s.mgmt.DeleteAccount)
+		mgmt.PATCH("/accounts/:account_key/status", s.mgmt.PatchAccountStatus)
+		mgmt.PATCH("/accounts/:account_key/priority", s.mgmt.PatchAccountPriority)
+		mgmt.POST("/account-migration/dry-run", s.mgmt.DryRunAccountMigration)
+		mgmt.POST("/account-migration/commit", s.mgmt.CommitAccountMigration)
+		mgmt.POST("/account-migration/delete-legacy-sources", s.mgmt.DeleteLegacyAccountSources)
 
 		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
 		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)

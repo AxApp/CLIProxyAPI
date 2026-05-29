@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -484,6 +486,51 @@ func TestFileSynthesizer_CodexAuthFileKeepsExplicitWebsocketsInMetadata(t *testi
 	}
 	if got, ok := auths[0].Metadata["websockets"].(bool); !ok || got {
 		t.Fatalf("expected websockets=false metadata to be preserved, got %#v", auths[0].Metadata["websockets"])
+	}
+}
+
+func TestFileSynthesizer_SkipsCodexAuthFilesWhenAccountStoreOwnsAccounts(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "codex-pro.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","access_token":"legacy"}`), 0600); err != nil {
+		t.Fatalf("WriteFile authFile: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "DB Codex",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "codex-pro.json",
+			AuthJSON:       `{"type":"codex","access_token":"db"}`,
+			AuthType:       "codex",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("file synthesizer returned %d auths, want 0 when account store owns codex auth-files", len(auths))
 	}
 }
 

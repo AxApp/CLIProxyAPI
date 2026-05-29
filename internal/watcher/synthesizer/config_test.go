@@ -1,10 +1,13 @@
 package synthesizer
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -382,6 +385,96 @@ func TestConfigSynthesizer_CodexKeys_SkipsEmptyAndHeaders(t *testing.T) {
 	}
 	if auths[0].Attributes["header:Authorization"] != "Bearer xyz" {
 		t.Errorf("expected header:Authorization=Bearer xyz, got %s", auths[0].Attributes["header:Authorization"])
+	}
+}
+
+func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	codexAccount, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "DB Codex",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		Priority:         5,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:      "sk-db-codex",
+			BaseURL:     "https://db.example.com/v1",
+			Prefix:      "db/",
+			Websockets:  true,
+			HeadersJSON: `{"X-DB":"1"}`,
+			ModelsJSON:  `[{"name":"gpt-5","alias":"gpt-5"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount codex: %v", err)
+	}
+	compatAccount, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindOpenAICompatible,
+		Title:            "DB DeepSeek",
+		Provider:         "deepseek",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		OpenAICompatible: &accountstore.OpenAICompatibleCredential{
+			ProviderName:       "deepseek",
+			RuntimeProviderKey: "openai-compatible:db-deepseek",
+			BaseURL:            "https://deepseek.example.com",
+			Prefix:             "ds/",
+			APIKeyEntriesJSON:  `[{"api-key":"sk-db-ds","proxy-url":"http://proxy.local:9000"}]`,
+			HeadersJSON:        `{"X-Provider":"DeepSeek"}`,
+			ModelsJSON:         `[{"name":"deepseek-chat","alias":"deepseek-chat"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount compat: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{
+			AccountStoreDB: dbPath,
+			CodexKey: []config.CodexKey{{
+				LocalID: "codex-api-key:legacy",
+				APIKey:  "sk-legacy",
+				BaseURL: "https://legacy.example.com",
+			}},
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "legacy",
+				BaseURL: "https://legacy.example.com",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey: "sk-legacy-openai-compatible",
+				}},
+			}},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("auths len = %d, want 2", len(auths))
+	}
+	if auths[0].AccountKey != codexAccount.AccountKey {
+		t.Fatalf("codex account_key = %q, want %q", auths[0].AccountKey, codexAccount.AccountKey)
+	}
+	if auths[0].Attributes["api_key"] != "sk-db-codex" || auths[0].Attributes["base_url"] != "https://db.example.com/v1" {
+		t.Fatalf("codex auth not synthesized from db: %+v", auths[0].Attributes)
+	}
+	if auths[0].Attributes["header:X-DB"] != "1" {
+		t.Fatalf("codex headers not synthesized from db: %+v", auths[0].Attributes)
+	}
+	if auths[1].AccountKey != compatAccount.AccountKey {
+		t.Fatalf("compat account_key = %q, want %q", auths[1].AccountKey, compatAccount.AccountKey)
+	}
+	if auths[1].Provider != "deepseek" || auths[1].Attributes["api_key"] != "sk-db-ds" {
+		t.Fatalf("compat auth not synthesized from db: provider=%s attrs=%+v", auths[1].Provider, auths[1].Attributes)
 	}
 }
 

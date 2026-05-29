@@ -89,6 +89,7 @@ type WatcherWrapper struct {
 	snapshotAuths         func() []*coreauth.Auth
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
+	refreshAuthState      func(force bool)
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -123,6 +124,13 @@ func (w *WatcherWrapper) DispatchRuntimeAuthUpdate(update watcher.AuthUpdate) bo
 		return false
 	}
 	return w.dispatchRuntimeUpdate(update)
+}
+
+func (w *WatcherWrapper) RefreshAuthState(force bool) {
+	if w == nil || w.refreshAuthState == nil {
+		return
+	}
+	w.refreshAuthState(force)
 }
 
 // SetClients updates the watcher file-backed clients registry.

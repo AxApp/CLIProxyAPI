@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -46,6 +47,8 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	accountStorePath    string
+	accountStoreApply   func(context.Context) error
 }
 
 // NewHandler creates a new management handler instance.
@@ -140,6 +143,21 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetAccountStorePath overrides the sidecar account store path for tests and embedded callers.
+func (h *Handler) SetAccountStorePath(path string) {
+	if h == nil {
+		return
+	}
+	h.accountStorePath = strings.TrimSpace(path)
+}
+
+func (h *Handler) SetAccountStoreApplyHook(hook func(context.Context) error) {
+	if h == nil {
+		return
+	}
+	h.accountStoreApply = hook
 }
 
 // Middleware enforces access control for management endpoints.

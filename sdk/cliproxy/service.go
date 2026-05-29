@@ -183,6 +183,23 @@ func (s *Service) emitAuthUpdate(ctx context.Context, update watcher.AuthUpdate)
 	s.handleAuthUpdate(ctx, update)
 }
 
+func (s *Service) refreshAccountStoreAuths(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.watcher != nil {
+		s.watcher.RefreshAuthState(true)
+		return nil
+	}
+	if s.coreManager != nil && s.cfg != nil {
+		s.coreManager.SetConfig(s.cfg)
+	}
+	return nil
+}
+
 func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {
 	if s == nil {
 		return
@@ -830,6 +847,11 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	if s.server != nil {
+		s.server.SetAccountStoreApplyHook(func(ctx context.Context) error {
+			return s.refreshAccountStoreAuths(ctx)
+		})
+	}
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()

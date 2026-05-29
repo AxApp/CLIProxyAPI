@@ -28,6 +28,7 @@ import (
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -1620,6 +1621,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	if strings.EqualFold(strings.TrimSpace(record.Provider), "codex") {
+		return h.saveTokenRecordToAccountStore(ctx, record)
+	}
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
@@ -1630,6 +1634,60 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		}
 	}
 	return store.Save(ctx, record)
+}
+
+func (h *Handler) saveTokenRecordToAccountStore(ctx context.Context, record *coreauth.Auth) (string, error) {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer store.Close()
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return "", fmt.Errorf("marshal token record: %w", err)
+	}
+	title := strings.TrimSpace(record.FileName)
+	if title == "" {
+		title = strings.TrimSpace(record.ID)
+	}
+	email := ""
+	planType := ""
+	if record.Metadata != nil {
+		email = stringFromAny(record.Metadata["email"])
+		planType = stringFromAny(record.Metadata["plan_type"])
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            title,
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarOAuth,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: title,
+			AuthJSON:       string(payload),
+			AuthType:       "codex",
+			Email:          email,
+			PlanType:       planType,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	account = h.applyAccountStoreRuntime(ctx, store, account)
+	if account.RuntimeApplyStatus == "failed" {
+		return "account-store:" + account.AccountKey, fmt.Errorf("account store runtime apply failed: %s", account.RuntimeApplyError)
+	}
+	return "account-store:" + account.AccountKey, nil
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return ""
+	}
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {

@@ -1,10 +1,15 @@
 package synthesizer
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -24,19 +29,87 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if ctx == nil || ctx.Config == nil {
 		return out, nil
 	}
+	accountStoreAuths, accountStoreActive := s.synthesizeAccountStore(ctx)
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
 	// Claude API Keys
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
-	// Codex API Keys
-	out = append(out, s.synthesizeCodexKeys(ctx)...)
-	// OpenAI-compat
-	out = append(out, s.synthesizeOpenAICompat(ctx)...)
+	if accountStoreActive {
+		out = append(out, accountStoreAuths...)
+	} else {
+		// Codex API Keys
+		out = append(out, s.synthesizeCodexKeys(ctx)...)
+		// OpenAI-compat
+		out = append(out, s.synthesizeOpenAICompat(ctx)...)
+	}
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 
 	return out, nil
+}
+
+func (s *ConfigSynthesizer) synthesizeAccountStore(ctx *SynthesisContext) ([]*coreauth.Auth, bool) {
+	path := strings.TrimSpace(ctx.Config.AccountStoreDB)
+	if path == "" {
+		return nil, false
+	}
+	path = expandAccountStorePath(path)
+	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		return nil, false
+	}
+	store, err := accountstore.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer store.Close()
+	accounts, err := store.ListAccounts(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	out := make([]*coreauth.Auth, 0, len(accounts))
+	for _, account := range accounts {
+		switch account.Kind {
+		case accountstore.KindAuthFile:
+			out = append(out, synthesizeAccountStoreAuthFile(ctx, account)...)
+		case accountstore.KindCodexAPIKey:
+			if auth := s.synthesizeAccountStoreCodexKey(ctx, account); auth != nil {
+				out = append(out, auth)
+			}
+		case accountstore.KindOpenAICompatible:
+			out = append(out, s.synthesizeAccountStoreOpenAICompat(ctx, account)...)
+		}
+	}
+	return out, len(accounts) > 0
+}
+
+func accountStoreHasKind(cfg *config.Config, kind accountstore.AccountKind) bool {
+	if cfg == nil {
+		return false
+	}
+	path := strings.TrimSpace(cfg.AccountStoreDB)
+	if path == "" {
+		return false
+	}
+	path = expandAccountStorePath(path)
+	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		return false
+	}
+	store, err := accountstore.Open(path)
+	if err != nil {
+		return false
+	}
+	defer store.Close()
+	accounts, err := store.ListAccounts(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, account := range accounts {
+		if account.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.
@@ -214,6 +287,148 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 	return out
 }
 
+func (s *ConfigSynthesizer) synthesizeAccountStoreCodexKey(ctx *SynthesisContext, account accountstore.AccountRecord) *coreauth.Auth {
+	if account.CodexAPIKey == nil {
+		return nil
+	}
+	key := strings.TrimSpace(account.CodexAPIKey.APIKey)
+	if key == "" {
+		return nil
+	}
+	base := strings.TrimSpace(account.CodexAPIKey.BaseURL)
+	id, token := ctx.IDGenerator.Next("codex:apikey", key, base, account.AccountKey)
+	attrs := map[string]string{
+		"source":      fmt.Sprintf("account-store:codex[%s]", token),
+		"api_key":     key,
+		"account_key": account.AccountKey,
+	}
+	if account.Priority != 0 {
+		attrs["priority"] = strconv.Itoa(account.Priority)
+	}
+	if base != "" {
+		attrs["base_url"] = base
+	}
+	if account.CodexAPIKey.Websockets {
+		attrs["websockets"] = "true"
+	}
+	if models := decodeCodexModels(account.CodexAPIKey.ModelsJSON); len(models) > 0 {
+		if hash := diff.ComputeCodexModelsHash(models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+	}
+	addJSONHeadersToAttrs(account.CodexAPIKey.HeadersJSON, attrs)
+	auth := &coreauth.Auth{
+		ID:         id,
+		AccountKey: account.AccountKey,
+		Provider:   "codex",
+		Label:      defaultLabel(account.Title, "codex-apikey"),
+		Prefix:     strings.TrimSpace(account.CodexAPIKey.Prefix),
+		Status:     coreauth.StatusActive,
+		Disabled:   account.Disabled,
+		ProxyURL:   strings.TrimSpace(account.CodexAPIKey.ProxyURL),
+		Attributes: attrs,
+		CreatedAt:  ctx.Now,
+		UpdatedAt:  ctx.Now,
+	}
+	if account.Disabled {
+		auth.Status = coreauth.StatusDisabled
+	}
+	ApplyAuthExcludedModelsMeta(auth, ctx.Config, decodeStringSlice(account.CodexAPIKey.ExcludedModelsJSON), "apikey")
+	return auth
+}
+
+func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisContext, account accountstore.AccountRecord) []*coreauth.Auth {
+	if account.OpenAICompatible == nil {
+		return nil
+	}
+	compat := account.OpenAICompatible
+	providerName := strings.ToLower(strings.TrimSpace(compat.ProviderName))
+	if providerName == "" {
+		providerName = strings.ToLower(strings.TrimSpace(account.Provider))
+	}
+	if providerName == "" {
+		providerName = "openai-compatibility"
+	}
+	base := strings.TrimSpace(compat.BaseURL)
+	prefix := strings.TrimSpace(compat.Prefix)
+	headers := decodeStringMap(compat.HeadersJSON)
+	models := decodeOpenAICompatModels(compat.ModelsJSON)
+	entries := decodeOpenAICompatAPIKeys(compat.APIKeyEntriesJSON)
+	if len(entries) == 0 {
+		entries = []config.OpenAICompatibilityAPIKey{{}}
+	}
+	out := make([]*coreauth.Auth, 0, len(entries))
+	for index := range entries {
+		entry := entries[index]
+		key := strings.TrimSpace(entry.APIKey)
+		proxyURL := strings.TrimSpace(entry.ProxyURL)
+		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
+		id, token := ctx.IDGenerator.Next(idKind, key, base, proxyURL, account.AccountKey, strconv.Itoa(index))
+		attrs := map[string]string{
+			"source":       fmt.Sprintf("account-store:%s[%s]", providerName, token),
+			"base_url":     base,
+			"compat_name":  defaultLabel(compat.ProviderName, account.Provider),
+			"provider_key": providerName,
+			"account_key":  account.AccountKey,
+		}
+		if account.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(account.Priority)
+		}
+		if key != "" {
+			attrs["api_key"] = key
+		}
+		if hash := diff.ComputeOpenAICompatModelsHash(models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		for header, value := range headers {
+			attrs["header:"+header] = value
+		}
+		auth := &coreauth.Auth{
+			ID:         id,
+			AccountKey: account.AccountKey,
+			Provider:   providerName,
+			Label:      defaultLabel(account.Title, compat.ProviderName),
+			Prefix:     prefix,
+			Status:     coreauth.StatusActive,
+			Disabled:   account.Disabled,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  ctx.Now,
+			UpdatedAt:  ctx.Now,
+		}
+		if account.Disabled {
+			auth.Status = coreauth.StatusDisabled
+		}
+		out = append(out, auth)
+	}
+	return out
+}
+
+func synthesizeAccountStoreAuthFile(ctx *SynthesisContext, account accountstore.AccountRecord) []*coreauth.Auth {
+	if account.AuthFile == nil || strings.TrimSpace(account.AuthFile.AuthJSON) == "" {
+		return nil
+	}
+	fullPath := account.AuthFile.SourceFileName
+	if fullPath == "" {
+		fullPath = account.AccountKey + ".json"
+	}
+	auths := SynthesizeAuthFile(ctx, fullPath, []byte(account.AuthFile.AuthJSON))
+	for _, auth := range auths {
+		auth.AccountKey = account.AccountKey
+		auth.Disabled = account.Disabled
+		if account.Disabled {
+			auth.Status = coreauth.StatusDisabled
+		}
+		if account.Priority != 0 {
+			if auth.Attributes == nil {
+				auth.Attributes = map[string]string{}
+			}
+			auth.Attributes["priority"] = strconv.Itoa(account.Priority)
+		}
+	}
+	return auths
+}
+
 // synthesizeOpenAICompat creates Auth entries for OpenAI-compatible providers.
 func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*coreauth.Auth {
 	cfg := ctx.Config
@@ -378,4 +593,66 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		out = append(out, a)
 	}
 	return out
+}
+
+func decodeCodexModels(raw string) []config.CodexModel {
+	var models []config.CodexModel
+	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &models)
+	return models
+}
+
+func decodeOpenAICompatModels(raw string) []config.OpenAICompatibilityModel {
+	var models []config.OpenAICompatibilityModel
+	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &models)
+	return models
+}
+
+func decodeOpenAICompatAPIKeys(raw string) []config.OpenAICompatibilityAPIKey {
+	var entries []config.OpenAICompatibilityAPIKey
+	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &entries)
+	return entries
+}
+
+func decodeStringMap(raw string) map[string]string {
+	var values map[string]string
+	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &values)
+	return values
+}
+
+func decodeStringSlice(raw string) []string {
+	var values []string
+	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &values)
+	return values
+}
+
+func addJSONHeadersToAttrs(raw string, attrs map[string]string) {
+	for key, value := range decodeStringMap(raw) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		attrs["header:"+key] = strings.TrimSpace(value)
+	}
+}
+
+func defaultLabel(value string, fallback string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func expandAccountStorePath(path string) string {
+	path = strings.TrimSpace(path)
+	if strings.HasPrefix(path, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			rest := strings.TrimLeft(strings.TrimPrefix(path, "~"), "/\\")
+			if rest == "" {
+				return home
+			}
+			return home + string(os.PathSeparator) + strings.ReplaceAll(rest, "\\", string(os.PathSeparator))
+		}
+	}
+	return path
 }

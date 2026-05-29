@@ -150,6 +150,11 @@ func (w *Watcher) DispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	return w.dispatchRuntimeAuthUpdate(update)
 }
 
+// RefreshAuthState forces a snapshot diff and dispatches auth updates.
+func (w *Watcher) RefreshAuthState(force bool) {
+	w.refreshAuthState(force)
+}
+
 // SnapshotCoreAuths converts current clients snapshot into core auth entries.
 func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()

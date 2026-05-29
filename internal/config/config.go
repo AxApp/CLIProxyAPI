@@ -25,6 +25,7 @@ const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultAccountStoreDB        = "~/.config/gettokens/accounts-v1.sqlite"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -47,6 +48,9 @@ type Config struct {
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
+
+	// AccountStoreDB is the GetTokens sidecar-owned SQLite account store path.
+	AccountStoreDB string `yaml:"account-store-db" json:"-"`
 
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
@@ -645,6 +649,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	var cfg Config
 	// Set defaults before unmarshal so that absent keys keep defaults.
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
+	cfg.AccountStoreDB = DefaultAccountStoreDB
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
