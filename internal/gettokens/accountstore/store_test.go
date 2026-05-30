@@ -522,6 +522,59 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 }
 
+func TestUpdateAuthFileCredentialUpdatesAuthJSONWithoutChangingRevision(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	created, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindAuthFile,
+		Title:            "Codex",
+		Provider:         "codex",
+		CredentialSource: SourceLegacyAuthFile,
+		AuthFile: &AuthFileCredential{
+			SourceFileName: "codex-user-free.json",
+			AuthJSON:       `{"type":"codex","access_token":"old","refresh_token":"old-refresh","email":"user@example.com","plan_type":"free"}`,
+			AuthType:       "codex",
+			Email:          "user@example.com",
+			PlanType:       "free",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	updated, err := store.UpdateAuthFileCredential(ctx, created.AccountKey, AuthFileCredential{
+		AuthJSON: `{"type":"codex","access_token":"new","refresh_token":"new-refresh","email":"user@example.com","plan_type":"plus"}`,
+		PlanType: "plus",
+	})
+	if err != nil {
+		t.Fatalf("UpdateAuthFileCredential: %v", err)
+	}
+	if updated.Revision != created.Revision {
+		t.Fatalf("revision = %d, want %d", updated.Revision, created.Revision)
+	}
+	if updated.AuthFile == nil {
+		t.Fatal("updated auth file is nil")
+	}
+	if got := updated.AuthFile.SourceFileName; got != "codex-user-free.json" {
+		t.Fatalf("source file name = %q, want original", got)
+	}
+	if got := updated.AuthFile.PlanType; got != "plus" {
+		t.Fatalf("plan type = %q, want plus", got)
+	}
+	if !strings.Contains(updated.AuthFile.AuthJSON, `"refresh_token":"new-refresh"`) {
+		t.Fatalf("auth_json was not updated: %s", updated.AuthFile.AuthJSON)
+	}
+}
+
 func TestListAccountsWorksWithSingleSQLiteConnection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

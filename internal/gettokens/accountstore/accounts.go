@@ -203,6 +203,100 @@ func (s *Store) SetAccountPriority(ctx context.Context, accountKey string, prior
 	})
 }
 
+func (s *Store) UpdateAuthFileCredential(ctx context.Context, accountKey string, credential AuthFileCredential) (AccountRecord, error) {
+	if s == nil || s.db == nil {
+		return AccountRecord{}, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return AccountRecord{}, fmt.Errorf("invalid account key %q", accountKey)
+	}
+	if strings.TrimSpace(credential.AuthJSON) == "" {
+		return AccountRecord{}, fmt.Errorf("auth-file account %s missing credential", accountKey)
+	}
+	current, err := s.GetAccount(ctx, accountKey)
+	if err != nil {
+		return AccountRecord{}, err
+	}
+	if current.Kind != KindAuthFile {
+		return AccountRecord{}, fmt.Errorf("account %s is %s, not auth-file", accountKey, current.Kind)
+	}
+	if current.AuthFile != nil {
+		if strings.TrimSpace(credential.SourceFileName) == "" {
+			credential.SourceFileName = current.AuthFile.SourceFileName
+		}
+		if strings.TrimSpace(credential.AuthType) == "" {
+			credential.AuthType = current.AuthFile.AuthType
+		}
+		if strings.TrimSpace(credential.Email) == "" {
+			credential.Email = current.AuthFile.Email
+		}
+		if strings.TrimSpace(credential.PlanType) == "" {
+			credential.PlanType = current.AuthFile.PlanType
+		}
+		if credential.ModifiedUnixMs == 0 {
+			credential.ModifiedUnixMs = current.AuthFile.ModifiedUnixMs
+		}
+	}
+	if strings.TrimSpace(credential.SourceFileName) == "" {
+		credential.SourceFileName = accountKey + ".json"
+	}
+	if strings.TrimSpace(credential.AuthType) == "" {
+		credential.AuthType = "codex"
+	}
+	if credential.SizeBytes == 0 {
+		credential.SizeBytes = int64(len([]byte(credential.AuthJSON)))
+	}
+	now := unixMs()
+	if credential.ModifiedUnixMs == 0 {
+		credential.ModifiedUnixMs = now
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("begin update auth-file credential transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `
+UPDATE auth_file_accounts
+SET source_file_name = ?, auth_json = ?, auth_fingerprint = ?, auth_type = ?, email = ?, plan_type = ?, modified_unix_ms = ?, size_bytes = ?, updated_at_unix_ms = ?
+WHERE account_key = ?`,
+		strings.TrimSpace(credential.SourceFileName),
+		credential.AuthJSON,
+		fingerprintString(credential.AuthJSON),
+		strings.TrimSpace(credential.AuthType),
+		strings.TrimSpace(credential.Email),
+		strings.TrimSpace(credential.PlanType),
+		credential.ModifiedUnixMs,
+		credential.SizeBytes,
+		now,
+		accountKey,
+	)
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("update auth-file credential %s: %w", accountKey, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("update auth-file credential %s rows affected: %w", accountKey, err)
+	}
+	if rows == 0 {
+		return AccountRecord{}, fmt.Errorf("auth-file credential %s not found", accountKey)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE account_cards SET updated_at_unix_ms = ? WHERE account_key = ? AND deleted_at_unix_ms IS NULL", now, accountKey); err != nil {
+		return AccountRecord{}, fmt.Errorf("touch account card %s: %w", accountKey, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountRecord{}, fmt.Errorf("commit update auth-file credential transaction: %w", err)
+	}
+	tx = nil
+	return s.GetAccount(ctx, accountKey)
+}
+
 func (s *Store) DeleteAccount(ctx context.Context, accountKey string) error {
 	if s == nil || s.db == nil {
 		return errors.New("account store is not open")
