@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -32,13 +33,14 @@ func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, en
 		return entries, false
 	}
 	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
-		Provider:   req.Provider,
-		Providers:  append([]string(nil), req.Providers...),
-		Model:      req.Model,
-		Options:    req.Options,
-		Candidates: routeCandidatesFromScheduled(entries),
-		Tried:      req.Tried,
-		Now:        req.Now,
+		Provider:     req.Provider,
+		Providers:    append([]string(nil), req.Providers...),
+		Model:        req.Model,
+		Options:      req.Options,
+		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
+		Candidates:   routeCandidatesFromScheduled(entries),
+		Tried:        req.Tried,
+		Now:          req.Now,
 	})
 	if !routeResultActive(result) {
 		return entries, false
@@ -134,13 +136,14 @@ func rewriteAuthCandidates(ctx context.Context, req routeRequest, auths []*Auth)
 		return auths, false
 	}
 	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
-		Provider:   req.Provider,
-		Providers:  append([]string(nil), req.Providers...),
-		Model:      req.Model,
-		Options:    req.Options,
-		Candidates: routeCandidatesFromAuths(auths),
-		Tried:      req.Tried,
-		Now:        req.Now,
+		Provider:     req.Provider,
+		Providers:    append([]string(nil), req.Providers...),
+		Model:        req.Model,
+		Options:      req.Options,
+		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
+		Candidates:   routeCandidatesFromAuths(auths),
+		Tried:        req.Tried,
+		Now:          req.Now,
 	})
 	if !routeResultActive(result) {
 		return auths, false

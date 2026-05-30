@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -20,13 +21,14 @@ const (
 )
 
 type RouteContext struct {
-	Provider   string
-	Providers  []string
-	Model      string
-	Options    cliproxyexecutor.Options
-	Candidates []RouteCandidate
-	Tried      map[string]struct{}
-	Now        time.Time
+	Provider     string
+	Providers    []string
+	Model        string
+	Options      cliproxyexecutor.Options
+	CodexRequest *gettokenscodex.RequestContext
+	Candidates   []RouteCandidate
+	Tried        map[string]struct{}
+	Now          time.Time
 }
 
 type RouteCandidate struct {

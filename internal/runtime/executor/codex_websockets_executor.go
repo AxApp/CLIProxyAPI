@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -931,11 +932,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	isAPIKey := codexAuthUsesAPIKey(auth)
 	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
+	ensureCodexResponsesClientContextHeaders(headers, ginHeaders)
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
@@ -976,6 +974,19 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 
 	return headers
+}
+
+func ensureCodexResponsesClientContextHeaders(target http.Header, source http.Header) {
+	for _, key := range gettokenscodex.CodexResponsesClientContextHeaderKeys() {
+		if target == nil || strings.TrimSpace(target.Get(key)) != "" {
+			continue
+		}
+		if source != nil {
+			if val := strings.TrimSpace(headerValueCaseInsensitive(source, key)); val != "" {
+				target.Set(key, val)
+			}
+		}
+	}
 }
 
 func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {

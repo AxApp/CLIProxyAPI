@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -15,6 +16,44 @@ func registerTestRoutingPolicy(policy gettokensrouting.Policy) func() {
 		policy.Stage = gettokensrouting.PolicyStageRequest
 	}
 	return gettokensrouting.RegisterPolicy(policy)
+}
+
+func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.T) {
+	codexCtx := gettokenscodex.RequestContext{
+		RequestKind:    gettokenscodex.RequestKindSubagent,
+		SubagentSource: "review",
+		RequestedModel: "gpt-5.1",
+	}
+	entries := []*scheduledAuth{{auth: &Auth{ID: "auth-a"}}}
+	policy := gettokensrouting.Policy{
+		Stage: gettokensrouting.PolicyStageRequest,
+		Name:  "assert-codex-context",
+		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
+			if req.CodexRequest == nil {
+				t.Fatalf("RouteContext.CodexRequest = nil, want context")
+			}
+			if req.CodexRequest.SubagentSource != "review" {
+				t.Fatalf("RouteContext.CodexRequest.SubagentSource = %q, want review", req.CodexRequest.SubagentSource)
+			}
+			return gettokensrouting.PolicyDecision{OrderIDs: []string{"auth-a"}, Reason: "codex context observed"}
+		},
+	}
+
+	got, changed := rewriteScheduledAuthsWithPolicies(context.Background(), routeRequest{
+		Provider: "codex",
+		Model:    "gpt-5.1",
+		Options: cliproxyexecutor.Options{Metadata: map[string]any{
+			gettokenscodex.MetadataKey: codexCtx,
+		}},
+		Now: time.Now(),
+	}, entries, []gettokensrouting.Policy{policy})
+
+	if !changed {
+		t.Fatalf("changed = false, want true")
+	}
+	if len(got) != 1 || got[0].auth.ID != "auth-a" {
+		t.Fatalf("got entries = %#v, want auth-a", got)
+	}
 }
 
 func TestSchedulerGetTokensRoutingOrdersReadyCandidates(t *testing.T) {

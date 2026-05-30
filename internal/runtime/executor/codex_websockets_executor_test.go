@@ -552,10 +552,19 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 	req = req.WithContext(contextWithGinHeaders(map[string]string{
-		"Originator":            "Codex Desktop",
-		"Version":               "0.115.0-alpha.27",
-		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
-		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
+		"Originator":               "Codex Desktop",
+		"Version":                  "0.115.0-alpha.27",
+		"X-Codex-Installation-Id":  "install-1",
+		"X-Codex-Turn-State":       "turn-state-1",
+		"X-Codex-Turn-Metadata":    `{"turn_id":"turn-1"}`,
+		"X-Client-Request-Id":      "019d2233-e240-7162-992d-38df0a2a0e0d",
+		"X-Codex-Parent-Thread-Id": "parent-1",
+		"X-Codex-Window-Id":        "window-1",
+		"X-OpenAI-Subagent":        "review",
+		"X-OpenAI-Memgen-Request":  "memgen-1",
+		"X-OAI-Attestation":        "attestation-1",
+		"Session-Id":               "session-dash-1",
+		"Thread-Id":                "thread-1",
 	}))
 
 	applyCodexHeaders(req, auth, "oauth-token", true, nil)
@@ -571,6 +580,63 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+	for key, want := range map[string]string{
+		"X-Codex-Installation-Id":  "install-1",
+		"X-Codex-Turn-State":       "turn-state-1",
+		"X-Codex-Parent-Thread-Id": "parent-1",
+		"X-Codex-Window-Id":        "window-1",
+		"X-OpenAI-Subagent":        "review",
+		"X-OpenAI-Memgen-Request":  "memgen-1",
+		"X-OAI-Attestation":        "attestation-1",
+		"Session-Id":               "session-dash-1",
+		"Thread-Id":                "thread-1",
+	} {
+		if got := req.Header.Get(key); got != want {
+			t.Fatalf("%s = %s, want %s", key, got, want)
+		}
+	}
+}
+
+func TestApplyCodexWebsocketHeadersPassesThroughLatestClientContext(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"Version":                  "0.115.0-alpha.27",
+		"X-Codex-Installation-Id":  "install-1",
+		"X-Codex-Turn-State":       "turn-state-1",
+		"X-Codex-Turn-Metadata":    `{"turn_id":"turn-1"}`,
+		"X-Client-Request-Id":      "client-1",
+		"X-Codex-Parent-Thread-Id": "parent-1",
+		"X-Codex-Window-Id":        "window-1",
+		"X-OpenAI-Subagent":        "collab_spawn",
+		"X-OpenAI-Memgen-Request":  "memgen-1",
+		"X-OAI-Attestation":        "attestation-1",
+		"Session-Id":               "session-dash-1",
+		"Thread-Id":                "thread-1",
+	})
+
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+
+	for key, want := range map[string]string{
+		"Version":                  "0.115.0-alpha.27",
+		"X-Codex-Installation-Id":  "install-1",
+		"X-Codex-Turn-State":       "turn-state-1",
+		"X-Codex-Turn-Metadata":    `{"turn_id":"turn-1"}`,
+		"X-Client-Request-Id":      "client-1",
+		"X-Codex-Parent-Thread-Id": "parent-1",
+		"X-Codex-Window-Id":        "window-1",
+		"X-OpenAI-Subagent":        "collab_spawn",
+		"X-OpenAI-Memgen-Request":  "memgen-1",
+		"X-OAI-Attestation":        "attestation-1",
+		"Session-Id":               "session-dash-1",
+		"Thread-Id":                "thread-1",
+	} {
+		if got := headers.Get(key); got != want {
+			t.Fatalf("%s = %s, want %s", key, got, want)
+		}
 	}
 }
 

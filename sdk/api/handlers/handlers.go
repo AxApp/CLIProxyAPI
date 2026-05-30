@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -257,6 +258,36 @@ func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {
 		}
 	}
 	meta[coreexecutor.ServiceTierMetadataKey] = serviceTier
+}
+
+func attachCodexRequestMetadata(meta map[string]any, headers http.Header, rawJSON []byte, modelName string, handlerType string) {
+	if meta == nil || handlerType != "openai-response" {
+		return
+	}
+	reqCtx := gettokenscodex.ExtractRequestContext(headers, rawJSON, modelName)
+	meta[gettokenscodex.MetadataKey] = reqCtx
+	meta[gettokenscodex.RequestKindMetadataKey] = string(reqCtx.RequestKind)
+	if reqCtx.SubagentSource != "" {
+		meta[gettokenscodex.SubagentSourceMetadataKey] = reqCtx.SubagentSource
+	}
+	if reqCtx.SessionID != "" {
+		meta[gettokenscodex.SessionIDMetadataKey] = reqCtx.SessionID
+	}
+	if reqCtx.ClientRequestID != "" {
+		meta[gettokenscodex.ClientRequestIDMetadataKey] = reqCtx.ClientRequestID
+	}
+	if reqCtx.ThreadID != "" {
+		meta[gettokenscodex.ThreadIDMetadataKey] = reqCtx.ThreadID
+	}
+	if reqCtx.ThreadSource != "" {
+		meta[gettokenscodex.ThreadSourceMetadataKey] = reqCtx.ThreadSource
+	}
+	if reqCtx.TurnID != "" {
+		meta[gettokenscodex.TurnIDMetadataKey] = reqCtx.TurnID
+	}
+	if reqCtx.TurnStartedAtUnixMs != 0 {
+		meta[gettokenscodex.TurnStartedAtUnixMsMetadataKey] = reqCtx.TurnStartedAtUnixMs
+	}
 }
 
 // headersFromContext extracts the original HTTP request headers from the gin context
@@ -580,6 +611,8 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	headers := headersFromContext(ctx)
+	attachCodexRequestMetadata(reqMeta, headers, rawJSON, modelName, handlerType)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -593,7 +626,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+		Headers:         headers,
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
@@ -632,6 +665,8 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	headers := headersFromContext(ctx)
+	attachCodexRequestMetadata(reqMeta, headers, rawJSON, modelName, handlerType)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -645,7 +680,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+		Headers:         headers,
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
@@ -697,6 +732,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
+	headers := headersFromContext(ctx)
+	attachCodexRequestMetadata(reqMeta, headers, rawJSON, modelName, handlerType)
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -710,7 +747,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
-		Headers:         headersFromContext(ctx),
+		Headers:         headers,
 	}
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
