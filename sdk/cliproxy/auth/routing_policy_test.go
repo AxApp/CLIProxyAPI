@@ -21,14 +21,14 @@ func TestSchedulerGetTokensRoutingOrdersReadyCandidates(t *testing.T) {
 	unregister := registerTestRoutingPolicy(gettokensrouting.Policy{
 		Name: "test-order",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-order-model" {
+			if req.Model != "routing-engine-order-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{OrderIDs: []string{"auth-b", "auth-a"}}
 		},
 	})
 	defer unregister()
-	registerSchedulerModels(t, "codex", "routing-policy-order-model", "auth-a", "auth-b")
+	registerSchedulerModels(t, "codex", "routing-engine-order-model", "auth-a", "auth-b")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -36,7 +36,7 @@ func TestSchedulerGetTokensRoutingOrdersReadyCandidates(t *testing.T) {
 		&Auth{ID: "auth-b", Provider: "codex", Status: StatusActive},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-policy-order-model", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-engine-order-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle: %v", err)
 	}
@@ -49,14 +49,14 @@ func TestSchedulerGetTokensRoutingCannotBypassCooldown(t *testing.T) {
 	unregister := registerTestRoutingPolicy(gettokensrouting.Policy{
 		Name: "test-cooldown",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-cooldown-model" {
+			if req.Model != "routing-engine-cooldown-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{OrderIDs: []string{"slow", "fast"}}
 		},
 	})
 	defer unregister()
-	registerSchedulerModels(t, "codex", "routing-policy-cooldown-model", "slow", "fast")
+	registerSchedulerModels(t, "codex", "routing-engine-cooldown-model", "slow", "fast")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -65,7 +65,7 @@ func TestSchedulerGetTokensRoutingCannotBypassCooldown(t *testing.T) {
 			Provider: "codex",
 			Status:   StatusActive,
 			ModelStates: map[string]*ModelState{
-				"routing-policy-cooldown-model": {
+				"routing-engine-cooldown-model": {
 					Status:         StatusError,
 					Unavailable:    true,
 					NextRetryAfter: time.Now().Add(time.Hour),
@@ -75,7 +75,7 @@ func TestSchedulerGetTokensRoutingCannotBypassCooldown(t *testing.T) {
 		&Auth{ID: "fast", Provider: "codex", Status: StatusActive},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-policy-cooldown-model", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-engine-cooldown-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestSchedulerGetTokensRoutingStrictAllow(t *testing.T) {
 	unregister := registerTestRoutingPolicy(gettokensrouting.Policy{
 		Name: "test-allow",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-allow-model" {
+			if req.Model != "routing-engine-allow-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{
@@ -99,7 +99,7 @@ func TestSchedulerGetTokensRoutingStrictAllow(t *testing.T) {
 		},
 	})
 	defer unregister()
-	registerSchedulerModels(t, "codex", "routing-policy-allow-model", "auth-a", "auth-b")
+	registerSchedulerModels(t, "codex", "routing-engine-allow-model", "auth-a", "auth-b")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -107,7 +107,7 @@ func TestSchedulerGetTokensRoutingStrictAllow(t *testing.T) {
 		&Auth{ID: "auth-b", Provider: "codex", Status: StatusActive},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-policy-allow-model", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-engine-allow-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestSchedulerGetTokensRoutingOrdersMixedProviderCandidates(t *testing.T) {
 	unregister := registerTestRoutingPolicy(gettokensrouting.Policy{
 		Name: "test-mixed",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-mixed-model" {
+			if req.Model != "routing-engine-mixed-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			if req.Provider != "mixed" {
@@ -130,8 +130,8 @@ func TestSchedulerGetTokensRoutingOrdersMixedProviderCandidates(t *testing.T) {
 		},
 	})
 	defer unregister()
-	registerSchedulerModels(t, "codex", "routing-policy-mixed-model", "codex-auth")
-	registerSchedulerModels(t, "claude", "routing-policy-mixed-model", "claude-auth")
+	registerSchedulerModels(t, "codex", "routing-engine-mixed-model", "codex-auth")
+	registerSchedulerModels(t, "claude", "routing-engine-mixed-model", "claude-auth")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -139,7 +139,7 @@ func TestSchedulerGetTokensRoutingOrdersMixedProviderCandidates(t *testing.T) {
 		&Auth{ID: "claude-auth", Provider: "claude", Status: StatusActive},
 	)
 
-	got, provider, err := scheduler.pickMixed(context.Background(), []string{"codex", "claude"}, "routing-policy-mixed-model", cliproxyexecutor.Options{}, nil)
+	got, provider, err := scheduler.pickMixed(context.Background(), []string{"codex", "claude"}, "routing-engine-mixed-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickMixed: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestSchedulerGetTokensRoutingDenyCannotBeBypassedByLaterAllow(t *testing.T)
 		Stage: gettokensrouting.PolicyStageHardFilter,
 		Name:  "test-hard-deny",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-hard-deny-model" {
+			if req.Model != "routing-engine-hard-deny-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"}
@@ -186,7 +186,7 @@ func TestSchedulerGetTokensRoutingDenyCannotBeBypassedByLaterAllow(t *testing.T)
 		Stage: gettokensrouting.PolicyStageRequest,
 		Name:  "test-request-allow",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-hard-deny-model" {
+			if req.Model != "routing-engine-hard-deny-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{
@@ -198,7 +198,7 @@ func TestSchedulerGetTokensRoutingDenyCannotBeBypassedByLaterAllow(t *testing.T)
 		},
 	})
 	defer unregisterAllow()
-	registerSchedulerModels(t, "codex", "routing-policy-hard-deny-model", "blocked", "fallback")
+	registerSchedulerModels(t, "codex", "routing-engine-hard-deny-model", "blocked", "fallback")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -206,7 +206,7 @@ func TestSchedulerGetTokensRoutingDenyCannotBeBypassedByLaterAllow(t *testing.T)
 		&Auth{ID: "fallback", Provider: "codex", Status: StatusActive},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-policy-hard-deny-model", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-engine-hard-deny-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestSchedulerGetTokensRoutingHardFilterRunsBeforeEarlierRequestPolicy(t *te
 		Stage: gettokensrouting.PolicyStageRequest,
 		Name:  "test-request-allow",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-staged-hard-deny-model" {
+			if req.Model != "routing-engine-staged-hard-deny-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{
@@ -237,14 +237,14 @@ func TestSchedulerGetTokensRoutingHardFilterRunsBeforeEarlierRequestPolicy(t *te
 		Stage: gettokensrouting.PolicyStageHardFilter,
 		Name:  "test-hard-deny",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model != "routing-policy-staged-hard-deny-model" {
+			if req.Model != "routing-engine-staged-hard-deny-model" {
 				return gettokensrouting.PolicyDecision{}
 			}
 			return gettokensrouting.PolicyDecision{DenyIDs: []string{"blocked"}, Reason: "hard guard"}
 		},
 	})
 	defer unregisterDeny()
-	registerSchedulerModels(t, "codex", "routing-policy-staged-hard-deny-model", "blocked", "fallback")
+	registerSchedulerModels(t, "codex", "routing-engine-staged-hard-deny-model", "blocked", "fallback")
 
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
@@ -252,7 +252,7 @@ func TestSchedulerGetTokensRoutingHardFilterRunsBeforeEarlierRequestPolicy(t *te
 		&Auth{ID: "fallback", Provider: "codex", Status: StatusActive},
 	)
 
-	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-policy-staged-hard-deny-model", cliproxyexecutor.Options{}, nil)
+	got, err := scheduler.pickSingle(context.Background(), "codex", "routing-engine-staged-hard-deny-model", cliproxyexecutor.Options{}, nil)
 	if err != nil {
 		t.Fatalf("pickSingle: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestSessionAffinityGetTokensRoutingDenyCannotBeBypassed(t *testing.T) {
 		t.Fatalf("Register(fallback): %v", err)
 	}
 
-	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-routing-policy-deny"}}}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-routing-engine-deny"}}}
 	got, _, errPick := manager.pickNext(context.Background(), "codex", "", opts, map[string]struct{}{})
 	if errPick != nil {
 		t.Fatalf("pickNext() error = %v", errPick)
@@ -319,7 +319,7 @@ func TestMixedSessionAffinityGetTokensRoutingDenyCannotBeBypassed(t *testing.T) 
 		t.Fatalf("Register(fallback): %v", err)
 	}
 
-	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-routing-policy-mixed-deny"}}}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-routing-engine-mixed-deny"}}}
 	got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"codex", "claude"}, "", opts, map[string]struct{}{})
 	if errPick != nil {
 		t.Fatalf("pickNextMixed() error = %v", errPick)
