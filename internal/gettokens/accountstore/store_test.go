@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	_ "modernc.org/sqlite"
@@ -78,6 +81,83 @@ func TestStoreEnsureSchemaCreatesTablesAndRestrictivePermissions(t *testing.T) {
 	if version != "1" {
 		t.Fatalf("schema_version = %q, want 1", version)
 	}
+}
+
+func TestStoreEnsureSchemaWaitsForConcurrentSQLiteWriter(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	store.Close()
+
+	locker, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	if _, err := locker.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		t.Fatalf("set locker busy timeout: %v", err)
+	}
+	tx, err := locker.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin locker tx: %v", err)
+	}
+	if _, err := tx.ExecContext(context.Background(), "UPDATE account_store_meta SET value=value WHERE key='schema_version'"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("hold write lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		next, err := Open(dbPath)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer next.Close()
+		done <- next.EnsureSchema(context.Background())
+	}()
+
+	select {
+	case err := <-done:
+		_ = tx.Rollback()
+		if err == nil {
+			t.Fatal("EnsureSchema returned before the writer released the sqlite lock")
+		}
+		if isSQLiteBusyError(err) {
+			t.Fatalf("EnsureSchema returned SQLITE_BUSY before waiting: %v", err)
+		}
+		t.Fatalf("EnsureSchema returned unexpected early error: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit locker tx: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureSchema after lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureSchema did not finish after sqlite lock was released")
+	}
+}
+
+func isSQLiteBusyError(err error) bool {
+	for err != nil {
+		if strings.Contains(err.Error(), "SQLITE_BUSY") || strings.Contains(err.Error(), "database is locked") {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 func TestDryRunLegacyImportFindsLegacySourcesWithoutWritingOrDeleting(t *testing.T) {

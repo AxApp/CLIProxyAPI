@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 )
 
 const schemaVersion = "1"
+const sqliteBusyTimeoutMs = 5000
 
 var accountKeyPattern = regexp.MustCompile(`^acct_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -44,7 +46,7 @@ func Open(path string) (*Store, error) {
 	}
 	_ = os.Chmod(clean, 0600)
 
-	db, err := sql.Open("sqlite", clean)
+	db, err := sql.Open("sqlite", sqliteDSN(clean))
 	if err != nil {
 		return nil, fmt.Errorf("open account store sqlite: %w", err)
 	}
@@ -55,6 +57,19 @@ func Open(path string) (*Store, error) {
 	_ = os.Chmod(clean, 0600)
 
 	return &Store{path: clean, db: db}, nil
+}
+
+func sqliteDSN(path string) string {
+	openPath := path
+	if abs, err := filepath.Abs(path); err == nil {
+		openPath = abs
+	}
+	dsn := url.URL{Scheme: "file", Path: filepath.ToSlash(openPath)}
+	query := dsn.Query()
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMs))
+	query.Add("_pragma", "foreign_keys(1)")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
 }
 
 func (s *Store) Close() error {
