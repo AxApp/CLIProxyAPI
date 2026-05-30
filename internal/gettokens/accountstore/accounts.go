@@ -361,6 +361,47 @@ WHERE account_key = ? AND revision = ?`,
 	return nil
 }
 
+func (s *Store) MarkPendingRuntimeApplyResults(ctx context.Context, status string, lastError string) error {
+	if s == nil || s.db == nil {
+		return errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	status = strings.TrimSpace(status)
+	switch status {
+	case "applied", "failed":
+	default:
+		return fmt.Errorf("invalid runtime apply status %q", status)
+	}
+	now := unixMs()
+	appliedAt := int64(0)
+	if status == "applied" {
+		appliedAt = now
+		lastError = ""
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE account_runtime_apply_state
+SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?
+WHERE status = 'pending'
+  AND EXISTS (
+    SELECT 1
+    FROM account_cards c
+    WHERE c.account_key = account_runtime_apply_state.account_key
+      AND c.revision = account_runtime_apply_state.revision
+      AND c.deleted_at_unix_ms IS NULL
+  )`,
+		status,
+		strings.TrimSpace(lastError),
+		appliedAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("mark pending runtime apply results: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ListUndeletedMigrationSources(ctx context.Context) ([]MigrationSourceRecord, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("account store is not open")

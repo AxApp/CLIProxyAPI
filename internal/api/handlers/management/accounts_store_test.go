@@ -46,6 +46,11 @@ func TestAccountMigrationDryRunAndCommitEndpoints(t *testing.T) {
 		}},
 	}, nil)
 	h.SetAccountStorePath(dbPath)
+	applyCalls := 0
+	h.SetAccountStoreApplyHook(func(context.Context) error {
+		applyCalls++
+		return nil
+	})
 
 	router := gin.New()
 	router.POST("/v0/management/account-migration/dry-run", h.DryRunAccountMigration)
@@ -97,6 +102,7 @@ func TestAccountMigrationDryRunAndCommitEndpoints(t *testing.T) {
 		Accounts []struct {
 			AccountKey string `json:"account_key"`
 			Kind       string `json:"kind"`
+			Apply      string `json:"runtime_apply_status"`
 		} `json:"accounts"`
 	}
 	if err := json.Unmarshal(accountsRecorder.Body.Bytes(), &accounts); err != nil {
@@ -104,6 +110,14 @@ func TestAccountMigrationDryRunAndCommitEndpoints(t *testing.T) {
 	}
 	if got, want := len(accounts.Accounts), 3; got != want {
 		t.Fatalf("accounts = %d, want %d: %s", got, want, accountsRecorder.Body.String())
+	}
+	for _, account := range accounts.Accounts {
+		if account.Apply != "applied" {
+			t.Fatalf("%s runtime apply = %q, want applied", account.AccountKey, account.Apply)
+		}
+	}
+	if applyCalls != 1 {
+		t.Fatalf("applyCalls after commit/list = %d, want 1", applyCalls)
 	}
 
 	commitAgainRecorder := httptest.NewRecorder()
