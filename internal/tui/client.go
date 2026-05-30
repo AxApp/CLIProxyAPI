@@ -140,22 +140,50 @@ func (c *Client) PutConfigYAML(yamlContent string) error {
 	return err
 }
 
-// GetAuthFiles lists auth credential files.
-// API returns {"files": [...]}.
+// GetAuthFiles lists auth credentials from the account store.
 func (c *Client) GetAuthFiles() ([]map[string]any, error) {
-	wrapper, err := c.getJSON("/v0/management/auth-files")
+	accounts, err := c.getAccountStoreAccounts()
 	if err != nil {
 		return nil, err
 	}
-	return extractList(wrapper, "files")
+	files := make([]map[string]any, 0, len(accounts))
+	for _, account := range accounts {
+		if getString(account, "kind") != "auth-file" {
+			continue
+		}
+		authFile := nestedMap(account, "auth_file")
+		name := firstNonEmpty(getString(authFile, "source_file_name"), getString(account, "title"))
+		provider := firstNonEmpty(getString(authFile, "auth_type"), getString(account, "provider"), "unknown")
+		files = append(files, map[string]any{
+			"name":          name,
+			"type":          provider,
+			"provider":      provider,
+			"priority":      getFloat(account, "priority"),
+			"email":         getString(authFile, "email"),
+			"planType":      getString(authFile, "plan_type"),
+			"size":          getFloat(authFile, "size_bytes"),
+			"authIndex":     getString(account, "account_key"),
+			"runtimeOnly":   false,
+			"disabled":      getBool(account, "disabled"),
+			"status":        accountStoreStatus(account),
+			"statusMessage": getString(account, "runtime_apply_error"),
+			"modified":      getFloat(authFile, "modified_unix_ms"),
+		})
+	}
+	return files, nil
 }
 
 // DeleteAuthFile deletes a single auth file by name.
 func (c *Client) DeleteAuthFile(name string) error {
-	query := url.Values{}
-	query.Set("name", name)
-	path := "/v0/management/auth-files?" + query.Encode()
-	_, code, err := c.doRequest("DELETE", path, nil)
+	account, err := c.findAuthFileAccount(name)
+	if err != nil {
+		return err
+	}
+	accountKey := getString(account, "account_key")
+	if accountKey == "" {
+		return fmt.Errorf("auth account key is empty")
+	}
+	_, code, err := c.doRequest("DELETE", "/v0/management/accounts/"+url.PathEscape(accountKey), nil)
 	if err != nil {
 		return err
 	}
@@ -167,17 +195,118 @@ func (c *Client) DeleteAuthFile(name string) error {
 
 // ToggleAuthFile enables or disables an auth file.
 func (c *Client) ToggleAuthFile(name string, disabled bool) error {
-	body, _ := json.Marshal(map[string]any{"name": name, "disabled": disabled})
-	_, err := c.patch("/v0/management/auth-files/status", strings.NewReader(string(body)))
+	account, err := c.findAuthFileAccount(name)
+	if err != nil {
+		return err
+	}
+	accountKey := getString(account, "account_key")
+	if accountKey == "" {
+		return fmt.Errorf("auth account key is empty")
+	}
+	body, _ := json.Marshal(map[string]any{"disabled": disabled})
+	_, err = c.patch("/v0/management/accounts/"+url.PathEscape(accountKey)+"/status", strings.NewReader(string(body)))
 	return err
 }
 
 // PatchAuthFileFields updates editable fields on an auth file.
 func (c *Client) PatchAuthFileFields(name string, fields map[string]any) error {
-	fields["name"] = name
-	body, _ := json.Marshal(fields)
-	_, err := c.patch("/v0/management/auth-files/fields", strings.NewReader(string(body)))
+	account, err := c.findAuthFileAccount(name)
+	if err != nil {
+		return err
+	}
+	accountKey := getString(account, "account_key")
+	if accountKey == "" {
+		return fmt.Errorf("auth account key is empty")
+	}
+	authFile := nestedMap(account, "auth_file")
+	var authJSON map[string]any
+	if raw := strings.TrimSpace(getString(authFile, "auth_json")); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &authJSON)
+	}
+	if authJSON == nil {
+		authJSON = map[string]any{}
+	}
+	for key, value := range fields {
+		switch key {
+		case "priority":
+			account["priority"] = value
+			authJSON["priority"] = value
+		case "email":
+			authFile["email"] = value
+			authJSON["email"] = value
+		case "plan_type", "planType":
+			authFile["plan_type"] = value
+			authJSON["plan_type"] = value
+		default:
+			authJSON[key] = value
+		}
+	}
+	updatedAuthJSON, err := json.MarshalIndent(authJSON, "", "  ")
+	if err != nil {
+		return err
+	}
+	authFile["auth_json"] = string(updatedAuthJSON)
+	account["auth_file"] = authFile
+	body, _ := json.Marshal(account)
+	_, err = c.patch("/v0/management/accounts/"+url.PathEscape(accountKey), strings.NewReader(string(body)))
 	return err
+}
+
+func (c *Client) getAccountStoreAccounts() ([]map[string]any, error) {
+	wrapper, err := c.getJSON("/v0/management/accounts")
+	if err != nil {
+		return nil, err
+	}
+	return extractList(wrapper, "accounts")
+}
+
+func (c *Client) findAuthFileAccount(name string) (map[string]any, error) {
+	trimmed := strings.TrimSpace(name)
+	accounts, err := c.getAccountStoreAccounts()
+	if err != nil {
+		return nil, err
+	}
+	for _, account := range accounts {
+		if getString(account, "kind") != "auth-file" {
+			continue
+		}
+		authFile := nestedMap(account, "auth_file")
+		if strings.EqualFold(getString(account, "account_key"), trimmed) ||
+			strings.EqualFold(getString(account, "title"), trimmed) ||
+			strings.EqualFold(getString(authFile, "source_file_name"), trimmed) {
+			return account, nil
+		}
+	}
+	return nil, fmt.Errorf("auth file not found: %s", name)
+}
+
+func nestedMap(parent map[string]any, key string) map[string]any {
+	if parent == nil {
+		return map[string]any{}
+	}
+	if child, ok := parent[key].(map[string]any); ok && child != nil {
+		return child
+	}
+	return map[string]any{}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func accountStoreStatus(account map[string]any) string {
+	if getBool(account, "disabled") {
+		return "disabled"
+	}
+	if strings.EqualFold(getString(account, "runtime_apply_status"), "failed") {
+		return "unavailable"
+	}
+	return "active"
 }
 
 // GetLogs fetches log lines from the server.

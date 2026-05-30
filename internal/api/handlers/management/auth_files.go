@@ -261,6 +261,69 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+func (h *Handler) DeprecatedAuthFilesEndpoint(c *gin.Context) {
+	c.JSON(http.StatusGone, gin.H{
+		"error":       "deprecated auth-files management endpoint; use account store management API",
+		"replacement": "/v0/management/accounts",
+	})
+}
+
+func (h *Handler) GetAccountModels(c *gin.Context) {
+	accountKey := strings.TrimSpace(c.Param("account_key"))
+	if accountKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account_key is required"})
+		return
+	}
+
+	authID := ""
+	if h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if strings.EqualFold(strings.TrimSpace(auth.AccountKey), accountKey) ||
+				strings.EqualFold(strings.TrimSpace(auth.ID), accountKey) {
+				authID = auth.ID
+				break
+			}
+		}
+	}
+	if authID == "" {
+		store, err := h.openAccountStore(c.Request.Context())
+		if err == nil {
+			if account, getErr := store.GetAccount(c.Request.Context(), accountKey); getErr == nil && account.AuthFile != nil {
+				sourceName := strings.TrimSpace(account.AuthFile.SourceFileName)
+				if h.authManager != nil && sourceName != "" {
+					for _, auth := range h.authManager.List() {
+						if strings.EqualFold(strings.TrimSpace(auth.FileName), sourceName) {
+							authID = auth.ID
+							break
+						}
+					}
+				}
+			}
+			_ = store.Close()
+		}
+	}
+	if authID == "" {
+		authID = accountKey
+	}
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	result := make([]gin.H, 0, len(models))
+	for _, m := range models {
+		entry := gin.H{"id": m.ID}
+		if m.DisplayName != "" {
+			entry["display_name"] = m.DisplayName
+		}
+		if m.Type != "" {
+			entry["type"] = m.Type
+		}
+		if m.OwnedBy != "" {
+			entry["owned_by"] = m.OwnedBy
+		}
+		result = append(result, entry)
+	}
+	c.JSON(http.StatusOK, gin.H{"models": result})
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
