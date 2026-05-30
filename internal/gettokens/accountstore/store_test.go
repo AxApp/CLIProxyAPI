@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	_ "modernc.org/sqlite"
@@ -77,6 +78,51 @@ func TestStoreEnsureSchemaCreatesTablesAndRestrictivePermissions(t *testing.T) {
 	}
 	if version != "1" {
 		t.Fatalf("schema_version = %q, want 1", version)
+	}
+}
+
+func TestStoreEnsureSchemaWaitsForConcurrentSQLiteWriter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	locker, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open locker sqlite: %v", err)
+	}
+	defer locker.Close()
+
+	tx, err := locker.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin locker tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS lock_holder(id INTEGER PRIMARY KEY)"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("hold sqlite write lock: %v", err)
+	}
+
+	release := make(chan struct{})
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		_ = tx.Commit()
+		close(release)
+	}()
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	start := time.Now()
+	err = store.EnsureSchema(ctx)
+	elapsed := time.Since(start)
+	<-release
+	if err != nil {
+		t.Fatalf("EnsureSchema should wait for concurrent writer: %v", err)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("EnsureSchema returned before concurrent writer released lock: %s", elapsed)
 	}
 }
 

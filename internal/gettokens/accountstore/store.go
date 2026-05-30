@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -44,7 +45,7 @@ func Open(path string) (*Store, error) {
 	}
 	_ = os.Chmod(clean, 0600)
 
-	db, err := sql.Open("sqlite", clean)
+	db, err := sql.Open("sqlite", sqliteDSN(clean))
 	if err != nil {
 		return nil, fmt.Errorf("open account store sqlite: %w", err)
 	}
@@ -55,6 +56,18 @@ func Open(path string) (*Store, error) {
 	_ = os.Chmod(clean, 0600)
 
 	return &Store{path: clean, db: db}, nil
+}
+
+func sqliteDSN(path string) string {
+	u := url.URL{
+		Scheme: "file",
+		Path:   path,
+	}
+	q := u.Query()
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "foreign_keys(1)")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func (s *Store) Close() error {
