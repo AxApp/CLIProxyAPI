@@ -2,141 +2,36 @@ package auth
 
 import (
 	"context"
-	"reflect"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-// RoutePolicy can rewrite ready auth candidates before the built-in selector runs.
-// Policies receive only candidates that already passed disabled, cooldown, and model checks.
-type RoutePolicy interface {
-	RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision
+type routeRequest struct {
+	Provider  string
+	Providers []string
+	Model     string
+	Options   cliproxyexecutor.Options
+	Tried     map[string]struct{}
+	Now       time.Time
 }
 
-// RoutePolicyFunc adapts a function to RoutePolicy.
-type RoutePolicyFunc func(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision
-
-// RewriteCandidates implements RoutePolicy.
-func (fn RoutePolicyFunc) RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
-	if fn == nil {
-		return RoutePolicyDecision{}
-	}
-	return fn(ctx, req)
-}
-
-// RoutePolicyRequest describes the current routing decision point.
-type RoutePolicyRequest struct {
-	Provider   string
-	Providers  []string
-	Model      string
-	Options    cliproxyexecutor.Options
-	Candidates []*Auth
-	Tried      map[string]struct{}
-	Now        time.Time
-}
-
-// RoutePolicyDecision describes candidate filtering and ordering preferences.
-type RoutePolicyDecision struct {
-	AllowIDs      []string
-	DenyIDs       []string
-	OrderIDs      []string
-	AllowFallback *bool
-	Reason        string
-}
-
-var routePolicies = struct {
-	sync.RWMutex
-	nextID int
-	items  map[int]RoutePolicy
-}{items: make(map[int]RoutePolicy)}
-
-// RegisterRoutePolicy installs a process-wide route policy and returns a cleanup function.
-func RegisterRoutePolicy(policy RoutePolicy) func() {
-	if policy == nil {
-		return func() {}
-	}
-	routePolicies.Lock()
-	routePolicies.nextID++
-	id := routePolicies.nextID
-	routePolicies.items[id] = policy
-	routePolicies.Unlock()
-
-	return func() {
-		routePolicies.Lock()
-		delete(routePolicies.items, id)
-		routePolicies.Unlock()
-	}
-}
-
-func routePolicySnapshot() []RoutePolicy {
-	routePolicies.RLock()
-	defer routePolicies.RUnlock()
-	ids := make([]int, 0, len(routePolicies.items))
-	for id := range routePolicies.items {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	out := make([]RoutePolicy, 0, len(ids))
-	for _, id := range ids {
-		policy := routePolicies.items[id]
-		if policy != nil {
-			out = append(out, policy)
-		}
-	}
-	return out
-}
-
-func rewriteScheduledAuths(ctx context.Context, req RoutePolicyRequest, entries []*scheduledAuth) ([]*scheduledAuth, bool) {
-	return rewriteScheduledAuthsWithPolicies(ctx, req, entries, nil)
-}
-
-func rewriteScheduledAuthsWithPolicies(ctx context.Context, req RoutePolicyRequest, entries []*scheduledAuth, extraPolicies []RoutePolicy) ([]*scheduledAuth, bool) {
+func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, entries []*scheduledAuth, extraPolicies []gettokensrouting.Policy) ([]*scheduledAuth, bool) {
 	if len(entries) == 0 {
 		return entries, false
 	}
-	policies := routePolicySnapshot()
+	policies := gettokensrouting.PolicySnapshot()
 	for _, policy := range extraPolicies {
-		if policy != nil {
+		if policy.Rewrite != nil {
 			policies = append(policies, policy)
 		}
 	}
 	if len(policies) == 0 {
 		return entries, false
 	}
-	enginePolicies := make([]gettokensrouting.Policy, 0, len(policies))
-	for _, policy := range policies {
-		policy := policy
-		enginePolicies = append(enginePolicies, gettokensrouting.Policy{
-			Stage: routePolicyStage(policy),
-			Name:  routePolicyName(policy),
-			Rewrite: func(ctx context.Context, routeCtx gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-				req.Provider = routeCtx.Provider
-				req.Providers = append([]string(nil), routeCtx.Providers...)
-				req.Model = routeCtx.Model
-				req.Options = routeCtx.Options
-				req.Candidates = authCandidatesFromRouteCandidates(routeCtx.Candidates)
-				req.Tried = routeCtx.Tried
-				req.Now = routeCtx.Now
-				decision, ok := safeEvaluateRoutePolicy(policy, ctx, req)
-				if !ok {
-					return gettokensrouting.PolicyDecision{}
-				}
-				return gettokensrouting.PolicyDecision{
-					AllowIDs:      decision.AllowIDs,
-					DenyIDs:       decision.DenyIDs,
-					OrderIDs:      decision.OrderIDs,
-					AllowFallback: decision.AllowFallback,
-					Reason:        decision.Reason,
-				}
-			},
-		})
-	}
-	result := gettokensrouting.NewEngine(enginePolicies...).Route(ctx, gettokensrouting.RouteContext{
+	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
 		Provider:   req.Provider,
 		Providers:  append([]string(nil), req.Providers...),
 		Model:      req.Model,
@@ -145,44 +40,54 @@ func rewriteScheduledAuthsWithPolicies(ctx context.Context, req RoutePolicyReque
 		Tried:      req.Tried,
 		Now:        req.Now,
 	})
-	active := false
-	for _, step := range result.Trace {
-		if step.Activated {
-			active = true
-			break
-		}
-	}
-	if !active {
+	if !routeResultActive(result) {
 		return entries, false
 	}
-	return scheduledFromRouteCandidates(result.Candidates), true
+	return scheduledFromRouteCandidates(result.Candidates, entries), true
 }
 
-func (s *SessionAffinitySelector) RoutePolicyStage() gettokensrouting.PolicyStage {
-	return gettokensrouting.PolicyStageSticky
-}
-
-func (s *SessionAffinitySelector) RewriteCandidates(ctx context.Context, req RoutePolicyRequest) RoutePolicyDecision {
-	if s == nil || s.cache == nil || len(req.Candidates) == 0 {
-		return RoutePolicyDecision{}
+func routeResultActive(result gettokensrouting.RouteResult) bool {
+	for _, step := range result.Trace {
+		if step.Activated {
+			return true
+		}
 	}
-	primaryID, fallbackID := extractSessionIDs(req.Options.Headers, req.Options.OriginalRequest, req.Options.Metadata)
+	return false
+}
+
+func (s *SessionAffinitySelector) routingPolicy() gettokensrouting.Policy {
+	if s == nil {
+		return gettokensrouting.Policy{}
+	}
+	return gettokensrouting.Policy{
+		Stage:   gettokensrouting.PolicyStageSticky,
+		Name:    "session-affinity",
+		Rewrite: s.rewriteRouteCandidates,
+	}
+}
+
+func (s *SessionAffinitySelector) rewriteRouteCandidates(ctx context.Context, routeCtx gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
+	if s == nil || s.cache == nil || len(routeCtx.Candidates) == 0 {
+		return gettokensrouting.PolicyDecision{}
+	}
+	primaryID, fallbackID := extractSessionIDs(routeCtx.Options.Headers, routeCtx.Options.OriginalRequest, routeCtx.Options.Metadata)
 	if strings.TrimSpace(primaryID) == "" {
-		return RoutePolicyDecision{}
+		return gettokensrouting.PolicyDecision{}
 	}
-	providerKey := sessionAffinityProviderKey(req.Provider)
-	modelKey := req.Model
-	candidateIDs := make(map[string]struct{}, len(req.Candidates))
-	for _, candidate := range req.Candidates {
-		if candidate == nil || strings.TrimSpace(candidate.ID) == "" {
+	providerKey := sessionAffinityProviderKey(routeCtx.Provider)
+	modelKey := routeCtx.Model
+	candidateIDs := make(map[string]struct{}, len(routeCtx.Candidates))
+	for _, candidate := range routeCtx.Candidates {
+		id := strings.TrimSpace(candidate.ID)
+		if id == "" {
 			continue
 		}
-		candidateIDs[strings.TrimSpace(candidate.ID)] = struct{}{}
+		candidateIDs[id] = struct{}{}
 	}
 	cacheKey := sessionAffinityCacheKey(providerKey, primaryID, modelKey)
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		if _, exists := candidateIDs[cachedAuthID]; exists {
-			return RoutePolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity cache hit"}
+			return gettokensrouting.PolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity cache hit"}
 		}
 	}
 	if fallbackID != "" && fallbackID != primaryID {
@@ -190,14 +95,14 @@ func (s *SessionAffinitySelector) RewriteCandidates(ctx context.Context, req Rou
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			if _, exists := candidateIDs[cachedAuthID]; exists {
 				s.cache.Set(cacheKey, cachedAuthID)
-				return RoutePolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity fallback cache hit"}
+				return gettokensrouting.PolicyDecision{OrderIDs: []string{cachedAuthID}, Reason: "session-affinity fallback cache hit"}
 			}
 		}
 	}
-	return RoutePolicyDecision{}
+	return gettokensrouting.PolicyDecision{}
 }
 
-func (s *SessionAffinitySelector) BindRouteResult(req RoutePolicyRequest, auth *Auth) {
+func (s *SessionAffinitySelector) bindRouteResult(req routeRequest, auth *Auth) {
 	if s == nil || s.cache == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return
 	}
@@ -220,55 +125,27 @@ func sessionAffinityCacheKey(provider, sessionID, model string) string {
 	return sessionAffinityProviderKey(provider) + "::" + strings.TrimSpace(sessionID) + "::" + strings.TrimSpace(model)
 }
 
-func rewriteAuthCandidates(ctx context.Context, req RoutePolicyRequest, auths []*Auth) ([]*Auth, bool) {
+func rewriteAuthCandidates(ctx context.Context, req routeRequest, auths []*Auth) ([]*Auth, bool) {
 	if len(auths) == 0 {
 		return auths, false
 	}
-	entries := make([]*scheduledAuth, 0, len(auths))
-	for _, auth := range auths {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		entries = append(entries, &scheduledAuth{auth: auth})
-	}
-	rewritten, active := rewriteScheduledAuths(ctx, req, entries)
-	if !active {
+	policies := gettokensrouting.PolicySnapshot()
+	if len(policies) == 0 {
 		return auths, false
 	}
-	out := make([]*Auth, 0, len(rewritten))
-	for _, entry := range rewritten {
-		if entry == nil || entry.auth == nil {
-			continue
-		}
-		out = append(out, entry.auth)
+	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
+		Provider:   req.Provider,
+		Providers:  append([]string(nil), req.Providers...),
+		Model:      req.Model,
+		Options:    req.Options,
+		Candidates: routeCandidatesFromAuths(auths),
+		Tried:      req.Tried,
+		Now:        req.Now,
+	})
+	if !routeResultActive(result) {
+		return auths, false
 	}
-	return out, true
-}
-
-type stagedRoutePolicy interface {
-	RoutePolicyStage() gettokensrouting.PolicyStage
-}
-
-func routePolicyStage(policy RoutePolicy) gettokensrouting.PolicyStage {
-	if staged, ok := policy.(stagedRoutePolicy); ok {
-		return staged.RoutePolicyStage()
-	}
-	return gettokensrouting.PolicyStageRequest
-}
-
-func routePolicyName(policy RoutePolicy) string {
-	if policy == nil {
-		return ""
-	}
-	name := routePolicyTypeName(policy)
-	if name == "" {
-		return "route-policy"
-	}
-	return name
-}
-
-func routePolicyTypeName(value any) string {
-	return strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(reflect.TypeOf(value).String()), "*"), "auth."))
+	return authsFromRouteCandidates(result.Candidates, auths), true
 }
 
 func routeCandidatesFromScheduled(entries []*scheduledAuth) []gettokensrouting.RouteCandidate {
@@ -279,167 +156,66 @@ func routeCandidatesFromScheduled(entries []*scheduledAuth) []gettokensrouting.R
 		}
 		out = append(out, gettokensrouting.RouteCandidate{
 			ID:    strings.TrimSpace(entry.auth.ID),
-			Value: entry,
+			Value: entry.auth.Clone(),
 		})
 	}
 	return out
 }
 
-func authCandidatesFromRouteCandidates(candidates []gettokensrouting.RouteCandidate) []*Auth {
-	out := make([]*Auth, 0, len(candidates))
-	for _, candidate := range candidates {
-		entry, ok := candidate.Value.(*scheduledAuth)
-		if !ok || entry == nil || entry.auth == nil {
+func routeCandidatesFromAuths(auths []*Auth) []gettokensrouting.RouteCandidate {
+	out := make([]gettokensrouting.RouteCandidate, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		out = append(out, entry.auth.Clone())
+		out = append(out, gettokensrouting.RouteCandidate{
+			ID:    strings.TrimSpace(auth.ID),
+			Value: auth.Clone(),
+		})
 	}
 	return out
 }
 
-func scheduledFromRouteCandidates(candidates []gettokensrouting.RouteCandidate) []*scheduledAuth {
-	out := make([]*scheduledAuth, 0, len(candidates))
-	for _, candidate := range candidates {
-		entry, ok := candidate.Value.(*scheduledAuth)
-		if !ok || entry == nil {
-			continue
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
-func cloneAuthCandidates(entries []*scheduledAuth) []*Auth {
-	out := make([]*Auth, 0, len(entries))
-	for _, entry := range entries {
-		if entry == nil || entry.auth == nil {
-			continue
-		}
-		out = append(out, entry.auth.Clone())
-	}
-	return out
-}
-
-func safeEvaluateRoutePolicy(policy RoutePolicy, ctx context.Context, req RoutePolicyRequest) (decision RoutePolicyDecision, ok bool) {
-	defer func() {
-		if recover() != nil {
-			decision = RoutePolicyDecision{}
-			ok = false
-		}
-	}()
-	decision = policy.RewriteCandidates(ctx, req)
-	ok = true
-	return decision, ok
-}
-
-func routePolicyDecisionActive(decision RoutePolicyDecision) bool {
-	return len(decision.AllowIDs) > 0 ||
-		len(decision.DenyIDs) > 0 ||
-		len(decision.OrderIDs) > 0 ||
-		decision.AllowFallback != nil
-}
-
-func applyRoutePolicyDecision(entries []*scheduledAuth, decision RoutePolicyDecision) []*scheduledAuth {
-	if len(entries) == 0 {
-		return entries
-	}
-	deny := authIDSet(decision.DenyIDs)
-	allow := authIDSet(decision.AllowIDs)
-	order := normalizeAuthIDs(decision.OrderIDs)
-
-	fallback := true
-	if len(allow) > 0 {
-		fallback = false
-	}
-	if decision.AllowFallback != nil {
-		fallback = *decision.AllowFallback
-	}
-
-	filtered := make([]*scheduledAuth, 0, len(entries))
+func scheduledFromRouteCandidates(candidates []gettokensrouting.RouteCandidate, entries []*scheduledAuth) []*scheduledAuth {
 	byID := make(map[string]*scheduledAuth, len(entries))
 	for _, entry := range entries {
 		if entry == nil || entry.auth == nil || strings.TrimSpace(entry.auth.ID) == "" {
 			continue
 		}
 		id := strings.TrimSpace(entry.auth.ID)
-		if _, denied := deny[id]; denied {
-			continue
-		}
-		if len(allow) > 0 {
-			if _, ok := allow[id]; !ok && !fallback {
-				continue
-			}
-		}
-		filtered = append(filtered, entry)
 		if _, exists := byID[id]; !exists {
 			byID[id] = entry
 		}
 	}
-	if len(filtered) == 0 {
-		return filtered
-	}
-
-	out := make([]*scheduledAuth, 0, len(filtered))
-	used := make(map[string]struct{}, len(filtered))
-	for _, id := range order {
-		entry := byID[id]
+	out := make([]*scheduledAuth, 0, len(candidates))
+	for _, candidate := range candidates {
+		entry := byID[strings.TrimSpace(candidate.ID)]
 		if entry == nil {
 			continue
 		}
-		if len(allow) > 0 {
-			if _, ok := allow[id]; !ok && !fallback {
-				continue
-			}
-		}
 		out = append(out, entry)
-		used[id] = struct{}{}
-	}
-	if len(allow) > 0 && len(order) == 0 {
-		for _, entry := range filtered {
-			id := strings.TrimSpace(entry.auth.ID)
-			if _, ok := allow[id]; ok {
-				out = append(out, entry)
-				used[id] = struct{}{}
-			}
-		}
-	}
-	if fallback {
-		for _, entry := range filtered {
-			id := strings.TrimSpace(entry.auth.ID)
-			if _, ok := used[id]; ok {
-				continue
-			}
-			out = append(out, entry)
-		}
 	}
 	return out
 }
 
-func authIDSet(ids []string) map[string]struct{} {
-	normalized := normalizeAuthIDs(ids)
-	if len(normalized) == 0 {
-		return nil
-	}
-	out := make(map[string]struct{}, len(normalized))
-	for _, id := range normalized {
-		out[id] = struct{}{}
-	}
-	return out
-}
-
-func normalizeAuthIDs(ids []string) []string {
-	out := make([]string, 0, len(ids))
-	seen := make(map[string]struct{}, len(ids))
-	for _, raw := range ids {
-		id := strings.TrimSpace(raw)
-		if id == "" {
+func authsFromRouteCandidates(candidates []gettokensrouting.RouteCandidate, auths []*Auth) []*Auth {
+	byID := make(map[string]*Auth, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
 			continue
 		}
-		if _, ok := seen[id]; ok {
+		id := strings.TrimSpace(auth.ID)
+		if _, exists := byID[id]; !exists {
+			byID[id] = auth
+		}
+	}
+	out := make([]*Auth, 0, len(candidates))
+	for _, candidate := range candidates {
+		auth := byID[strings.TrimSpace(candidate.ID)]
+		if auth == nil {
 			continue
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+		out = append(out, auth)
 	}
 	return out
 }

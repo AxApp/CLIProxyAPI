@@ -105,7 +105,7 @@ func buildGetTokensStartupHooks(configPath string) cliproxy.Hooks {
 }
 
 func installGetTokensHooks(cfg *config.Config, configPath string) error {
-	gettokenshooks.InstallRoutePolicyHook()
+	gettokenshooks.InstallRoutingPolicies()
 	if err := gettokenshooks.InstallLiveSessionHistoryHook(gettokenshooks.LiveSessionHistoryOptions{
 		ConfigFilePath: configPath,
 	}); err != nil {

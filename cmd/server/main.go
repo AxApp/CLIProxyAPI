@@ -506,7 +506,7 @@ func main() {
 			return
 		}
 	}
-	gettokenshooks.InstallRoutePolicyHook()
+	gettokenshooks.InstallRoutingPolicies()
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)

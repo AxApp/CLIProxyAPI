@@ -14,7 +14,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestInstallGetTokensHooksInstallsRoutePolicy(t *testing.T) {
+func TestInstallGetTokensHooksInstallsRoutingPolicy(t *testing.T) {
 	if err := installGetTokensHooks(&config.Config{}, t.TempDir()); err != nil {
 		t.Fatalf("install hooks: %v", err)
 	}
@@ -31,9 +31,17 @@ func TestInstallGetTokensHooksInstallsRoutePolicy(t *testing.T) {
 		t.Fatalf("register auth-b: %v", err)
 	}
 
-	_, err := mgr.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{
-		Metadata: gettokenshooks.RouteMetadata(nil, []string{"auth-a"}, nil, nil),
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
 	})
+	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
+		Source: gettokenshooks.AccountRouteGuardSourceManualDisabled,
+		AuthID: "auth-a",
+		Reason: "disabled by test",
+	})
+
+	_, err := mgr.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

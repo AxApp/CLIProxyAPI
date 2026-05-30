@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -67,6 +68,49 @@ type RouteResult struct {
 
 type Engine struct {
 	policies []Policy
+}
+
+var registeredPolicies = struct {
+	sync.RWMutex
+	nextID int
+	items  map[int]Policy
+}{items: make(map[int]Policy)}
+
+// RegisterPolicy installs a process-wide GetTokens routing policy.
+func RegisterPolicy(policy Policy) func() {
+	if policy.Rewrite == nil {
+		return func() {}
+	}
+	registeredPolicies.Lock()
+	registeredPolicies.nextID++
+	id := registeredPolicies.nextID
+	registeredPolicies.items[id] = policy
+	registeredPolicies.Unlock()
+
+	return func() {
+		registeredPolicies.Lock()
+		delete(registeredPolicies.items, id)
+		registeredPolicies.Unlock()
+	}
+}
+
+// PolicySnapshot returns registered policies in registration order.
+func PolicySnapshot() []Policy {
+	registeredPolicies.RLock()
+	defer registeredPolicies.RUnlock()
+	ids := make([]int, 0, len(registeredPolicies.items))
+	for id := range registeredPolicies.items {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	out := make([]Policy, 0, len(ids))
+	for _, id := range ids {
+		policy := registeredPolicies.items[id]
+		if policy.Rewrite != nil {
+			out = append(out, policy)
+		}
+	}
+	return out
 }
 
 func NewEngine(policies ...Policy) Engine {

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -19,10 +20,10 @@ func TestAccountRouteGuardManualDisabledDeniesCandidate(t *testing.T) {
 		Reason:     "disabled by user",
 	})
 
-	decision := accountRouteGuardPolicy{store: store}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
-		Candidates: []*coreauth.Auth{
-			{ID: "codex-auth-1", Provider: "codex"},
-			{ID: "codex-auth-2", Provider: "codex"},
+	decision := accountRouteGuardPolicy{store: store}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: "codex-auth-1", Value: &coreauth.Auth{ID: "codex-auth-1", Provider: "codex"}},
+			{ID: "codex-auth-2", Value: &coreauth.Auth{ID: "codex-auth-2", Provider: "codex"}},
 		},
 	})
 

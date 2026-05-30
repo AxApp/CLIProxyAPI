@@ -299,20 +299,26 @@ type accountRouteGuardPolicy struct {
 	store *AccountRouteGuardStore
 }
 
-func (p accountRouteGuardPolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
-	return gettokensrouting.PolicyStageHardFilter
+func accountRouteGuardRoutingPolicy(store *AccountRouteGuardStore) gettokensrouting.Policy {
+	return gettokensrouting.Policy{
+		Stage: gettokensrouting.PolicyStageHardFilter,
+		Name:  "account-route-guard",
+		Rewrite: func(ctx context.Context, routeCtx gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
+			return accountRouteGuardPolicy{store: store}.RewriteCandidates(ctx, routeCtx)
+		},
+	}
 }
 
-func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req coreauth.RoutePolicyRequest) coreauth.RoutePolicyDecision {
+func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
 	store := p.store
 	if store == nil {
 		store = defaultAccountRouteGuardStore
 	}
-	deny := store.DenyIDsForCandidates(req.Candidates)
+	deny := store.DenyIDsForCandidates(authCandidatesFromRouteContext(req))
 	if len(deny) == 0 {
-		return coreauth.RoutePolicyDecision{}
+		return gettokensrouting.PolicyDecision{}
 	}
-	return coreauth.RoutePolicyDecision{DenyIDs: deny, Reason: "gettokens account route guard"}
+	return gettokensrouting.PolicyDecision{DenyIDs: deny, Reason: "gettokens account route guard"}
 }
 
 func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteGuardBlock {

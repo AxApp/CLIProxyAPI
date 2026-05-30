@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestChannelRoutingRoutePolicySelectsBalancedAccountWithoutRoutingStrategy(t *testing.T) {
+func TestChannelRoutingPolicySelectsBalancedAccountWithoutRoutingStrategy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	configPath := filepath.Join(home, ".config", "gettokens-data", "channel-routing", "config.json")
@@ -41,12 +41,11 @@ func TestChannelRoutingRoutePolicySelectsBalancedAccountWithoutRoutingStrategy(t
 		channelRoutingActiveSessionsByAuthID = restoreSessions
 	})
 
-	decision := channelRoutingRoutePolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
+	decision := rewriteChannelRoutingCandidates(context.Background(), gettokensrouting.RouteContext{
 		Provider: "codex",
-		Options:  cliproxyexecutor.Options{},
-		Candidates: []*coreauth.Auth{
-			{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive},
-			{ID: "auth-b", Provider: "codex", Status: coreauth.StatusActive},
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: "auth-a", Value: &coreauth.Auth{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive}},
+			{ID: "auth-b", Value: &coreauth.Auth{ID: "auth-b", Provider: "codex", Status: coreauth.StatusActive}},
 		},
 	})
 

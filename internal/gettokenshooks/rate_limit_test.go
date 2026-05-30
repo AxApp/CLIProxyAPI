@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -362,8 +363,10 @@ func TestRateLimitEvaluatorFeedsAccountRouteGuardPolicy(t *testing.T) {
 		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
 	}})
 
-	decision := accountRouteGuardPolicy{}.RewriteCandidates(context.Background(), coreauth.RoutePolicyRequest{
-		Candidates: []*coreauth.Auth{{ID: "openai-compatibility:mi:abc123", AccountKey: "openai-compatible:MI", Provider: "mi"}},
+	decision := accountRouteGuardPolicy{}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: "openai-compatibility:mi:abc123", Value: &coreauth.Auth{ID: "openai-compatibility:mi:abc123", AccountKey: "openai-compatible:MI", Provider: "mi"}},
+		},
 	})
 	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "openai-compatibility:mi:abc123" {
 		t.Fatalf("DenyIDs = %#v, want blocked candidate", decision.DenyIDs)

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -285,22 +286,22 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	req := RoutePolicyRequest{
+	req := routeRequest{
 		Provider: providerKey,
 		Model:    model,
 		Options:  opts,
 		Tried:    tried,
 		Now:      time.Now(),
 	}
-	if picked, active := shard.pickRoutePolicyLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity); active {
+	if picked, active := shard.pickRoutingPolicyLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity.routingPolicy()); active {
 		if picked != nil {
-			s.sessionAffinity.BindRouteResult(req, picked)
+			s.sessionAffinity.bindRouteResult(req, picked)
 			return picked, nil
 		}
 		return nil, shard.unavailableErrorLocked(provider, model, predicate)
 	}
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
-		s.sessionAffinity.BindRouteResult(req, picked)
+		s.sessionAffinity.bindRouteResult(req, picked)
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -383,7 +384,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			hasCandidate = true
 		}
 	}
-	if picked, providerKey, active := s.pickMixedRoutePolicyLocked(ctx, normalized, model, opts, tried, candidateShards, predicate); active {
+	if picked, providerKey, active := s.pickMixedRoutingPolicyLocked(ctx, normalized, model, opts, tried, candidateShards, predicate); active {
 		if picked != nil {
 			return picked, providerKey, nil
 		}
@@ -401,7 +402,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
 			if picked != nil {
-				s.sessionAffinity.BindRouteResult(RoutePolicyRequest{
+				s.sessionAffinity.bindRouteResult(routeRequest{
 					Provider:  "mixed",
 					Providers: append([]string(nil), normalized...),
 					Model:     model,
@@ -466,7 +467,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			continue
 		}
 		s.mixedCursors[cursorKey] = slot + 1
-		s.sessionAffinity.BindRouteResult(RoutePolicyRequest{
+		s.sessionAffinity.bindRouteResult(routeRequest{
 			Provider:  "mixed",
 			Providers: append([]string(nil), normalized...),
 			Model:     model,
@@ -514,7 +515,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	return &Error{Code: "auth_unavailable", Message: "no auth available"}
 }
 
-func (s *authScheduler) pickMixedRoutePolicyLocked(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, shards []*modelScheduler, predicate func(*scheduledAuth) bool) (*Auth, string, bool) {
+func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, shards []*modelScheduler, predicate func(*scheduledAuth) bool) (*Auth, string, bool) {
 	if s == nil || len(shards) == 0 {
 		return nil, "", false
 	}
@@ -533,7 +534,7 @@ func (s *authScheduler) pickMixedRoutePolicyLocked(ctx context.Context, provider
 			providerByAuthID[entry.auth.ID] = providerKey
 		}
 	}
-	req := RoutePolicyRequest{
+	req := routeRequest{
 		Provider:  "mixed",
 		Providers: append([]string(nil), providers...),
 		Model:     model,
@@ -541,14 +542,14 @@ func (s *authScheduler) pickMixedRoutePolicyLocked(ctx context.Context, provider
 		Tried:     tried,
 		Now:       time.Now(),
 	}
-	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []RoutePolicy{s.sessionAffinity})
+	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{s.sessionAffinity.routingPolicy()})
 	if !active {
 		return nil, "", false
 	}
 	if len(rewritten) == 0 || rewritten[0] == nil || rewritten[0].auth == nil {
 		return nil, "", true
 	}
-	s.sessionAffinity.BindRouteResult(req, rewritten[0].auth)
+	s.sessionAffinity.bindRouteResult(req, rewritten[0].auth)
 	return rewritten[0].auth, providerByAuthID[rewritten[0].auth.ID], true
 }
 
@@ -859,7 +860,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
 }
 
-func (m *modelScheduler) pickRoutePolicyLocked(ctx context.Context, req RoutePolicyRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, extraPolicies ...RoutePolicy) (*Auth, bool) {
+func (m *modelScheduler) pickRoutingPolicyLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, extraPolicies ...gettokensrouting.Policy) (*Auth, bool) {
 	if m == nil {
 		return nil, false
 	}
