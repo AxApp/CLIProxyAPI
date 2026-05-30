@@ -463,6 +463,15 @@ func (h *Handler) upsertAccountStoreAuthFile(ctx context.Context, store *account
 		return accountstore.AccountRecord{}, err
 	}
 	if existing := matchAccountStoreAuthFile(current, sourceFileName, accountID, email); existing != nil {
+		write.Title = firstNonEmptyValue(existing.Title, write.Title)
+		write.Priority = existing.Priority
+		write.Disabled = existing.Disabled
+		if existing.AuthFile != nil && write.AuthFile != nil {
+			write.AuthFile.SourceFileName = firstNonEmptyValue(existing.AuthFile.SourceFileName, write.AuthFile.SourceFileName)
+			write.AuthFile.Email = firstNonEmptyValue(write.AuthFile.Email, existing.AuthFile.Email)
+			write.AuthFile.PlanType = firstNonEmptyValue(write.AuthFile.PlanType, existing.AuthFile.PlanType)
+			write.AuthFile.AuthType = firstNonEmptyValue(write.AuthFile.AuthType, existing.AuthFile.AuthType)
+		}
 		return store.UpdateAccount(ctx, existing.AccountKey, write)
 	}
 	return store.CreateAccount(ctx, write)

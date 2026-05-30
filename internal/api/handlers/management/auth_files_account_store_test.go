@@ -116,6 +116,30 @@ func TestSaveTokenRecordToAccountStoreUpdatesExistingAuthFileByAccountID(t *test
 	if _, err := handler.saveTokenRecordToAccountStore(context.Background(), first); err != nil {
 		t.Fatalf("first saveTokenRecordToAccountStore() error = %v", err)
 	}
+	store, err := accountstore.Open(handler.accountStorePath)
+	if err != nil {
+		t.Fatalf("Open after first save: %v", err)
+	}
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema after first save: %v", err)
+	}
+	accounts, err := store.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListAccounts after first save: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("account count after first save = %d, want 1", len(accounts))
+	}
+	accountKey := accounts[0].AccountKey
+	if _, err := store.SetAccountPriority(context.Background(), accountKey, 7); err != nil {
+		t.Fatalf("SetAccountPriority: %v", err)
+	}
+	if _, err := store.SetAccountStatus(context.Background(), accountKey, true); err != nil {
+		t.Fatalf("SetAccountStatus: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close after first save: %v", err)
+	}
 
 	second := &coreauth.Auth{
 		ID:       "codex-user-plus.json",
@@ -143,7 +167,7 @@ func TestSaveTokenRecordToAccountStoreUpdatesExistingAuthFileByAccountID(t *test
 		t.Fatal("second saveTokenRecordToAccountStore() returned empty saved path")
 	}
 
-	store, err := accountstore.Open(handler.accountStorePath)
+	store, err = accountstore.Open(handler.accountStorePath)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -151,7 +175,7 @@ func TestSaveTokenRecordToAccountStoreUpdatesExistingAuthFileByAccountID(t *test
 	if err := store.EnsureSchema(context.Background()); err != nil {
 		t.Fatalf("EnsureSchema() error = %v", err)
 	}
-	accounts, err := store.ListAccounts(context.Background())
+	accounts, err = store.ListAccounts(context.Background())
 	if err != nil {
 		t.Fatalf("ListAccounts() error = %v", err)
 	}
@@ -162,8 +186,17 @@ func TestSaveTokenRecordToAccountStoreUpdatesExistingAuthFileByAccountID(t *test
 	if account.AuthFile == nil {
 		t.Fatal("auth file credential is nil")
 	}
-	if got := account.AuthFile.SourceFileName; got != "codex-user-plus.json" {
-		t.Fatalf("source file name = %q, want codex-user-plus.json", got)
+	if got := account.Priority; got != 7 {
+		t.Fatalf("priority = %d, want 7", got)
+	}
+	if !account.Disabled {
+		t.Fatal("disabled = false, want true")
+	}
+	if got := account.Title; got != "codex-user-free.json" {
+		t.Fatalf("title = %q, want original title", got)
+	}
+	if got := account.AuthFile.SourceFileName; got != "codex-user-free.json" {
+		t.Fatalf("source file name = %q, want original source file name", got)
 	}
 	if got := account.AuthFile.PlanType; got != "plus" {
 		t.Fatalf("plan type = %q, want plus", got)
