@@ -277,6 +277,32 @@ func TestDryRunLegacyImportFindsLegacySourcesWithoutWritingOrDeleting(t *testing
 	}
 }
 
+func TestDryRunLegacyImportInfersAuthFilePlanTypeFromFileNameFallback(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auth")
+	mustMkdir(t, authDir)
+
+	authPath := filepath.Join(authDir, "codex-demo@example.com-plus.json")
+	mustWriteJSON(t, authPath, map[string]any{
+		"type":  "codex",
+		"email": "demo@example.com",
+	})
+
+	report, err := DryRunLegacyImport(context.Background(), LegacySources{AuthDir: authDir})
+	if err != nil {
+		t.Fatalf("DryRunLegacyImport: %v", err)
+	}
+	if got, want := len(report.Candidates), 1; got != want {
+		t.Fatalf("candidates = %d, want %d", got, want)
+	}
+	if report.Candidates[0].AuthFile == nil {
+		t.Fatalf("expected auth file credential: %#v", report.Candidates[0])
+	}
+	if got, want := report.Candidates[0].AuthFile.PlanType, "plus"; got != want {
+		t.Fatalf("plan type = %q, want %q", got, want)
+	}
+}
+
 func TestCommitImportWritesAccountsAndIsIdempotentByMigrationSource(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

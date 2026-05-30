@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
@@ -209,7 +210,7 @@ func appendAuthFileCandidates(ctx context.Context, report *MigrationReport, auth
 				AuthJSON:       string(data),
 				AuthType:       stringFromMap(raw, "type"),
 				Email:          stringFromMap(raw, "email"),
-				PlanType:       stringFromMap(raw, "plan_type"),
+				PlanType:       inferAuthFilePlanType(entry.Name(), raw),
 				ModifiedUnixMs: info.ModTime().UnixMilli(),
 				SizeBytes:      info.Size(),
 			},
@@ -466,6 +467,89 @@ func stringFromMap(raw map[string]any, key string) string {
 		return strings.TrimSpace(value)
 	}
 	return ""
+}
+
+func inferAuthFilePlanType(fileName string, raw map[string]any) string {
+	if raw == nil {
+		return inferPlanTypeFromFileName(fileName)
+	}
+	for _, key := range []string{"plan_type", "planType", "plan"} {
+		if value := stringFromMap(raw, key); value != "" {
+			return normalizePlanType(value)
+		}
+	}
+	if metadata, ok := raw["metadata"].(map[string]any); ok {
+		for _, key := range []string{"plan_type", "planType", "plan"} {
+			if value := stringFromMap(metadata, key); value != "" {
+				return normalizePlanType(value)
+			}
+		}
+	}
+	for _, key := range []string{"id_token", "idToken"} {
+		if token := stringFromMap(raw, key); token != "" {
+			if planType := planTypeFromIDToken(token); planType != "" {
+				return planType
+			}
+		}
+	}
+	if metadata, ok := raw["metadata"].(map[string]any); ok {
+		for _, key := range []string{"id_token", "idToken"} {
+			if token := stringFromMap(metadata, key); token != "" {
+				if planType := planTypeFromIDToken(token); planType != "" {
+					return planType
+				}
+			}
+		}
+	}
+	return inferPlanTypeFromFileName(fileName)
+}
+
+func planTypeFromIDToken(token string) string {
+	claims, err := codex.ParseJWTToken(strings.TrimSpace(token))
+	if err != nil || claims == nil {
+		return ""
+	}
+	return normalizePlanType(claims.CodexAuthInfo.ChatgptPlanType)
+}
+
+func inferPlanTypeFromFileName(fileName string) string {
+	name := strings.TrimSpace(strings.TrimSuffix(fileName, filepath.Ext(fileName)))
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, "-plus"):
+		return "plus"
+	case strings.HasSuffix(lower, "-pro"):
+		return "pro"
+	case strings.HasSuffix(lower, "-free"):
+		return "free"
+	default:
+		return ""
+	}
+}
+
+func normalizePlanType(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "":
+		return ""
+	case "free", "chatgptfree", "freeplan":
+		return "free"
+	case "plus", "chatgptplus", "plusplan":
+		return "plus"
+	case "pro", "chatgptpro", "proplan", "professional", "prolite":
+		return "pro"
+	default:
+		if strings.Contains(normalized, "plus") {
+			return "plus"
+		}
+		if strings.Contains(normalized, "pro") {
+			return "pro"
+		}
+		if strings.Contains(normalized, "free") {
+			return "free"
+		}
+		return normalized
+	}
 }
 
 func jsonString(value any, empty string) (string, error) {

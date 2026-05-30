@@ -1642,21 +1642,15 @@ func (h *Handler) saveTokenRecordToAccountStore(ctx context.Context, record *cor
 		return "", err
 	}
 	defer store.Close()
-	payload, err := json.Marshal(record)
+	payload, email, planType, accountID, err := accountStoreAuthFilePayload(record)
 	if err != nil {
-		return "", fmt.Errorf("marshal token record: %w", err)
+		return "", err
 	}
 	title := strings.TrimSpace(record.FileName)
 	if title == "" {
 		title = strings.TrimSpace(record.ID)
 	}
-	email := ""
-	planType := ""
-	if record.Metadata != nil {
-		email = stringFromAny(record.Metadata["email"])
-		planType = stringFromAny(record.Metadata["plan_type"])
-	}
-	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+	write := accountstore.AccountWrite{
 		Kind:             accountstore.KindAuthFile,
 		Title:            title,
 		Provider:         "codex",
@@ -1668,7 +1662,8 @@ func (h *Handler) saveTokenRecordToAccountStore(ctx context.Context, record *cor
 			Email:          email,
 			PlanType:       planType,
 		},
-	})
+	}
+	account, err := h.upsertAccountStoreAuthFile(ctx, store, title, accountID, email, write)
 	if err != nil {
 		return "", err
 	}
@@ -1688,6 +1683,165 @@ func stringFromAny(value any) string {
 	default:
 		return ""
 	}
+}
+
+func accountStoreAuthFilePayload(record *coreauth.Auth) ([]byte, string, string, string, error) {
+	if record == nil {
+		return nil, "", "", "", fmt.Errorf("token record is nil")
+	}
+	var payload map[string]any
+	switch {
+	case record.Storage != nil:
+		merged, err := misc.MergeMetadata(record.Storage, record.Metadata)
+		if err != nil {
+			return nil, "", "", "", fmt.Errorf("merge auth metadata: %w", err)
+		}
+		payload = merged
+	case record.Metadata != nil:
+		merged, err := misc.MergeMetadata(record.Metadata, nil)
+		if err != nil {
+			return nil, "", "", "", fmt.Errorf("marshal auth metadata: %w", err)
+		}
+		payload = merged
+	default:
+		return nil, "", "", "", fmt.Errorf("token record has no storage payload")
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["type"] = "codex"
+	email := stringFromAny(payload["email"])
+	planType := normalizeAccountStorePlanType(
+		stringFromAny(payload["plan_type"]),
+		stringFromAny(payload["chatgpt_plan_type"]),
+	)
+	if planType == "" && record.Attributes != nil {
+		planType = normalizeAccountStorePlanType(record.Attributes["plan_type"])
+	}
+	accountID := stringFromAny(payload["account_id"])
+	if planType == "" {
+		if idToken := stringFromAny(payload["id_token"]); idToken != "" {
+			if claims, err := codex.ParseJWTToken(idToken); err == nil && claims != nil {
+				planType = normalizeAccountStorePlanType(claims.CodexAuthInfo.ChatgptPlanType)
+				if accountID == "" {
+					accountID = strings.TrimSpace(claims.GetAccountID())
+				}
+				if email == "" {
+					email = strings.TrimSpace(claims.Email)
+				}
+			}
+		}
+	}
+	if planType != "" {
+		payload["plan_type"] = planType
+	}
+	if email != "" {
+		payload["email"] = email
+	}
+	if accountID != "" {
+		payload["account_id"] = accountID
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", "", "", fmt.Errorf("marshal auth payload: %w", err)
+	}
+	return normalized, email, planType, accountID, nil
+}
+
+func normalizeAccountStorePlanType(values ...string) string {
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "free":
+			return "free"
+		case "plus":
+			return "plus"
+		case "pro":
+			return "pro"
+		case "team":
+			return "team"
+		case "enterprise":
+			return "enterprise"
+		}
+	}
+	return ""
+}
+
+func (h *Handler) upsertAccountStoreAuthFile(ctx context.Context, store *accountstore.Store, sourceFileName string, accountID string, email string, write accountstore.AccountWrite) (accountstore.AccountRecord, error) {
+	if store == nil {
+		return accountstore.AccountRecord{}, fmt.Errorf("account store unavailable")
+	}
+	current, err := store.ListAccounts(ctx)
+	if err != nil {
+		return accountstore.AccountRecord{}, err
+	}
+	if existing := matchAccountStoreAuthFile(current, sourceFileName, accountID, email); existing != nil {
+		return store.UpdateAccount(ctx, existing.AccountKey, write)
+	}
+	return store.CreateAccount(ctx, write)
+}
+
+func matchAccountStoreAuthFile(accounts []accountstore.AccountRecord, sourceFileName string, accountID string, email string) *accountstore.AccountRecord {
+	normalizedName := strings.TrimSpace(sourceFileName)
+	normalizedAccountID := strings.TrimSpace(accountID)
+	normalizedEmail := strings.ToLower(strings.TrimSpace(email))
+	var emailMatch *accountstore.AccountRecord
+	for i := range accounts {
+		account := &accounts[i]
+		if account.Kind != accountstore.KindAuthFile || account.AuthFile == nil {
+			continue
+		}
+		if normalizedAccountID != "" {
+			if existingAccountID := accountStoreAuthJSONField(account.AuthFile.AuthJSON, "account_id"); strings.EqualFold(existingAccountID, normalizedAccountID) {
+				return account
+			}
+		}
+		if normalizedName != "" && strings.EqualFold(strings.TrimSpace(account.AuthFile.SourceFileName), normalizedName) {
+			return account
+		}
+		if normalizedEmail != "" {
+			existingEmail := strings.ToLower(firstNonEmptyValue(
+				strings.TrimSpace(account.AuthFile.Email),
+				accountStoreAuthJSONField(account.AuthFile.AuthJSON, "email"),
+				accountStoreAuthJSONField(account.AuthFile.AuthJSON, "metadata.email"),
+			))
+			if existingEmail == normalizedEmail && emailMatch == nil {
+				emailMatch = account
+			}
+		}
+	}
+	return emailMatch
+}
+
+func accountStoreAuthJSONField(raw string, path string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || path == "" {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return ""
+	}
+	current := any(payload)
+	for _, segment := range strings.Split(path, ".") {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current, ok = m[segment]
+		if !ok {
+			return ""
+		}
+	}
+	return stringFromAny(current)
+}
+
+func firstNonEmptyValue(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
