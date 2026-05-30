@@ -21,16 +21,14 @@ import (
 )
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
-	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
+	body := codexPassthroughPayload()
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
 
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
 		t.Fatalf("type = %s, want response.create", got)
 	}
-	if got := gjson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {
-		t.Fatalf("previous_response_id = %s, want resp-1", got)
-	}
+	assertCodexPassthroughPayload(t, wsReqBody)
 	if gjson.GetBytes(wsReqBody, "input.0.id").String() != "msg-1" {
 		t.Fatalf("input item id mismatch")
 	}
@@ -72,7 +70,7 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`),
+		Payload: codexPassthroughPayload(),
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
@@ -85,9 +83,7 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
 			t.Fatalf("upstream type = %s, want response.create; payload=%s", got, payload)
 		}
-		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "resp-1" {
-			t.Fatalf("upstream previous_response_id = %s, want resp-1; payload=%s", got, payload)
-		}
+		assertCodexPassthroughPayload(t, payload)
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for upstream websocket payload")
 	}
