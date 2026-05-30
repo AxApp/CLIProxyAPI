@@ -72,7 +72,7 @@ type apiCallResponse struct {
 //
 // Request JSON:
 //   - auth_index / authIndex / AuthIndex (optional):
-//     The credential "auth_index" from GET /v0/management/auth-files (or other endpoints returning it).
+//     The credential "auth_index" from GET /v0/management/accounts (or other endpoints returning it).
 //     If omitted or not found, credential-specific proxy/token substitution is skipped.
 //   - method (required): HTTP method, e.g. GET, POST, PUT, PATCH, DELETE.
 //   - url (required): Absolute URL including scheme and host, e.g. "https://api.example.com/v1/ping".

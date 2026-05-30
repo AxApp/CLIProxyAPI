@@ -760,14 +760,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
-		mgmt.GET("/auth-files", s.mgmt.DeprecatedAuthFilesEndpoint)
-		mgmt.GET("/auth-files/models", s.mgmt.DeprecatedAuthFilesEndpoint)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
-		mgmt.GET("/auth-files/download", s.mgmt.DeprecatedAuthFilesEndpoint)
-		mgmt.POST("/auth-files", s.mgmt.DeprecatedAuthFilesEndpoint)
-		mgmt.DELETE("/auth-files", s.mgmt.DeprecatedAuthFilesEndpoint)
-		mgmt.PATCH("/auth-files/status", s.mgmt.DeprecatedAuthFilesEndpoint)
-		mgmt.PATCH("/auth-files/fields", s.mgmt.DeprecatedAuthFilesEndpoint)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
