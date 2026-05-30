@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+type accountStoreQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type AccountRecord struct {
 	AccountKey         string           `json:"account_key"`
 	Kind               AccountKind      `json:"kind"`
@@ -427,7 +431,14 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin list accounts transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	rows, err := tx.QueryContext(ctx, `
 SELECT
   c.account_key,
   c.kind,
@@ -450,7 +461,6 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query accounts: %w", err)
 	}
-	defer rows.Close()
 
 	var accounts []AccountRecord
 	for rows.Next() {
@@ -472,25 +482,35 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 			&account.RuntimeApplyStatus,
 			&account.RuntimeApplyError,
 		); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("scan account: %w", err)
 		}
 		account.Disabled = disabled != 0
-		if err := s.attachCredential(ctx, &account); err != nil {
-			return nil, err
-		}
 		accounts = append(accounts, account)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, fmt.Errorf("iterate accounts: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close account rows: %w", err)
+	}
+	for i := range accounts {
+		if err := attachCredential(ctx, tx, &accounts[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit list accounts transaction: %w", err)
 	}
 	return accounts, nil
 }
 
-func (s *Store) attachCredential(ctx context.Context, account *AccountRecord) error {
+func attachCredential(ctx context.Context, queryer accountStoreQueryer, account *AccountRecord) error {
 	switch account.Kind {
 	case KindAuthFile:
 		var credential AuthFileCredential
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT source_file_name, auth_json, auth_type, email, plan_type, modified_unix_ms, size_bytes
 FROM auth_file_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.SourceFileName,
@@ -508,7 +528,7 @@ FROM auth_file_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 	case KindCodexAPIKey:
 		var credential CodexAPIKeyCredential
 		var websockets, quotaEnabled, billingEnabled int
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, format_base_urls_json, headers_json, models_json, excluded_models_json
 FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.APIKey,
@@ -535,7 +555,7 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 		account.CodexAPIKey = &credential
 	case KindOpenAICompatible:
 		var credential OpenAICompatibleCredential
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, models_json
 FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.ProviderName,

@@ -496,6 +496,47 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 }
 
+func TestListAccountsWorksWithSingleSQLiteConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	store.db.SetMaxOpenConns(1)
+
+	_, err = store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Primary",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:            "sk-test",
+			APIKeyFingerprint: "fp-test",
+			BaseURL:           "https://api.example.com/v1",
+			Prefix:            "team-a/",
+			Websockets:        true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	accounts, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts with single SQLite connection: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].CodexAPIKey == nil || accounts[0].CodexAPIKey.APIKey != "sk-test" {
+		t.Fatalf("ListAccounts returned incomplete credential payload: %+v", accounts)
+	}
+}
+
 func countKind(candidates []ImportCandidate, kind AccountKind) int {
 	count := 0
 	for _, candidate := range candidates {
