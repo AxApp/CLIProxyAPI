@@ -17,6 +17,7 @@ import (
 )
 
 const schemaVersion = "1"
+const sqliteBusyTimeoutMs = 5000
 
 var accountKeyPattern = regexp.MustCompile(`^acct_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
@@ -59,15 +60,16 @@ func Open(path string) (*Store, error) {
 }
 
 func sqliteDSN(path string) string {
-	u := url.URL{
-		Scheme: "file",
-		Path:   path,
+	openPath := path
+	if abs, err := filepath.Abs(path); err == nil {
+		openPath = abs
 	}
-	q := u.Query()
-	q.Add("_pragma", "busy_timeout(5000)")
-	q.Add("_pragma", "foreign_keys(1)")
-	u.RawQuery = q.Encode()
-	return u.String()
+	dsn := url.URL{Scheme: "file", Path: filepath.ToSlash(openPath)}
+	query := dsn.Query()
+	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMs))
+	query.Add("_pragma", "foreign_keys(1)")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
 }
 
 func (s *Store) Close() error {
