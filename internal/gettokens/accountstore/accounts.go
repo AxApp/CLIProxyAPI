@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+type accountStoreQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type AccountRecord struct {
 	AccountKey         string           `json:"account_key"`
 	Kind               AccountKind      `json:"kind"`
@@ -199,6 +203,100 @@ func (s *Store) SetAccountPriority(ctx context.Context, accountKey string, prior
 	})
 }
 
+func (s *Store) UpdateAuthFileCredential(ctx context.Context, accountKey string, credential AuthFileCredential) (AccountRecord, error) {
+	if s == nil || s.db == nil {
+		return AccountRecord{}, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return AccountRecord{}, fmt.Errorf("invalid account key %q", accountKey)
+	}
+	if strings.TrimSpace(credential.AuthJSON) == "" {
+		return AccountRecord{}, fmt.Errorf("auth-file account %s missing credential", accountKey)
+	}
+	current, err := s.GetAccount(ctx, accountKey)
+	if err != nil {
+		return AccountRecord{}, err
+	}
+	if current.Kind != KindAuthFile {
+		return AccountRecord{}, fmt.Errorf("account %s is %s, not auth-file", accountKey, current.Kind)
+	}
+	if current.AuthFile != nil {
+		if strings.TrimSpace(credential.SourceFileName) == "" {
+			credential.SourceFileName = current.AuthFile.SourceFileName
+		}
+		if strings.TrimSpace(credential.AuthType) == "" {
+			credential.AuthType = current.AuthFile.AuthType
+		}
+		if strings.TrimSpace(credential.Email) == "" {
+			credential.Email = current.AuthFile.Email
+		}
+		if strings.TrimSpace(credential.PlanType) == "" {
+			credential.PlanType = current.AuthFile.PlanType
+		}
+		if credential.ModifiedUnixMs == 0 {
+			credential.ModifiedUnixMs = current.AuthFile.ModifiedUnixMs
+		}
+	}
+	if strings.TrimSpace(credential.SourceFileName) == "" {
+		credential.SourceFileName = accountKey + ".json"
+	}
+	if strings.TrimSpace(credential.AuthType) == "" {
+		credential.AuthType = "codex"
+	}
+	if credential.SizeBytes == 0 {
+		credential.SizeBytes = int64(len([]byte(credential.AuthJSON)))
+	}
+	now := unixMs()
+	if credential.ModifiedUnixMs == 0 {
+		credential.ModifiedUnixMs = now
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("begin update auth-file credential transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `
+UPDATE auth_file_accounts
+SET source_file_name = ?, auth_json = ?, auth_fingerprint = ?, auth_type = ?, email = ?, plan_type = ?, modified_unix_ms = ?, size_bytes = ?, updated_at_unix_ms = ?
+WHERE account_key = ?`,
+		strings.TrimSpace(credential.SourceFileName),
+		credential.AuthJSON,
+		fingerprintString(credential.AuthJSON),
+		strings.TrimSpace(credential.AuthType),
+		strings.TrimSpace(credential.Email),
+		strings.TrimSpace(credential.PlanType),
+		credential.ModifiedUnixMs,
+		credential.SizeBytes,
+		now,
+		accountKey,
+	)
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("update auth-file credential %s: %w", accountKey, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("update auth-file credential %s rows affected: %w", accountKey, err)
+	}
+	if rows == 0 {
+		return AccountRecord{}, fmt.Errorf("auth-file credential %s not found", accountKey)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE account_cards SET updated_at_unix_ms = ? WHERE account_key = ? AND deleted_at_unix_ms IS NULL", now, accountKey); err != nil {
+		return AccountRecord{}, fmt.Errorf("touch account card %s: %w", accountKey, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountRecord{}, fmt.Errorf("commit update auth-file credential transaction: %w", err)
+	}
+	tx = nil
+	return s.GetAccount(ctx, accountKey)
+}
+
 func (s *Store) DeleteAccount(ctx context.Context, accountKey string) error {
 	if s == nil || s.db == nil {
 		return errors.New("account store is not open")
@@ -259,6 +357,47 @@ WHERE account_key = ? AND revision = ?`,
 	)
 	if err != nil {
 		return fmt.Errorf("mark runtime apply result %s: %w", accountKey, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkPendingRuntimeApplyResults(ctx context.Context, status string, lastError string) error {
+	if s == nil || s.db == nil {
+		return errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	status = strings.TrimSpace(status)
+	switch status {
+	case "applied", "failed":
+	default:
+		return fmt.Errorf("invalid runtime apply status %q", status)
+	}
+	now := unixMs()
+	appliedAt := int64(0)
+	if status == "applied" {
+		appliedAt = now
+		lastError = ""
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE account_runtime_apply_state
+SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?
+WHERE status = 'pending'
+  AND EXISTS (
+    SELECT 1
+    FROM account_cards c
+    WHERE c.account_key = account_runtime_apply_state.account_key
+      AND c.revision = account_runtime_apply_state.revision
+      AND c.deleted_at_unix_ms IS NULL
+  )`,
+		status,
+		strings.TrimSpace(lastError),
+		appliedAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("mark pending runtime apply results: %w", err)
 	}
 	return nil
 }
@@ -427,7 +566,14 @@ func (s *Store) ListAccounts(ctx context.Context) ([]AccountRecord, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin list accounts transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	rows, err := tx.QueryContext(ctx, `
 SELECT
   c.account_key,
   c.kind,
@@ -450,7 +596,6 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("query accounts: %w", err)
 	}
-	defer rows.Close()
 
 	var accounts []AccountRecord
 	for rows.Next() {
@@ -472,25 +617,35 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 			&account.RuntimeApplyStatus,
 			&account.RuntimeApplyError,
 		); err != nil {
+			_ = rows.Close()
 			return nil, fmt.Errorf("scan account: %w", err)
 		}
 		account.Disabled = disabled != 0
-		if err := s.attachCredential(ctx, &account); err != nil {
-			return nil, err
-		}
 		accounts = append(accounts, account)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return nil, fmt.Errorf("iterate accounts: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close account rows: %w", err)
+	}
+	for i := range accounts {
+		if err := attachCredential(ctx, tx, &accounts[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit list accounts transaction: %w", err)
 	}
 	return accounts, nil
 }
 
-func (s *Store) attachCredential(ctx context.Context, account *AccountRecord) error {
+func attachCredential(ctx context.Context, queryer accountStoreQueryer, account *AccountRecord) error {
 	switch account.Kind {
 	case KindAuthFile:
 		var credential AuthFileCredential
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT source_file_name, auth_json, auth_type, email, plan_type, modified_unix_ms, size_bytes
 FROM auth_file_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.SourceFileName,
@@ -508,7 +663,7 @@ FROM auth_file_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 	case KindCodexAPIKey:
 		var credential CodexAPIKeyCredential
 		var websockets, quotaEnabled, billingEnabled int
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, format_base_urls_json, headers_json, models_json, excluded_models_json
 FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.APIKey,
@@ -535,7 +690,7 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 		account.CodexAPIKey = &credential
 	case KindOpenAICompatible:
 		var credential OpenAICompatibleCredential
-		err := s.db.QueryRowContext(ctx, `
+		err := queryer.QueryRowContext(ctx, `
 SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, models_json
 FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.ProviderName,

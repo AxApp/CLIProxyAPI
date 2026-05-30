@@ -51,7 +51,7 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		if errRead != nil || len(data) == 0 {
 			continue
 		}
-		auths := synthesizeFileAuths(ctx, full, data)
+		auths := synthesizeFileAuths(ctx, full, data, true)
 		if len(auths) == 0 {
 			continue
 		}
@@ -63,10 +63,10 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 // SynthesizeAuthFile generates Auth entries for one auth JSON file payload.
 // It shares exactly the same mapping behavior as FileSynthesizer.Synthesize.
 func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
-	return synthesizeFileAuths(ctx, fullPath, data)
+	return synthesizeFileAuths(ctx, fullPath, data, true)
 }
 
-func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
+func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte, skipAccountStoreOwnedCodex bool) []*coreauth.Auth {
 	if ctx == nil || len(data) == 0 {
 		return nil
 	}
@@ -84,7 +84,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
-	if provider == "codex" && accountStoreHasKind(ctx.Config, accountstore.KindAuthFile) {
+	if skipAccountStoreOwnedCodex && provider == "codex" && accountStoreHasKind(ctx.Config, accountstore.KindAuthFile) {
 		return nil
 	}
 	label := provider

@@ -277,6 +277,32 @@ func TestDryRunLegacyImportFindsLegacySourcesWithoutWritingOrDeleting(t *testing
 	}
 }
 
+func TestDryRunLegacyImportInfersAuthFilePlanTypeFromFileNameFallback(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auth")
+	mustMkdir(t, authDir)
+
+	authPath := filepath.Join(authDir, "codex-demo@example.com-plus.json")
+	mustWriteJSON(t, authPath, map[string]any{
+		"type":  "codex",
+		"email": "demo@example.com",
+	})
+
+	report, err := DryRunLegacyImport(context.Background(), LegacySources{AuthDir: authDir})
+	if err != nil {
+		t.Fatalf("DryRunLegacyImport: %v", err)
+	}
+	if got, want := len(report.Candidates), 1; got != want {
+		t.Fatalf("candidates = %d, want %d", got, want)
+	}
+	if report.Candidates[0].AuthFile == nil {
+		t.Fatalf("expected auth file credential: %#v", report.Candidates[0])
+	}
+	if got, want := report.Candidates[0].AuthFile.PlanType, "plus"; got != want {
+		t.Fatalf("plan type = %q, want %q", got, want)
+	}
+}
+
 func TestCommitImportWritesAccountsAndIsIdempotentByMigrationSource(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
@@ -493,6 +519,100 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 	if !updated.Disabled || updated.Priority != 9 {
 		t.Fatalf("card fields not updated: disabled=%v priority=%d", updated.Disabled, updated.Priority)
+	}
+}
+
+func TestUpdateAuthFileCredentialUpdatesAuthJSONWithoutChangingRevision(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	created, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindAuthFile,
+		Title:            "Codex",
+		Provider:         "codex",
+		CredentialSource: SourceLegacyAuthFile,
+		AuthFile: &AuthFileCredential{
+			SourceFileName: "codex-user-free.json",
+			AuthJSON:       `{"type":"codex","access_token":"old","refresh_token":"old-refresh","email":"user@example.com","plan_type":"free"}`,
+			AuthType:       "codex",
+			Email:          "user@example.com",
+			PlanType:       "free",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	updated, err := store.UpdateAuthFileCredential(ctx, created.AccountKey, AuthFileCredential{
+		AuthJSON: `{"type":"codex","access_token":"new","refresh_token":"new-refresh","email":"user@example.com","plan_type":"plus"}`,
+		PlanType: "plus",
+	})
+	if err != nil {
+		t.Fatalf("UpdateAuthFileCredential: %v", err)
+	}
+	if updated.Revision != created.Revision {
+		t.Fatalf("revision = %d, want %d", updated.Revision, created.Revision)
+	}
+	if updated.AuthFile == nil {
+		t.Fatal("updated auth file is nil")
+	}
+	if got := updated.AuthFile.SourceFileName; got != "codex-user-free.json" {
+		t.Fatalf("source file name = %q, want original", got)
+	}
+	if got := updated.AuthFile.PlanType; got != "plus" {
+		t.Fatalf("plan type = %q, want plus", got)
+	}
+	if !strings.Contains(updated.AuthFile.AuthJSON, `"refresh_token":"new-refresh"`) {
+		t.Fatalf("auth_json was not updated: %s", updated.AuthFile.AuthJSON)
+	}
+}
+
+func TestListAccountsWorksWithSingleSQLiteConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	store.db.SetMaxOpenConns(1)
+
+	_, err = store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Primary",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:            "sk-test",
+			APIKeyFingerprint: "fp-test",
+			BaseURL:           "https://api.example.com/v1",
+			Prefix:            "team-a/",
+			Websockets:        true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	accounts, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts with single SQLite connection: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].CodexAPIKey == nil || accounts[0].CodexAPIKey.APIKey != "sk-test" {
+		t.Fatalf("ListAccounts returned incomplete credential payload: %+v", accounts)
 	}
 }
 

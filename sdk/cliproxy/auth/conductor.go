@@ -3060,18 +3060,17 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	if rewritten, active := rewriteAuthCandidates(ctx, RoutePolicyRequest{
-		Provider:   strings.TrimSpace(strings.ToLower(provider)),
-		Model:      model,
-		Options:    opts,
-		Tried:      tried,
-		Now:        time.Now(),
-		Candidates: available,
+	if rewritten, active := rewriteAuthCandidates(ctx, routeRequest{
+		Provider: strings.TrimSpace(strings.ToLower(provider)),
+		Model:    model,
+		Options:  opts,
+		Tried:    tried,
+		Now:      time.Now(),
 	}, available); active {
 		available = rewritten
 		if len(available) == 0 {
 			m.mu.RUnlock()
-			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available after route policy"}
+			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available after routing policy"}
 		}
 	}
 	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
@@ -3230,19 +3229,18 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	if rewritten, active := rewriteAuthCandidates(ctx, RoutePolicyRequest{
-		Provider:   "mixed",
-		Providers:  normalizedProviders,
-		Model:      model,
-		Options:    opts,
-		Tried:      tried,
-		Now:        time.Now(),
-		Candidates: available,
+	if rewritten, active := rewriteAuthCandidates(ctx, routeRequest{
+		Provider:  "mixed",
+		Providers: normalizedProviders,
+		Model:     model,
+		Options:   opts,
+		Tried:     tried,
+		Now:       time.Now(),
 	}, available); active {
 		available = rewritten
 		if len(available) == 0 {
 			m.mu.RUnlock()
-			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available after route policy"}
+			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available after routing policy"}
 		}
 	}
 	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)

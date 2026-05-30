@@ -12,8 +12,6 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-type channelRoutingRoutePolicy struct{}
-
 type channelRoutingPolicyStore struct {
 	Channels map[string]channelRoutingPolicyConfig `json:"channels"`
 }
@@ -38,20 +36,24 @@ type channelRoutingPolicyAccountGroup struct {
 
 var channelRoutingActiveSessionsByAuthID = currentLiveSessionActiveAuthCounts
 
-func (channelRoutingRoutePolicy) RoutePolicyStage() gettokensrouting.PolicyStage {
-	return gettokensrouting.PolicyStagePoolScope
+func channelRoutingPolicy() gettokensrouting.Policy {
+	return gettokensrouting.Policy{
+		Stage:   gettokensrouting.PolicyStagePoolScope,
+		Name:    "channel-routing",
+		Rewrite: rewriteChannelRoutingCandidates,
+	}
 }
 
-func (channelRoutingRoutePolicy) RewriteCandidates(_ context.Context, req coreauth.RoutePolicyRequest) coreauth.RoutePolicyDecision {
+func rewriteChannelRoutingCandidates(_ context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
 	channel := channelRoutingChannelForRequest(req)
 	if channel == "" || len(req.Candidates) == 0 {
-		return coreauth.RoutePolicyDecision{}
+		return gettokensrouting.PolicyDecision{}
 	}
 	cfg, ok := loadChannelRoutingPolicyConfig(channel)
 	if !ok {
-		return coreauth.RoutePolicyDecision{}
+		return gettokensrouting.PolicyDecision{}
 	}
-	accounts, groups := channelRoutingSnapshots(req.Candidates, cfg)
+	accounts, groups := channelRoutingSnapshots(authCandidatesFromRouteContext(req), cfg)
 	decision := gettokensrouting.DecideChannelRoute(accounts, groups, gettokensrouting.ChannelRoutingConfig{
 		Channel:                      channel,
 		RouteMode:                    cfg.RouteMode,
@@ -64,9 +66,9 @@ func (channelRoutingRoutePolicy) RewriteCandidates(_ context.Context, req coreau
 		Tried: req.Tried,
 	})
 	if decision.SelectedID == "" {
-		return coreauth.RoutePolicyDecision{}
+		return gettokensrouting.PolicyDecision{}
 	}
-	return coreauth.RoutePolicyDecision{
+	return gettokensrouting.PolicyDecision{
 		OrderIDs: channelRoutingOrderIDs(decision),
 		Reason:   "channel-routing:" + channel + ":" + string(cfg.RouteMode),
 	}
@@ -106,7 +108,7 @@ func channelRoutingPolicyConfigPath() (string, error) {
 	return filepath.Join(home, ".config", "gettokens-data", "channel-routing", "config.json"), nil
 }
 
-func channelRoutingChannelForRequest(req coreauth.RoutePolicyRequest) string {
+func channelRoutingChannelForRequest(req gettokensrouting.RouteContext) string {
 	provider := strings.ToLower(strings.TrimSpace(req.Provider))
 	switch provider {
 	case "codex", "claude":

@@ -1,0 +1,32 @@
+package gettokenshooks
+
+import (
+	"sync"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+)
+
+var installRoutingPoliciesOnce sync.Once
+
+// InstallRoutingPolicies installs GetTokens-owned routing policies.
+func InstallRoutingPolicies() {
+	installRoutingPoliciesOnce.Do(func() {
+		gettokensrouting.RegisterPolicy(channelRoutingPolicy())
+		gettokensrouting.RegisterPolicy(accountRouteGuardRoutingPolicy(nil))
+	})
+}
+
+func authCandidatesFromRouteContext(routeCtx gettokensrouting.RouteContext) []*coreauth.Auth {
+	out := make([]*coreauth.Auth, 0, len(routeCtx.Candidates))
+	for _, candidate := range routeCtx.Candidates {
+		if auth, ok := candidate.Value.(*coreauth.Auth); ok && auth != nil {
+			out = append(out, auth.Clone())
+			continue
+		}
+		if candidate.ID != "" {
+			out = append(out, &coreauth.Auth{ID: candidate.ID})
+		}
+	}
+	return out
+}

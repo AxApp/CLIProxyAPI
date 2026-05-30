@@ -170,6 +170,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if hasPendingAccountStoreRuntime(accounts) {
+		_ = h.applyPendingAccountStoreRuntime(c.Request.Context(), store)
+		accounts, err = store.ListAccounts(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
 }
 
@@ -266,7 +274,7 @@ func (h *Handler) CommitAccountMigration(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	_ = h.triggerAccountStoreApply(c.Request.Context())
+	_ = h.applyPendingAccountStoreRuntime(c.Request.Context(), store)
 	c.JSON(http.StatusOK, commit)
 }
 
@@ -356,7 +364,7 @@ func (h *Handler) DeleteLegacyAccountSources(c *gin.Context) {
 			return
 		}
 	}
-	_ = h.triggerAccountStoreApply(c.Request.Context())
+	_ = h.applyPendingAccountStoreRuntime(c.Request.Context(), store)
 	c.JSON(http.StatusOK, gin.H{"deleted": len(results), "items": results, "backup_dir": backupDir})
 }
 
@@ -385,6 +393,26 @@ func (h *Handler) triggerAccountStoreApply(ctx context.Context) error {
 		return nil
 	}
 	return h.accountStoreApply(ctx)
+}
+
+func (h *Handler) applyPendingAccountStoreRuntime(ctx context.Context, store *accountstore.Store) error {
+	if h == nil || h.accountStoreApply == nil || store == nil {
+		return nil
+	}
+	if err := h.accountStoreApply(ctx); err != nil {
+		_ = store.MarkPendingRuntimeApplyResults(ctx, "failed", err.Error())
+		return err
+	}
+	return store.MarkPendingRuntimeApplyResults(ctx, "applied", "")
+}
+
+func hasPendingAccountStoreRuntime(accounts []accountstore.AccountRecord) bool {
+	for _, account := range accounts {
+		if strings.TrimSpace(account.RuntimeApplyStatus) == "pending" {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) buildAccountMigrationReport(ctx context.Context, req accountMigrationRequest) (*accountstore.MigrationReport, error) {
