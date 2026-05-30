@@ -230,6 +230,30 @@ func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
 	}
 }
 
+func TestAuthByIndexMatchesAccountKey(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:         "codex-plus.json",
+		AccountKey: "acct_plus",
+		Provider:   "codex",
+		Metadata:   map[string]any{"type": "codex", "access_token": "token"},
+	}
+	if _, errRegister := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	h := &Handler{authManager: manager}
+	got := h.authByIndex("acct_plus")
+	if got == nil {
+		t.Fatal("expected auth by account key")
+	}
+	if got.ID != auth.ID {
+		t.Fatalf("authByIndex returned %q, want %q", got.ID, auth.ID)
+	}
+}
+
 func TestTokenValueFromMetadataSupportsNestedTokens(t *testing.T) {
 	t.Parallel()
 

@@ -412,7 +412,7 @@ func synthesizeAccountStoreAuthFile(ctx *SynthesisContext, account accountstore.
 	if fullPath == "" {
 		fullPath = account.AccountKey + ".json"
 	}
-	auths := SynthesizeAuthFile(ctx, fullPath, []byte(account.AuthFile.AuthJSON))
+	auths := synthesizeFileAuths(ctx, fullPath, []byte(account.AuthFile.AuthJSON), false)
 	for _, auth := range auths {
 		auth.AccountKey = account.AccountKey
 		auth.Disabled = account.Disabled

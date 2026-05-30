@@ -45,6 +45,56 @@ func TestConfigSynthesizer_Synthesize_NilConfig(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_SynthesizesAccountStoreAuthFilesWhenStoreOwnsCodex(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	created, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "Plus",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "codex-plus.json",
+			AuthJSON:       `{"type":"codex","access_token":"token","account_id":"acct_chatgpt","plan_type":"plus","email":"plus@example.com"}`,
+			AuthType:       "codex",
+			Email:          "plus@example.com",
+			PlanType:       "plus",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", auth.Provider)
+	}
+	if auth.AccountKey != created.AccountKey {
+		t.Fatalf("account key = %q, want %q", auth.AccountKey, created.AccountKey)
+	}
+	if got := auth.Metadata["access_token"]; got != "token" {
+		t.Fatalf("access token metadata = %#v, want token", got)
+	}
+}
+
 func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	tests := []struct {
 		name       string

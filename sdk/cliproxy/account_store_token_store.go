@@ -88,6 +88,12 @@ func authFileCredentialFromRuntimeAuth(auth *coreauth.Auth, existing *accountsto
 		return accountstore.AuthFileCredential{}, fmt.Errorf("auth is nil")
 	}
 	payload := map[string]any{}
+	if strings.TrimSpace(existingAuthFileValue(existing, "auth_json")) != "" {
+		_ = json.Unmarshal([]byte(existing.AuthJSON), &payload)
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
 	if auth.Metadata != nil {
 		for key, value := range auth.Metadata {
 			payload[key] = value
@@ -171,6 +177,8 @@ func existingAuthFileValue(existing *accountstore.AuthFileCredential, key string
 		return existing.Email
 	case "plan_type":
 		return existing.PlanType
+	case "auth_json":
+		return existing.AuthJSON
 	default:
 		return ""
 	}

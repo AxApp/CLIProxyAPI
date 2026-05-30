@@ -46,7 +46,7 @@ func TestAccountStoreTokenStoreSaveUpdatesSQLiteAuthJSON(t *testing.T) {
 		CredentialSource: accountstore.SourceLegacyAuthFile,
 		AuthFile: &accountstore.AuthFileCredential{
 			SourceFileName: "codex-user-plus.json",
-			AuthJSON:       `{"type":"codex","access_token":"old","refresh_token":"old-refresh","email":"user@example.com","plan_type":"plus"}`,
+			AuthJSON:       `{"type":"codex","access_token":"old","refresh_token":"old-refresh","email":"user@example.com","account_id":"acct_chatgpt","id_token":"id-token","plan_type":"plus"}`,
 			AuthType:       "codex",
 			Email:          "user@example.com",
 			PlanType:       "plus",
@@ -122,6 +122,12 @@ func TestAccountStoreTokenStoreSaveUpdatesSQLiteAuthJSON(t *testing.T) {
 	}
 	if !strings.Contains(updated.AuthFile.AuthJSON, `"plan_type":"plus"`) {
 		t.Fatalf("auth_json did not preserve plan_type: %s", updated.AuthFile.AuthJSON)
+	}
+	if !strings.Contains(updated.AuthFile.AuthJSON, `"account_id":"acct_chatgpt"`) {
+		t.Fatalf("auth_json did not preserve account_id: %s", updated.AuthFile.AuthJSON)
+	}
+	if !strings.Contains(updated.AuthFile.AuthJSON, `"id_token":"id-token"`) {
+		t.Fatalf("auth_json did not preserve id_token: %s", updated.AuthFile.AuthJSON)
 	}
 }
 
