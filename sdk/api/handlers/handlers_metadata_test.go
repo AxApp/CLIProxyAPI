@@ -83,14 +83,11 @@ func TestAttachCodexRequestMetadataForOpenAIResponses(t *testing.T) {
 	if !ok {
 		t.Fatalf("metadata[%s] = %T, want gettokenscodex.RequestContext", gettokenscodex.MetadataKey, raw)
 	}
-	if reqCtx.RequestKind != gettokenscodex.RequestKindSubagent || reqCtx.SubagentSource != "collab_spawn" {
-		t.Fatalf("codex context = %#v, want collab_spawn subagent", reqCtx)
+	if reqCtx.RequestKind != gettokenscodex.RequestKindMain || reqCtx.RequestedModel != "gpt-5.1" {
+		t.Fatalf("codex context = %#v, want main request context with requested model", reqCtx)
 	}
-	if got := meta[gettokenscodex.RequestKindMetadataKey]; got != string(gettokenscodex.RequestKindSubagent) {
-		t.Fatalf("request kind metadata = %v, want subagent", got)
-	}
-	if got := meta[gettokenscodex.SubagentSourceMetadataKey]; got != "collab_spawn" {
-		t.Fatalf("subagent source metadata = %v, want collab_spawn", got)
+	if got := meta[gettokenscodex.RequestKindMetadataKey]; got != string(gettokenscodex.RequestKindMain) {
+		t.Fatalf("request kind metadata = %v, want main", got)
 	}
 	if got := meta[gettokenscodex.SessionIDMetadataKey]; got != "session-1" {
 		t.Fatalf("session metadata = %v, want session-1", got)

@@ -12,14 +12,12 @@ import (
 type RequestKind string
 
 const (
-	RequestKindMain     RequestKind = "main"
-	RequestKindSubagent RequestKind = "subagent"
+	RequestKindMain RequestKind = "main"
 )
 
 const (
 	MetadataKey                    = "codex_request_context"
 	RequestKindMetadataKey         = "codex_request_kind"
-	SubagentSourceMetadataKey      = "codex_subagent_source"
 	SessionIDMetadataKey           = "codex_session_id"
 	ClientRequestIDMetadataKey     = "codex_client_request_id"
 	ThreadIDMetadataKey            = "codex_thread_id"
@@ -33,13 +31,11 @@ const (
 	maxClientRequestIDLength = 256
 	maxThreadIDLength        = 256
 	maxTurnIDLength          = 256
-	maxSubagentSourceLength  = 128
 	maxSmallFieldLength      = 64
 )
 
 type RequestContext struct {
 	RequestKind         RequestKind
-	SubagentSource      string
 	RequestedModel      string
 	SessionID           string
 	ClientRequestID     string
@@ -96,10 +92,6 @@ func ExtractRequestContext(headers http.Header, body []byte, fallbackModel strin
 		ctx.RequestedModel = boundedString(model, maxSessionIDLength)
 	}
 	if headers != nil {
-		ctx.SubagentSource = boundedString(headerValue(headers, "X-OpenAI-Subagent"), maxSubagentSourceLength)
-		if ctx.SubagentSource != "" {
-			ctx.RequestKind = RequestKindSubagent
-		}
 		ctx.SessionID = firstNonEmpty(
 			boundedString(headerValue(headers, "Session_id"), maxSessionIDLength),
 			boundedString(headerValue(headers, "Session-Id"), maxSessionIDLength),

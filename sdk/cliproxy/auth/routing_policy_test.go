@@ -20,8 +20,7 @@ func registerTestRoutingPolicy(policy gettokensrouting.Policy) func() {
 
 func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.T) {
 	codexCtx := gettokenscodex.RequestContext{
-		RequestKind:    gettokenscodex.RequestKindSubagent,
-		SubagentSource: "review",
+		RequestKind:    gettokenscodex.RequestKindMain,
 		RequestedModel: "gpt-5.1",
 	}
 	entries := []*scheduledAuth{{auth: &Auth{ID: "auth-a"}}}
@@ -32,8 +31,8 @@ func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.
 			if req.CodexRequest == nil {
 				t.Fatalf("RouteContext.CodexRequest = nil, want context")
 			}
-			if req.CodexRequest.SubagentSource != "review" {
-				t.Fatalf("RouteContext.CodexRequest.SubagentSource = %q, want review", req.CodexRequest.SubagentSource)
+			if req.CodexRequest.RequestedModel != "gpt-5.1" {
+				t.Fatalf("RouteContext.CodexRequest.RequestedModel = %q, want gpt-5.1", req.CodexRequest.RequestedModel)
 			}
 			return gettokensrouting.PolicyDecision{OrderIDs: []string{"auth-a"}, Reason: "codex context observed"}
 		},

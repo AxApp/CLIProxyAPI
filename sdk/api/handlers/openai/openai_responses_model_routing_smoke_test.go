@@ -23,7 +23,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
+func TestCodexModelRoutingResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	capturedHeaders := make(chan http.Header, 1)
@@ -46,9 +46,9 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	capturedRouteContext := make(chan gettokenscodex.RequestContext, 1)
 	unregisterPolicy := gettokensrouting.RegisterPolicy(gettokensrouting.Policy{
 		Stage: gettokensrouting.PolicyStageRequest,
-		Name:  "codex-subagent-http-smoke",
+		Name:  "codex-model-http-smoke",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model == "smoke-subagent-model" && req.CodexRequest != nil {
+			if req.Model == "smoke-model-route" && req.CodexRequest != nil {
 				capturedRouteContext <- *req.CodexRequest
 			}
 			return gettokensrouting.PolicyDecision{}
@@ -67,7 +67,7 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "smoke-subagent-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "smoke-model-route"}})
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
@@ -75,7 +75,7 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	router := gin.New()
 	router.POST("/v1/responses", h.Responses)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"smoke-subagent-model","input":[{"type":"message","id":"msg-in"}]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"smoke-model-route","input":[{"type":"message","id":"msg-in"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	setSmokeCodexHeaders(req.Header, "review")
 	req.Header.Set("Authorization", "Bearer inbound-should-not-forward")
@@ -94,8 +94,8 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	headers := waitSmokeHeaders(t, capturedHeaders)
 	body := waitSmokeBody(t, capturedBody)
 	assertSmokeUpstreamHeaders(t, headers, "review", "Bearer sk-smoke-http")
-	if got := gjson.GetBytes(body, "model").String(); got != "smoke-subagent-model" {
-		t.Fatalf("upstream body model = %q, want smoke-subagent-model; body=%s", got, body)
+	if got := gjson.GetBytes(body, "model").String(); got != "smoke-model-route" {
+		t.Fatalf("upstream body model = %q, want smoke-model-route; body=%s", got, body)
 	}
 	if got := gjson.GetBytes(body, "input.0.id").String(); got != "msg-in" {
 		t.Fatalf("upstream body input id = %q, want msg-in; body=%s", got, body)
@@ -103,8 +103,8 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 
 	select {
 	case routeCtx := <-capturedRouteContext:
-		if routeCtx.RequestKind != gettokenscodex.RequestKindSubagent || routeCtx.SubagentSource != "review" {
-			t.Fatalf("route codex context = %#v, want review subagent", routeCtx)
+		if routeCtx.RequestKind != gettokenscodex.RequestKindMain || routeCtx.RequestedModel != "smoke-model-route" {
+			t.Fatalf("route codex context = %#v, want main context with requested model", routeCtx)
 		}
 		if routeCtx.SessionID != "session-smoke" || routeCtx.ThreadID != "thread-smoke" || routeCtx.TurnID != "turn-smoke" {
 			t.Fatalf("route codex context ids = %#v, want session/thread/turn smoke ids", routeCtx)
@@ -114,7 +114,7 @@ func TestCodexSubagentResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	}
 }
 
-func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
+func TestCodexModelRoutingResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -151,9 +151,9 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	capturedRouteContext := make(chan gettokenscodex.RequestContext, 1)
 	unregisterPolicy := gettokensrouting.RegisterPolicy(gettokensrouting.Policy{
 		Stage: gettokensrouting.PolicyStageRequest,
-		Name:  "codex-subagent-ws-smoke",
+		Name:  "codex-model-ws-smoke",
 		Rewrite: func(ctx context.Context, req gettokensrouting.RouteContext) gettokensrouting.PolicyDecision {
-			if req.Model == "smoke-subagent-model-ws" && req.CodexRequest != nil {
+			if req.Model == "smoke-model-route-ws" && req.CodexRequest != nil {
 				capturedRouteContext <- *req.CodexRequest
 			}
 			return gettokensrouting.PolicyDecision{}
@@ -177,7 +177,7 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "smoke-subagent-model-ws"}})
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "smoke-model-route-ws"}})
 	t.Cleanup(func() {
 		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
 		wsExecutor.CloseExecutionSession(coreauth.CloseAllExecutionSessionsID)
@@ -201,7 +201,7 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	requestPayload := []byte(`{"type":"response.create","model":"smoke-subagent-model-ws","input":[{"type":"message","id":"msg-in-ws"}]}`)
+	requestPayload := []byte(`{"type":"response.create","model":"smoke-model-route-ws","input":[{"type":"message","id":"msg-in-ws"}]}`)
 	if err := conn.WriteMessage(websocket.TextMessage, requestPayload); err != nil {
 		t.Fatalf("write downstream websocket request: %v", err)
 	}
@@ -219,8 +219,8 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	if got := gjson.GetBytes(body, "type").String(); got != "response.create" {
 		t.Fatalf("upstream websocket body type = %q, want response.create; body=%s", got, body)
 	}
-	if got := gjson.GetBytes(body, "model").String(); got != "smoke-subagent-model-ws" {
-		t.Fatalf("upstream websocket body model = %q, want smoke-subagent-model-ws; body=%s", got, body)
+	if got := gjson.GetBytes(body, "model").String(); got != "smoke-model-route-ws" {
+		t.Fatalf("upstream websocket body model = %q, want smoke-model-route-ws; body=%s", got, body)
 	}
 	if got := gjson.GetBytes(body, "input.0.id").String(); got != "msg-in-ws" {
 		t.Fatalf("upstream websocket body input id = %q, want msg-in-ws; body=%s", got, body)
@@ -228,8 +228,8 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 
 	select {
 	case routeCtx := <-capturedRouteContext:
-		if routeCtx.RequestKind != gettokenscodex.RequestKindSubagent || routeCtx.SubagentSource != "collab_spawn" {
-			t.Fatalf("route codex context = %#v, want collab_spawn subagent", routeCtx)
+		if routeCtx.RequestKind != gettokenscodex.RequestKindMain || routeCtx.RequestedModel != "smoke-model-route-ws" {
+			t.Fatalf("route codex context = %#v, want main context with requested model", routeCtx)
 		}
 		if routeCtx.SessionID != "session-smoke" || routeCtx.ThreadID != "thread-smoke" || routeCtx.TurnID != "turn-smoke" {
 			t.Fatalf("route codex context ids = %#v, want session/thread/turn smoke ids", routeCtx)
@@ -239,7 +239,7 @@ func TestCodexSubagentResponsesWebSocketDownstreamUpstreamSmoke(t *testing.T) {
 	}
 }
 
-func setSmokeCodexHeaders(headers http.Header, subagent string) {
+func setSmokeCodexHeaders(headers http.Header, passthroughLabel string) {
 	headers.Set("Version", "0.133.0-smoke")
 	headers.Set("X-Codex-Installation-Id", "install-smoke")
 	headers.Set("X-Codex-Turn-State", "turn-state-smoke")
@@ -247,7 +247,7 @@ func setSmokeCodexHeaders(headers http.Header, subagent string) {
 	headers.Set("X-Client-Request-Id", "client-smoke")
 	headers.Set("X-Codex-Parent-Thread-Id", "parent-smoke")
 	headers.Set("X-Codex-Window-Id", "window-smoke")
-	headers.Set("X-OpenAI-Subagent", subagent)
+	headers.Set("X-OpenAI-Subagent", passthroughLabel)
 	headers.Set("X-OpenAI-Memgen-Request", "memgen-smoke")
 	headers.Set("X-OAI-Attestation", "attestation-smoke")
 	headers.Set("Session_id", "session-smoke")
@@ -255,7 +255,7 @@ func setSmokeCodexHeaders(headers http.Header, subagent string) {
 	headers.Set("Thread-Id", "thread-smoke")
 }
 
-func assertSmokeUpstreamHeaders(t *testing.T, headers http.Header, subagent string, authorization string) {
+func assertSmokeUpstreamHeaders(t *testing.T, headers http.Header, passthroughLabel string, authorization string) {
 	t.Helper()
 	want := map[string]string{
 		"Authorization":            authorization,
@@ -265,7 +265,7 @@ func assertSmokeUpstreamHeaders(t *testing.T, headers http.Header, subagent stri
 		"X-Client-Request-Id":      "client-smoke",
 		"X-Codex-Parent-Thread-Id": "parent-smoke",
 		"X-Codex-Window-Id":        "window-smoke",
-		"X-OpenAI-Subagent":        subagent,
+		"X-OpenAI-Subagent":        passthroughLabel,
 		"X-OpenAI-Memgen-Request":  "memgen-smoke",
 		"X-OAI-Attestation":        "attestation-smoke",
 		"Session-Id":               "session-dash-smoke",

@@ -267,9 +267,6 @@ func attachCodexRequestMetadata(meta map[string]any, headers http.Header, rawJSO
 	reqCtx := gettokenscodex.ExtractRequestContext(headers, rawJSON, modelName)
 	meta[gettokenscodex.MetadataKey] = reqCtx
 	meta[gettokenscodex.RequestKindMetadataKey] = string(reqCtx.RequestKind)
-	if reqCtx.SubagentSource != "" {
-		meta[gettokenscodex.SubagentSourceMetadataKey] = reqCtx.SubagentSource
-	}
 	if reqCtx.SessionID != "" {
 		meta[gettokenscodex.SessionIDMetadataKey] = reqCtx.SessionID
 	}

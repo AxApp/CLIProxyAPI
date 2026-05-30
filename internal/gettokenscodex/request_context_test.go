@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestExtractRequestContextSubagentAndTurnMetadata(t *testing.T) {
+func TestExtractRequestContextUsesModelAndIgnoresSubagentForRoutingContext(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("X-OpenAI-Subagent", " review ")
 	headers.Set("Session_id", "session-header")
@@ -19,11 +19,8 @@ func TestExtractRequestContextSubagentAndTurnMetadata(t *testing.T) {
 
 	got := ExtractRequestContext(headers, body, "fallback-model")
 
-	if got.RequestKind != RequestKindSubagent {
-		t.Fatalf("RequestKind = %q, want %q", got.RequestKind, RequestKindSubagent)
-	}
-	if got.SubagentSource != "review" {
-		t.Fatalf("SubagentSource = %q, want review", got.SubagentSource)
+	if got.RequestKind != RequestKindMain {
+		t.Fatalf("RequestKind = %q, want %q", got.RequestKind, RequestKindMain)
 	}
 	if got.RequestedModel != "gpt-5.1" {
 		t.Fatalf("RequestedModel = %q, want gpt-5.1", got.RequestedModel)
@@ -75,9 +72,6 @@ func TestExtractRequestContextMainRequestAndMalformedMetadata(t *testing.T) {
 
 	if got.RequestKind != RequestKindMain {
 		t.Fatalf("RequestKind = %q, want %q", got.RequestKind, RequestKindMain)
-	}
-	if got.SubagentSource != "" {
-		t.Fatalf("SubagentSource = %q, want empty", got.SubagentSource)
 	}
 	if got.RequestedModel != "fallback-model" {
 		t.Fatalf("RequestedModel = %q, want fallback-model", got.RequestedModel)
