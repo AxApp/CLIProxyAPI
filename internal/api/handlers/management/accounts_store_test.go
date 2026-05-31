@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 )
 
 func TestAccountMigrationDryRunAndCommitEndpoints(t *testing.T) {
@@ -157,6 +158,13 @@ func TestAccountsCRUDEndpointsPreserveAccountKeyOnPatch(t *testing.T) {
 		applyCalls++
 		return nil
 	})
+	statusCalls := 0
+	var statusHookDisabled bool
+	h.SetAccountStoreStatusHook(func(_ context.Context, account accountstore.AccountRecord) error {
+		statusCalls++
+		statusHookDisabled = account.Disabled
+		return nil
+	})
 
 	router := gin.New()
 	router.POST("/v0/management/accounts", h.CreateAccount)
@@ -254,6 +262,25 @@ func TestAccountsCRUDEndpointsPreserveAccountKeyOnPatch(t *testing.T) {
 	router.ServeHTTP(statusRecorder, httptest.NewRequest(http.MethodPatch, "/v0/management/accounts/"+created.AccountKey+"/status", bytes.NewReader([]byte(`{"disabled":false}`))))
 	if statusRecorder.Code != http.StatusOK {
 		t.Fatalf("status status = %d body=%s", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	var statusPatched struct {
+		Disabled bool   `json:"disabled"`
+		Apply    string `json:"runtime_apply_status"`
+	}
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &statusPatched); err != nil {
+		t.Fatalf("unmarshal status patch: %v", err)
+	}
+	if statusPatched.Disabled {
+		t.Fatalf("status patch disabled = true, want false")
+	}
+	if statusPatched.Apply != "applied" {
+		t.Fatalf("status patch runtime apply = %q, want previous applied state", statusPatched.Apply)
+	}
+	if applyCalls != 2 {
+		t.Fatalf("status patch should not trigger runtime apply, calls=%d want 2", applyCalls)
+	}
+	if statusCalls != 1 || statusHookDisabled {
+		t.Fatalf("status hook calls=%d disabled=%v, want one enabled status sync", statusCalls, statusHookDisabled)
 	}
 
 	priorityRecorder := httptest.NewRecorder()

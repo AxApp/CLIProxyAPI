@@ -522,6 +522,67 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 }
 
+func TestSetAccountStatusOnlyUpdatesDisabledWithoutRuntimeApply(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	created, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Primary",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		Priority:         1,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:            "sk-old",
+			APIKeyFingerprint: "old-fp",
+			BaseURL:           "https://api.example.com/v1",
+			Websockets:        true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	if err := store.MarkRuntimeApplyResult(ctx, created.AccountKey, created.Revision, "applied", ""); err != nil {
+		t.Fatalf("MarkRuntimeApplyResult: %v", err)
+	}
+
+	disabled, err := store.SetAccountStatus(ctx, created.AccountKey, true)
+	if err != nil {
+		t.Fatalf("SetAccountStatus: %v", err)
+	}
+	if !disabled.Disabled {
+		t.Fatal("disabled flag = false, want true")
+	}
+	if disabled.Revision != created.Revision {
+		t.Fatalf("revision = %d, want unchanged %d", disabled.Revision, created.Revision)
+	}
+	if disabled.RuntimeApplyStatus != "applied" {
+		t.Fatalf("runtime apply status = %q, want applied", disabled.RuntimeApplyStatus)
+	}
+
+	enabled, err := store.SetAccountStatus(ctx, created.AccountKey, false)
+	if err != nil {
+		t.Fatalf("SetAccountStatus enable: %v", err)
+	}
+	if enabled.Disabled {
+		t.Fatal("disabled flag = true, want false")
+	}
+	if enabled.Revision != created.Revision {
+		t.Fatalf("enable revision = %d, want unchanged %d", enabled.Revision, created.Revision)
+	}
+	if enabled.RuntimeApplyStatus != "applied" {
+		t.Fatalf("enable runtime apply status = %q, want applied", enabled.RuntimeApplyStatus)
+	}
+}
+
 func TestUpdateAuthFileCredentialUpdatesAuthJSONWithoutChangingRevision(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

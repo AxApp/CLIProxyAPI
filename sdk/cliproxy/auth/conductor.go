@@ -1197,6 +1197,40 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// SetRouteDisabled toggles the operator-disabled route state without persisting
+// the auth credential payload. Account-store status changes already persist the
+// card state in SQLite and only need the in-memory pool membership to follow.
+func (m *Manager) SetRouteDisabled(id string, disabled bool) (*Auth, bool) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	auth, ok := m.auths[id]
+	if !ok || auth == nil {
+		m.mu.Unlock()
+		return nil, false
+	}
+	next := auth.Clone()
+	next.Disabled = disabled
+	if disabled {
+		next.Status = StatusDisabled
+		if strings.TrimSpace(next.StatusMessage) == "" {
+			next.StatusMessage = "account disabled"
+		}
+	} else if next.Status == StatusDisabled {
+		next.Status = StatusActive
+		next.StatusMessage = ""
+	}
+	next.UpdatedAt = time.Now().UTC()
+	m.auths[id] = next.Clone()
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(next)
+	}
+	m.queueRefreshReschedule(id)
+	return next.Clone(), true
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()

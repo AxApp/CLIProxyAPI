@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -387,6 +388,31 @@ func (s *Service) applyRouteGuardForAuthUpdate(auth *coreauth.Auth, wasRouteable
 	if wasRouteable && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		closeCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
 	}
+}
+
+func (s *Service) applyAccountStoreStatusChange(_ context.Context, account accountstore.AccountRecord) error {
+	if s == nil || s.coreManager == nil || strings.TrimSpace(account.AccountKey) == "" {
+		return nil
+	}
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.AccountKey), strings.TrimSpace(account.AccountKey)) {
+			continue
+		}
+		wasRouteable := !auth.Disabled && auth.Status != coreauth.StatusDisabled
+		updated, ok := s.coreManager.SetRouteDisabled(auth.ID, account.Disabled)
+		if ok && updated != nil {
+			auth = updated
+		}
+		if account.Disabled {
+			gettokenshooks.MarkManualDisabledAuth(auth, "account disabled")
+			if wasRouteable && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+				closeCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
+			}
+			continue
+		}
+		gettokenshooks.ClearManualDisabledAuth(auth)
+	}
+	return nil
 }
 
 func (s *Service) applyRetryConfig(cfg *config.Config) {
@@ -850,6 +876,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.server != nil {
 		s.server.SetAccountStoreApplyHook(func(ctx context.Context) error {
 			return s.refreshAccountStoreAuths(ctx)
+		})
+		s.server.SetAccountStoreStatusHook(func(ctx context.Context, account accountstore.AccountRecord) error {
+			return s.applyAccountStoreStatusChange(ctx, account)
 		})
 	}
 

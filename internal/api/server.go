@@ -30,6 +30,7 @@ import (
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
@@ -354,6 +355,13 @@ func (s *Server) SetAccountStoreApplyHook(hook func(context.Context) error) {
 		return
 	}
 	s.mgmt.SetAccountStoreApplyHook(hook)
+}
+
+func (s *Server) SetAccountStoreStatusHook(hook func(context.Context, accountstore.AccountRecord) error) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetAccountStoreStatusHook(hook)
 }
 
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {

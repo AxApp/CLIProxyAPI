@@ -131,7 +131,7 @@ func (h *Handler) PatchAccountStatus(c *gin.Context) {
 		writeAccountStoreError(c, err)
 		return
 	}
-	account = h.applyAccountStoreRuntime(c.Request.Context(), store, account)
+	_ = h.triggerAccountStoreStatusChange(c.Request.Context(), account)
 	c.JSON(http.StatusOK, account)
 }
 
@@ -386,6 +386,13 @@ func (h *Handler) applyAccountStoreRuntime(ctx context.Context, store *accountst
 		return refreshed
 	}
 	return account
+}
+
+func (h *Handler) triggerAccountStoreStatusChange(ctx context.Context, account accountstore.AccountRecord) error {
+	if h == nil || h.accountStoreStatus == nil || account.AccountKey == "" {
+		return nil
+	}
+	return h.accountStoreStatus(ctx, account)
 }
 
 func (h *Handler) triggerAccountStoreApply(ctx context.Context) error {

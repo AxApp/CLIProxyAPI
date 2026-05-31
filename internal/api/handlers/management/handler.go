@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -49,6 +50,7 @@ type Handler struct {
 	postAuthHook        coreauth.PostAuthHook
 	accountStorePath    string
 	accountStoreApply   func(context.Context) error
+	accountStoreStatus  func(context.Context, accountstore.AccountRecord) error
 }
 
 // NewHandler creates a new management handler instance.
@@ -158,6 +160,13 @@ func (h *Handler) SetAccountStoreApplyHook(hook func(context.Context) error) {
 		return
 	}
 	h.accountStoreApply = hook
+}
+
+func (h *Handler) SetAccountStoreStatusHook(hook func(context.Context, accountstore.AccountRecord) error) {
+	if h == nil {
+		return
+	}
+	h.accountStoreStatus = hook
 }
 
 // Middleware enforces access control for management endpoints.

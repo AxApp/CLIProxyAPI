@@ -192,9 +192,31 @@ func (s *Store) GetAccount(ctx context.Context, accountKey string) (AccountRecor
 }
 
 func (s *Store) SetAccountStatus(ctx context.Context, accountKey string, disabled bool) (AccountRecord, error) {
-	return s.updateAccountCardOnly(ctx, accountKey, func(current AccountRecord) (string, int, bool) {
-		return current.Title, current.Priority, disabled
-	})
+	if s == nil || s.db == nil {
+		return AccountRecord{}, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return AccountRecord{}, fmt.Errorf("invalid account key %q", accountKey)
+	}
+	now := unixMs()
+	result, err := s.db.ExecContext(ctx, `
+UPDATE account_cards
+SET disabled = ?, updated_at_unix_ms = ?
+WHERE account_key = ? AND deleted_at_unix_ms IS NULL`,
+		boolInt(disabled),
+		now,
+		accountKey,
+	)
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("update account status %s: %w", accountKey, err)
+	}
+	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
+		return AccountRecord{}, fmt.Errorf("account %s not found", accountKey)
+	}
+	return s.GetAccount(ctx, accountKey)
 }
 
 func (s *Store) SetAccountPriority(ctx context.Context, accountKey string, priority int) (AccountRecord, error) {
