@@ -170,6 +170,7 @@ type CodexLiveSessionIdentity struct {
 	ClientRequestID string
 	PromptCacheKey  string
 	CodexWindowID   string
+	ProjectName     string
 }
 
 type CodexLiveRequestStart struct {
@@ -178,6 +179,7 @@ type CodexLiveRequestStart struct {
 	ClientRequestID     string
 	PromptCacheKey      string
 	CodexWindowID       string
+	ProjectName         string
 	Model               string
 	AuthID              string
 	AuthLabel           string
@@ -347,6 +349,9 @@ func ExtractCodexLiveSessionIdentity(headers http.Header, payload []byte) CodexL
 		identity.ClientRequestID = strings.TrimSpace(headers.Get("x-client-request-id"))
 		identity.CodexWindowID = strings.TrimSpace(headers.Get("x-codex-window-id"))
 		identity.ConversationID = strings.TrimSpace(headers.Get("session_id"))
+		turnMetadata := parseCodexTurnMetadata(headers.Get("x-codex-turn-metadata"))
+		identity.ConversationID = firstNonEmptyString(identity.ConversationID, turnMetadata.SessionID, turnMetadata.ThreadID)
+		identity.ProjectName = turnMetadata.ProjectName
 	}
 	if len(payload) > 0 {
 		if identity.PromptCacheKey == "" {
@@ -366,6 +371,39 @@ func ExtractCodexLiveSessionIdentity(headers http.Header, payload []byte) CodexL
 		identity.ClientRequestID,
 	)
 	return identity
+}
+
+type codexTurnMetadataIdentity struct {
+	SessionID   string
+	ThreadID    string
+	ProjectName string
+}
+
+func parseCodexTurnMetadata(raw string) codexTurnMetadataIdentity {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !gjson.Valid(raw) {
+		return codexTurnMetadataIdentity{}
+	}
+	workspaces := gjson.Get(raw, "workspaces").Map()
+	workspacePaths := make([]string, 0, len(workspaces))
+	for workspacePath := range workspaces {
+		if strings.TrimSpace(workspacePath) != "" {
+			workspacePaths = append(workspacePaths, workspacePath)
+		}
+	}
+	sort.Strings(workspacePaths)
+	projectName := ""
+	for _, workspacePath := range workspacePaths {
+		if candidate := liveSessionPathBase(workspacePath); candidate != "" {
+			projectName = candidate
+			break
+		}
+	}
+	return codexTurnMetadataIdentity{
+		SessionID:   strings.TrimSpace(gjson.Get(raw, "session_id").String()),
+		ThreadID:    strings.TrimSpace(gjson.Get(raw, "thread_id").String()),
+		ProjectName: projectName,
+	}
 }
 
 func currentLiveSessionTracker() *liveSessionTracker {
@@ -451,6 +489,7 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 		ClientRequestID: input.ClientRequestID,
 		PromptCacheKey:  input.PromptCacheKey,
 		CodexWindowID:   input.CodexWindowID,
+		ProjectName:     input.ProjectName,
 	}
 	downstream := firstNonEmptyString(strings.TrimSpace(input.DownstreamTransport), "http")
 	upstream := firstNonEmptyString(strings.TrimSpace(input.UpstreamTransport), "unknown")
@@ -979,6 +1018,9 @@ func (t *liveSessionTracker) ensureSessionForIdentityLocked(fallbackSessionID st
 	if identity.CodexWindowID != "" {
 		session.session.CodexWindowID = identity.CodexWindowID
 	}
+	if identity.ProjectName != "" {
+		session.session.ProjectName = identity.ProjectName
+	}
 	return session
 }
 
@@ -1012,6 +1054,7 @@ func normalizeCodexLiveSessionIdentity(identity CodexLiveSessionIdentity) CodexL
 	identity.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
 	identity.PromptCacheKey = strings.TrimSpace(identity.PromptCacheKey)
 	identity.CodexWindowID = strings.TrimSpace(identity.CodexWindowID)
+	identity.ProjectName = strings.TrimSpace(identity.ProjectName)
 	identity.ConversationID = firstNonEmptyString(
 		identity.ConversationID,
 		identity.PromptCacheKey,

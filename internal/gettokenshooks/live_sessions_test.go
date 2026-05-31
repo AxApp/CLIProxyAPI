@@ -646,6 +646,39 @@ func TestExtractCodexLiveSessionIdentityPrefersCodexConversationFields(t *testin
 	}
 }
 
+func TestExtractCodexLiveSessionIdentityDerivesProjectNameFromTurnMetadataWorkspaces(t *testing.T) {
+	headers := http.Header{
+		"X-Codex-Turn-Metadata": []string{`{"session_id":"session-1","thread_id":"thread-1","workspaces":{"/Users/linhey/Desktop/FlowUp-Libs/Overloaded-v2":{"has_changes":false}}}`},
+	}
+
+	identity := ExtractCodexLiveSessionIdentity(headers, nil)
+	if identity.ProjectName != "Overloaded-v2" {
+		t.Fatalf("projectName = %q, want Overloaded-v2", identity.ProjectName)
+	}
+	if identity.ConversationID != "session-1" {
+		t.Fatalf("conversationID = %q, want session-1", identity.ConversationID)
+	}
+}
+
+func TestLiveSessionsSnapshotUsesProjectNameFromTurnMetadata(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+	headers := http.Header{
+		"X-Codex-Turn-Metadata": []string{`{"session_id":"session-live","thread_id":"thread-live","workspaces":{"/Users/linhey/Desktop/FlowUp-Libs/Overloaded-v2":{"has_changes":false}}}`},
+	}
+	identity := ExtractCodexLiveSessionIdentity(headers, nil)
+
+	RecordDownstreamWebsocketConnected("passthrough-1", "127.0.0.1")
+	RecordDownstreamWebsocketRequest("passthrough-1", "ws-req-1", "gpt-5.5", identity)
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if got := snapshot.Sessions[0].ProjectName; got != "Overloaded-v2" {
+		t.Fatalf("projectName = %q, want Overloaded-v2", got)
+	}
+}
+
 func resetLiveSessionTrackerForTest(t *testing.T) {
 	t.Helper()
 	liveSessionsMu.Lock()
