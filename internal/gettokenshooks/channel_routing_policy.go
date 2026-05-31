@@ -17,14 +17,11 @@ type channelRoutingPolicyStore struct {
 }
 
 type channelRoutingPolicyConfig struct {
-	Channel                      string                                        `json:"channel"`
-	RouteMode                    gettokensrouting.ChannelRouteMode             `json:"routeMode"`
-	OrderedAccountIDs            []string                                      `json:"orderedAccountIDs"`
-	AccountGroups                []channelRoutingPolicyAccountGroup            `json:"accountGroups,omitempty"`
-	ChannelGroupStates           map[string]gettokensrouting.ChannelGroupState `json:"channelGroupStates"`
-	ProjectBindings              []gettokensrouting.ProjectBinding             `json:"projectBindings"`
-	ProjectModeFallbackRouteMode gettokensrouting.ChannelRouteMode             `json:"projectModeFallbackRouteMode"`
-	FallbackMode                 gettokensrouting.ChannelFallbackMode          `json:"fallbackMode"`
+	Channel            string                                        `json:"channel"`
+	RouteMode          gettokensrouting.ChannelRouteMode             `json:"routeMode"`
+	OrderedAccountIDs  []string                                      `json:"orderedAccountIDs"`
+	AccountGroups      []channelRoutingPolicyAccountGroup            `json:"accountGroups,omitempty"`
+	ChannelGroupStates map[string]gettokensrouting.ChannelGroupState `json:"channelGroupStates"`
 }
 
 type channelRoutingPolicyAccountGroup struct {
@@ -55,13 +52,10 @@ func rewriteChannelRoutingCandidates(_ context.Context, req gettokensrouting.Rou
 	}
 	accounts, groups := channelRoutingSnapshots(authCandidatesFromRouteContext(req), cfg)
 	decision := gettokensrouting.DecideChannelRoute(accounts, groups, gettokensrouting.ChannelRoutingConfig{
-		Channel:                      channel,
-		RouteMode:                    cfg.RouteMode,
-		OrderedAccountIDs:            cfg.OrderedAccountIDs,
-		ChannelGroupStates:           cfg.ChannelGroupStates,
-		ProjectBindings:              cfg.ProjectBindings,
-		ProjectModeFallbackRouteMode: cfg.ProjectModeFallbackRouteMode,
-		FallbackMode:                 cfg.FallbackMode,
+		Channel:            channel,
+		RouteMode:          cfg.RouteMode,
+		OrderedAccountIDs:  cfg.OrderedAccountIDs,
+		ChannelGroupStates: cfg.ChannelGroupStates,
 	}, gettokensrouting.ChannelRouteRequest{
 		Tried: req.Tried,
 	})

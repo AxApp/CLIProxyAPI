@@ -20,16 +20,14 @@ func TestChannelRoutingPolicySelectsBalancedAccountWithoutRoutingStrategy(t *tes
 	if err := os.WriteFile(configPath, []byte(`{
   "channels": {
     "codex": {
-      "channel": "codex",
-      "routeMode": "balanced",
-      "orderedAccountIDs": ["auth-a", "auth-b"],
-      "channelGroupStates": {},
-      "projectBindings": [],
-      "projectModeFallbackRouteMode": "sequential",
-      "fallbackMode": "fail-closed"
-    }
-  }
-}`), 0o600); err != nil {
+	      "channel": "codex",
+	      "routeMode": "balanced",
+	      "orderedAccountIDs": ["auth-a", "auth-b"],
+	      "channelGroupStates": {},
+	      "accountGroups": []
+	    }
+	  }
+	}`), 0o600); err != nil {
 		t.Fatalf("write channel routing config: %v", err)
 	}
 

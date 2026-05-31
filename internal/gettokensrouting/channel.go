@@ -11,15 +11,6 @@ type ChannelRouteMode string
 const (
 	ChannelRouteModeSequential ChannelRouteMode = "sequential"
 	ChannelRouteModeBalanced   ChannelRouteMode = "balanced"
-	ChannelRouteModeProject    ChannelRouteMode = "project"
-)
-
-type ChannelFallbackMode string
-
-const (
-	ChannelFallbackModeFailClosed      ChannelFallbackMode = "fail-closed"
-	ChannelFallbackModeFallbackDefault ChannelFallbackMode = "fallback-default"
-	ChannelFallbackModeFallbackGlobal  ChannelFallbackMode = "fallback-global"
 )
 
 type AccountSnapshot struct {
@@ -42,26 +33,15 @@ type ChannelGroupState struct {
 	RouteOrder *int
 }
 
-type ProjectBinding struct {
-	ProjectName  string
-	TargetType   string
-	TargetID     string
-	FallbackMode ChannelFallbackMode
-}
-
 type ChannelRoutingConfig struct {
-	Channel                      string
-	RouteMode                    ChannelRouteMode
-	OrderedAccountIDs            []string
-	ChannelGroupStates           map[string]ChannelGroupState
-	ProjectBindings              []ProjectBinding
-	ProjectModeFallbackRouteMode ChannelRouteMode
-	FallbackMode                 ChannelFallbackMode
+	Channel            string
+	RouteMode          ChannelRouteMode
+	OrderedAccountIDs  []string
+	ChannelGroupStates map[string]ChannelGroupState
 }
 
 type ChannelRouteRequest struct {
-	ProjectName string
-	Tried       map[string]struct{}
+	Tried map[string]struct{}
 }
 
 type ChannelRouteDecision struct {
@@ -81,11 +61,6 @@ type FilteredAccount struct {
 	Reason    string
 }
 
-type routeScope struct {
-	AccountID string
-	GroupID   string
-}
-
 type routeSortKey struct {
 	GroupOrder   int
 	AccountOrder int
@@ -96,36 +71,11 @@ type routeSortKey struct {
 func DecideChannelRoute(accounts []AccountSnapshot, groups []AccountGroupSnapshot, cfg ChannelRoutingConfig, req ChannelRouteRequest) ChannelRouteDecision {
 	mode := normalizeChannelRouteMode(cfg.RouteMode, ChannelRouteModeSequential)
 	steps := []string{"mode:" + string(mode)}
-	scope := routeScope{}
-	if mode == ChannelRouteModeProject {
-		binding, ok := matchProjectBinding(cfg.ProjectBindings, req.ProjectName)
-		if !ok {
-			steps = append(steps, "project:miss")
-			mode = normalizeChannelRouteMode(cfg.ProjectModeFallbackRouteMode, ChannelRouteModeSequential)
-		} else {
-			steps = append(steps, "project:hit:"+binding.ProjectName)
-			if binding.TargetType == "account" {
-				scope.AccountID = strings.TrimSpace(binding.TargetID)
-			} else if binding.TargetType == "group" {
-				scope.GroupID = strings.TrimSpace(binding.TargetID)
-			}
-			mode = normalizeChannelRouteMode(cfg.ProjectModeFallbackRouteMode, ChannelRouteModeSequential)
-			if mode == ChannelRouteModeProject {
-				mode = ChannelRouteModeSequential
-			}
-			decision := decideScopedRoute(accounts, groups, cfg, req, scope, mode, steps)
-			if decision.SelectedID != "" || normalizeFallbackMode(binding.FallbackMode, cfg.FallbackMode) == ChannelFallbackModeFailClosed {
-				return decision
-			}
-			steps = append(decision.Steps, "project:fallback-default")
-			scope = routeScope{}
-		}
-	}
-	return decideScopedRoute(accounts, groups, cfg, req, scope, mode, steps)
+	return decideScopedRoute(accounts, groups, cfg, req, mode, steps)
 }
 
-func decideScopedRoute(accounts []AccountSnapshot, groups []AccountGroupSnapshot, cfg ChannelRoutingConfig, req ChannelRouteRequest, scope routeScope, mode ChannelRouteMode, steps []string) ChannelRouteDecision {
-	candidates, filtered := BuildRouteablePool(accounts, groups, cfg, req, scope)
+func decideScopedRoute(accounts []AccountSnapshot, groups []AccountGroupSnapshot, cfg ChannelRoutingConfig, req ChannelRouteRequest, mode ChannelRouteMode, steps []string) ChannelRouteDecision {
+	candidates, filtered := BuildRouteablePool(accounts, groups, cfg, req)
 	steps = append(steps, "candidates:"+strconv.Itoa(len(candidates)))
 	var selected string
 	switch normalizeChannelRouteMode(mode, ChannelRouteModeSequential) {
@@ -142,7 +92,7 @@ func decideScopedRoute(accounts []AccountSnapshot, groups []AccountGroupSnapshot
 	}
 }
 
-func BuildRouteablePool(accounts []AccountSnapshot, groups []AccountGroupSnapshot, cfg ChannelRoutingConfig, req ChannelRouteRequest, scope routeScope) ([]RouteableCandidate, []FilteredAccount) {
+func BuildRouteablePool(accounts []AccountSnapshot, groups []AccountGroupSnapshot, cfg ChannelRoutingConfig, req ChannelRouteRequest) ([]RouteableCandidate, []FilteredAccount) {
 	groupLookup := map[string]AccountGroupSnapshot{}
 	for _, group := range groups {
 		id := strings.TrimSpace(group.ID)
@@ -160,10 +110,6 @@ func BuildRouteablePool(accounts []AccountSnapshot, groups []AccountGroupSnapsho
 		if account.ID == "" {
 			continue
 		}
-		if scope.AccountID != "" && account.ID != scope.AccountID {
-			filtered = append(filtered, FilteredAccount{AccountID: account.ID, Reason: "scope-account"})
-			continue
-		}
 		if _, tried := req.Tried[account.ID]; tried {
 			filtered = append(filtered, FilteredAccount{AccountID: account.ID, Reason: "tried"})
 			continue
@@ -176,7 +122,7 @@ func BuildRouteablePool(accounts []AccountSnapshot, groups []AccountGroupSnapsho
 			filtered = append(filtered, FilteredAccount{AccountID: account.ID, Reason: "account-unrequestable"})
 			continue
 		}
-		groupID, groupOrder, ok := effectiveGroupForAccount(account, groupLookup, cfg.ChannelGroupStates, scope.GroupID)
+		groupID, groupOrder, ok := effectiveGroupForAccount(account, groupLookup, cfg.ChannelGroupStates)
 		if !ok {
 			filtered = append(filtered, FilteredAccount{AccountID: account.ID, Reason: "group-disabled-or-missing"})
 			continue
@@ -196,15 +142,8 @@ func BuildRouteablePool(accounts []AccountSnapshot, groups []AccountGroupSnapsho
 	return candidates, filtered
 }
 
-func effectiveGroupForAccount(account AccountSnapshot, groups map[string]AccountGroupSnapshot, channelStates map[string]ChannelGroupState, targetGroupID string) (string, int, bool) {
+func effectiveGroupForAccount(account AccountSnapshot, groups map[string]AccountGroupSnapshot, channelStates map[string]ChannelGroupState) (string, int, bool) {
 	groupIDs := normalizeIDs(account.GroupIDs)
-	if targetGroupID != "" {
-		targetGroupID = strings.TrimSpace(targetGroupID)
-		if !containsID(groupIDs, targetGroupID) {
-			return "", 0, false
-		}
-		return effectiveGroupOrder(targetGroupID, groups, channelStates)
-	}
 	if len(groupIDs) == 0 {
 		return "", 0, true
 	}
@@ -300,42 +239,11 @@ func lookupRank(ranks map[string]int, id string) int {
 	return 1_000_000
 }
 
-func matchProjectBinding(bindings []ProjectBinding, projectName string) (ProjectBinding, bool) {
-	projectName = strings.TrimSpace(projectName)
-	if projectName == "" {
-		return ProjectBinding{}, false
-	}
-	for _, binding := range bindings {
-		if strings.TrimSpace(binding.ProjectName) == projectName {
-			return binding, true
-		}
-	}
-	return ProjectBinding{}, false
-}
-
 func normalizeChannelRouteMode(mode ChannelRouteMode, fallback ChannelRouteMode) ChannelRouteMode {
 	switch mode {
-	case ChannelRouteModeSequential, ChannelRouteModeBalanced, ChannelRouteModeProject:
+	case ChannelRouteModeSequential, ChannelRouteModeBalanced:
 		return mode
 	default:
 		return fallback
 	}
-}
-
-func normalizeFallbackMode(mode ChannelFallbackMode, fallback ChannelFallbackMode) ChannelFallbackMode {
-	switch mode {
-	case ChannelFallbackModeFailClosed, ChannelFallbackModeFallbackDefault, ChannelFallbackModeFallbackGlobal:
-		return mode
-	default:
-		return fallback
-	}
-}
-
-func containsID(ids []string, target string) bool {
-	for _, id := range ids {
-		if id == target {
-			return true
-		}
-	}
-	return false
 }

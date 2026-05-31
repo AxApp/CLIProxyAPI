@@ -51,13 +51,10 @@ func TestDecideChannelRouteBalancedUsesSessionCountThenOrder(t *testing.T) {
 	}
 }
 
-func TestDecideChannelRouteProjectBindingGroupDelegatesToBalanced(t *testing.T) {
+func TestDecideChannelRouteDropsLegacyProjectMode(t *testing.T) {
 	cfg := ChannelRoutingConfig{
-		RouteMode:                    ChannelRouteModeProject,
-		ProjectModeFallbackRouteMode: ChannelRouteModeBalanced,
-		ProjectBindings: []ProjectBinding{
-			{ProjectName: "repo-a", TargetType: "group", TargetID: "group-pro", FallbackMode: ChannelFallbackModeFailClosed},
-		},
+		RouteMode:         "project",
+		OrderedAccountIDs: []string{"auth-other", "auth-light", "auth-heavy"},
 	}
 	accounts := []AccountSnapshot{
 		{ID: "auth-heavy", Enabled: true, Requestable: true, GroupIDs: []string{"group-pro"}, ActiveSessions: 10},
@@ -69,52 +66,16 @@ func TestDecideChannelRouteProjectBindingGroupDelegatesToBalanced(t *testing.T) 
 		{ID: "group-default", Enabled: true},
 	}
 
-	decision := DecideChannelRoute(accounts, groups, cfg, ChannelRouteRequest{ProjectName: "repo-a"})
+	decision := DecideChannelRoute(accounts, groups, cfg, ChannelRouteRequest{})
 
-	if decision.SelectedID != "auth-light" {
-		t.Fatalf("selected = %q, want auth-light", decision.SelectedID)
+	if decision.SelectedID != "auth-other" {
+		t.Fatalf("selected = %q, want auth-other from normalized sequential route", decision.SelectedID)
 	}
-	assertRouteableIDs(t, decision.Candidates, []string{"auth-heavy", "auth-light"})
-	assertFilteredReason(t, decision.Filtered, "auth-other", "group-disabled-or-missing")
-}
-
-func TestDecideChannelRouteProjectBindingFailClosedDoesNotFallback(t *testing.T) {
-	cfg := ChannelRoutingConfig{
-		RouteMode:                    ChannelRouteModeProject,
-		ProjectModeFallbackRouteMode: ChannelRouteModeSequential,
-		ProjectBindings: []ProjectBinding{
-			{ProjectName: "repo-a", TargetType: "account", TargetID: "missing", FallbackMode: ChannelFallbackModeFailClosed},
-		},
-	}
-	accounts := []AccountSnapshot{
-		{ID: "auth-a", Enabled: true, Requestable: true},
-	}
-
-	decision := DecideChannelRoute(accounts, nil, cfg, ChannelRouteRequest{ProjectName: "repo-a"})
-
-	if decision.SelectedID != "" {
-		t.Fatalf("selected = %q, want fail closed empty selection", decision.SelectedID)
-	}
-	assertFilteredReason(t, decision.Filtered, "auth-a", "scope-account")
-}
-
-func TestDecideChannelRouteProjectBindingFallbackDefault(t *testing.T) {
-	cfg := ChannelRoutingConfig{
-		RouteMode:                    ChannelRouteModeProject,
-		ProjectModeFallbackRouteMode: ChannelRouteModeSequential,
-		FallbackMode:                 ChannelFallbackModeFallbackDefault,
-		ProjectBindings: []ProjectBinding{
-			{ProjectName: "repo-a", TargetType: "account", TargetID: "missing", FallbackMode: ChannelFallbackModeFallbackDefault},
-		},
-	}
-	accounts := []AccountSnapshot{
-		{ID: "auth-a", Enabled: true, Requestable: true},
-	}
-
-	decision := DecideChannelRoute(accounts, nil, cfg, ChannelRouteRequest{ProjectName: "repo-a"})
-
-	if decision.SelectedID != "auth-a" {
-		t.Fatalf("selected = %q, want fallback default auth-a", decision.SelectedID)
+	assertRouteableIDs(t, decision.Candidates, []string{"auth-other", "auth-light", "auth-heavy"})
+	for _, step := range decision.Steps {
+		if step == "mode:project" {
+			t.Fatalf("legacy project mode step remained: %#v", decision.Steps)
+		}
 	}
 }
 
