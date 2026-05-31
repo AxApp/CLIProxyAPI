@@ -3,6 +3,7 @@ package gettokenshooks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-1",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 2,
@@ -42,7 +43,7 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 			CompletedAtUnixMs: now.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
-			AccountKey:        "codex-api-key:stable-001",
+			AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       50,
@@ -59,19 +60,140 @@ func TestRateLimitEvaluatorBlocksRequestWindowRule(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
 	if !state.Blocked || state.BlockReason != "1h requests 已满" {
 		t.Fatalf("blocked state = %#v, want 1h request block", state)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "acct_00000000-0000-4000-8000-000000000001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
 		t.Fatalf("deny ids = %#v, want candidate auth id", got)
 	}
-	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "acct_00000000-0000-4000-8000-000000000001"}}); len(got) != 1 || got[0] != "codex:apikey:abc123" {
 		t.Fatalf("route guard deny ids = %#v, want rate-limited candidate auth id", got)
 	}
+}
+
+func TestRateLimitAdmissionReservationDeniesConcurrentRequestWindow(t *testing.T) {
+	ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit) })
+
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	if err := store.upsertRule(RateLimitRule{
+		ID:         "rule-admission",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyRequestWindow,
+		Window:     "1h",
+		LimitValue: 1,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now); err != nil {
+		t.Fatalf("upsert rule: %v", err)
+	}
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return now.Add(30 * time.Minute) },
+	})
+	unregister := gettokensrouting.RegisterAdmissionPolicy(rateLimitAdmissionPolicy(evaluator))
+	defer unregister()
+
+	first := gettokensrouting.AdmitCandidate(
+		context.Background(),
+		gettokensrouting.RouteContext{Provider: "codex", Model: "gpt-5.4"},
+		gettokensrouting.RouteCandidate{
+			ID:    "auth-a",
+			Value: &coreauth.Auth{ID: "auth-a", AccountKey: accountKey, Provider: "codex"},
+		},
+	)
+	if !first.Active || !first.Allow {
+		t.Fatalf("first admission = %#v, want active allow with reservation", first)
+	}
+	second := gettokensrouting.AdmitCandidate(
+		context.Background(),
+		gettokensrouting.RouteContext{Provider: "codex", Model: "gpt-5.4"},
+		gettokensrouting.RouteCandidate{
+			ID:    "auth-a",
+			Value: &coreauth.Auth{ID: "auth-a", AccountKey: accountKey, Provider: "codex"},
+		},
+	)
+	if !second.Active || second.Allow {
+		t.Fatalf("second admission = %#v, want active deny for same request window", second)
+	}
+
+	first.Lease.Release(context.Background())
+	recovered := gettokensrouting.AdmitCandidate(
+		context.Background(),
+		gettokensrouting.RouteContext{Provider: "codex", Model: "gpt-5.4"},
+		gettokensrouting.RouteCandidate{
+			ID:    "auth-a",
+			Value: &coreauth.Auth{ID: "auth-a", AccountKey: accountKey, Provider: "codex"},
+		},
+	)
+	if !recovered.Active || !recovered.Allow {
+		t.Fatalf("recovered admission = %#v, want allow after reservation release", recovered)
+	}
+	recovered.Lease.Release(context.Background())
+}
+
+func TestRateLimitAdmissionReservationCleanupExpiresOrphan(t *testing.T) {
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	base := time.Now().UTC().Truncate(time.Hour)
+	current := base.Add(30 * time.Minute)
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	if err := store.upsertRule(RateLimitRule{
+		ID:         "rule-orphan",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyRequestWindow,
+		Window:     "1h",
+		LimitValue: 1,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, base); err != nil {
+		t.Fatalf("upsert rule: %v", err)
+	}
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return current },
+	})
+	unregister := gettokensrouting.RegisterAdmissionPolicy(rateLimitAdmissionPolicy(evaluator))
+	defer unregister()
+
+	first := gettokensrouting.AdmitCandidate(
+		context.Background(),
+		gettokensrouting.RouteContext{Provider: "codex", Model: "gpt-5.4"},
+		gettokensrouting.RouteCandidate{
+			ID:    "auth-a",
+			Value: &coreauth.Auth{ID: "auth-a", AccountKey: accountKey, Provider: "codex"},
+		},
+	)
+	if !first.Active || !first.Allow {
+		t.Fatalf("first admission = %#v, want active allow with reservation", first)
+	}
+	first.Lease.Commit(context.Background())
+
+	current = current.Add(defaultRateLimitReservationTTL + time.Second)
+	if err := evaluator.EvaluateNow(context.Background()); err != nil {
+		t.Fatalf("evaluate after orphan ttl: %v", err)
+	}
+	recovered := gettokensrouting.AdmitCandidate(
+		context.Background(),
+		gettokensrouting.RouteContext{Provider: "codex", Model: "gpt-5.4"},
+		gettokensrouting.RouteCandidate{
+			ID:    "auth-a",
+			Value: &coreauth.Auth{ID: "auth-a", AccountKey: accountKey, Provider: "codex"},
+		},
+	)
+	if !recovered.Active || !recovered.Allow {
+		t.Fatalf("recovered admission = %#v, want orphan cleanup to release capacity", recovered)
+	}
+	recovered.Lease.Release(context.Background())
 }
 
 func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
@@ -82,7 +204,7 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-token",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyTokenWindow,
 		Window:     "24h",
 		LimitValue: 100,
@@ -96,7 +218,7 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 		CompletedAtUnixMs: now.Add(2 * time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
-		AccountKey:        "codex-api-key:stable-001",
+		AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       100,
@@ -112,7 +234,7 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
@@ -133,7 +255,7 @@ func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) 
 	now := time.Date(2026, 5, 22, 14, 30, 0, 0, location)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-calendar-day",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     RateLimitWindowCalendarDay,
 		LimitValue: 2,
@@ -156,7 +278,7 @@ func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) 
 			CompletedAtUnixMs: event.timestamp.UTC().UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
-			AccountKey:        "codex-api-key:stable-001",
+			AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       25,
@@ -173,7 +295,7 @@ func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) 
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
@@ -193,7 +315,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-warn",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 1,
@@ -207,7 +329,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 		CompletedAtUnixMs: now.Add(time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
-		AccountKey:        "codex-api-key:stable-001",
+		AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       25,
@@ -223,7 +345,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
@@ -233,7 +355,7 @@ func TestRateLimitEvaluatorWarnRuleDoesNotDenyCandidate(t *testing.T) {
 	if len(state.Rules) != 1 || !state.Rules[0].Exceeded {
 		t.Fatalf("rules = %#v, want exceeded warning rule", state.Rules)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 0 {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "acct_00000000-0000-4000-8000-000000000001"}}); len(got) != 0 {
 		t.Fatalf("deny ids = %#v, warn rule should not deny", got)
 	}
 }
@@ -247,7 +369,7 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 	current := base.Add(30 * time.Minute)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-slide",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 2,
@@ -262,7 +384,7 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 			CompletedAtUnixMs: base.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
-			AccountKey:        "codex-api-key:stable-001",
+			AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       25,
@@ -278,7 +400,7 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 	if err := evaluator.EvaluateNow(context.Background()); err != nil {
 		t.Fatalf("evaluate blocked window: %v", err)
 	}
-	if state, ok := evaluator.StateForAccount("codex-api-key:stable-001"); !ok || !state.Blocked {
+	if state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001"); !ok || !state.Blocked {
 		t.Fatalf("initial state = %#v, ok=%v, want blocked", state, ok)
 	}
 
@@ -286,15 +408,87 @@ func TestRateLimitEvaluatorRecoversWhenWindowSlides(t *testing.T) {
 	if err := evaluator.EvaluateNow(context.Background()); err != nil {
 		t.Fatalf("evaluate recovered window: %v", err)
 	}
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing recovered account state")
 	}
 	if state.Blocked || len(state.Rules) != 1 || state.Rules[0].CurrentUsage != 0 {
 		t.Fatalf("recovered state = %#v, want unblocked zero usage", state)
 	}
-	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "codex-api-key:stable-001"}}); len(got) != 0 {
+	if got := evaluator.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex:apikey:abc123", AccountKey: "acct_00000000-0000-4000-8000-000000000001"}}); len(got) != 0 {
 		t.Fatalf("deny ids = %#v, recovered account should not deny", got)
+	}
+}
+
+func TestRateLimitEvaluatorEvaluateAccountNowPreservesOtherAccountBlocks(t *testing.T) {
+	ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit) })
+
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	firstAccount := "acct_00000000-0000-4000-8000-000000000001"
+	secondAccount := "acct_00000000-0000-4000-8000-000000000002"
+	base := time.Now().UTC().Truncate(time.Hour)
+	current := base.Add(30 * time.Minute)
+	for _, accountKey := range []string{firstAccount, secondAccount} {
+		if err := store.upsertRule(RateLimitRule{
+			ID:         "rule-" + accountKey,
+			AccountKey: accountKey,
+			Strategy:   RateLimitStrategyRequestWindow,
+			Window:     "1h",
+			LimitValue: 1,
+			Action:     RateLimitActionBlock,
+			Enabled:    true,
+		}, base); err != nil {
+			t.Fatalf("upsert rule for %s: %v", accountKey, err)
+		}
+		if err := store.insertUsageAttributionEvent(usageAttributionEvent{
+			ID:                "event-" + accountKey,
+			CompletedAtUnixMs: base.Add(time.Minute).UnixMilli(),
+			AttributionKey:    "auth-id:" + accountKey,
+			AttributionKind:   "auth_id",
+			AccountKey:        accountKey,
+			Provider:          "codex",
+			RequestedModel:    "gpt-5.4",
+			TotalTokens:       25,
+			EvidenceKind:      "auth_id",
+		}); err != nil {
+			t.Fatalf("insert event for %s: %v", accountKey, err)
+		}
+	}
+
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return current },
+	})
+	if err := evaluator.EvaluateNow(context.Background()); err != nil {
+		t.Fatalf("evaluate initial blocked windows: %v", err)
+	}
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{
+		{ID: "auth-first", AccountKey: firstAccount},
+		{ID: "auth-second", AccountKey: secondAccount},
+	}); len(got) != 2 {
+		t.Fatalf("initial route guard deny ids = %#v, want both accounts blocked", got)
+	}
+
+	current = base.Add(2 * time.Hour)
+	if err := evaluator.EvaluateAccountNow(context.Background(), firstAccount); err != nil {
+		t.Fatalf("evaluate first account recovery: %v", err)
+	}
+	firstState, ok := evaluator.StateForAccount(firstAccount)
+	if !ok || firstState.Blocked {
+		t.Fatalf("first state = %#v, ok=%v, want recovered target account", firstState, ok)
+	}
+	secondState, ok := evaluator.StateForAccount(secondAccount)
+	if !ok || !secondState.Blocked {
+		t.Fatalf("second state = %#v, ok=%v, want untouched blocked account", secondState, ok)
+	}
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{
+		{ID: "auth-first", AccountKey: firstAccount},
+		{ID: "auth-second", AccountKey: secondAccount},
+	}); len(got) != 1 || got[0] != "auth-second" {
+		t.Fatalf("route guard deny ids after target refresh = %#v, want only second account", got)
 	}
 }
 
@@ -306,7 +500,7 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 	now := time.Now().UTC().Truncate(time.Hour)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-disabled",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 1,
@@ -320,7 +514,7 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 		CompletedAtUnixMs: now.Add(time.Minute).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:abc123",
 		AttributionKind:   "auth_id",
-		AccountKey:        "codex-api-key:stable-001",
+		AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 		Provider:          "codex",
 		RequestedModel:    "gpt-5.4",
 		TotalTokens:       25,
@@ -335,7 +529,7 @@ func TestRateLimitEvaluatorSkipsDisabledRulesAndUnconfiguredCandidates(t *testin
 	if err := evaluator.EvaluateNow(context.Background()); err != nil {
 		t.Fatalf("evaluate disabled rule: %v", err)
 	}
-	if _, ok := evaluator.StateForAccount("codex-api-key:stable-001"); ok {
+	if _, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001"); ok {
 		t.Fatal("disabled rule should not create account state")
 	}
 	deny := evaluator.DenyIDsForCandidates([]*coreauth.Auth{
@@ -371,43 +565,39 @@ func TestRateLimitEvaluatorFeedsAccountRouteGuardPolicy(t *testing.T) {
 	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "openai-compatibility:mi:abc123" {
 		t.Fatalf("DenyIDs = %#v, want blocked candidate", decision.DenyIDs)
 	}
-	if decision.Reason != "gettokens account route guard" {
-		t.Fatalf("Reason = %q, want account route guard path", decision.Reason)
+	if !strings.Contains(decision.Reason, "gettokens account route guard") || !strings.Contains(decision.Reason, AccountRouteGuardSourceRateLimit) {
+		t.Fatalf("Reason = %q, want account route guard source", decision.Reason)
 	}
 }
 
 func TestRateLimitEvaluatorUsesRegisteredStrategy(t *testing.T) {
-	previousRegistry := defaultRateLimitRegistry
-	defaultRateLimitRegistry = NewRateLimitStrategyRegistry(rateLimitTestStrategy{})
-	t.Cleanup(func() {
-		defaultRateLimitRegistry = previousRegistry
-	})
-
 	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {
 		t.Fatalf("new rate limit store: %v", err)
 	}
+	registry := NewRateLimitStrategyRegistry(rateLimitTestStrategy{})
 	now := time.Now().UTC().Truncate(time.Hour)
-	if err := store.upsertRule(RateLimitRule{
+	if _, err := store.upsertRuleWithRegistry(RateLimitRule{
 		ID:         "rule-custom",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   "test-window",
 		Window:     "1h",
 		LimitValue: 5,
 		Action:     RateLimitActionBlock,
 		Enabled:    true,
-	}, now); err != nil {
+	}, now, registry); err != nil {
 		t.Fatalf("upsert custom strategy rule: %v", err)
 	}
 
 	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
-		Now: func() time.Time { return now },
+		Now:      func() time.Time { return now },
+		Registry: registry,
 	})
 	if err := evaluator.EvaluateNow(context.Background()); err != nil {
 		t.Fatalf("evaluate custom strategy: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
@@ -415,9 +605,66 @@ func TestRateLimitEvaluatorUsesRegisteredStrategy(t *testing.T) {
 		t.Fatalf("blocked state = %#v, want registered strategy block", state)
 	}
 
-	strategies := ListRateLimitStrategies()
+	strategies := registry.List()
 	if len(strategies) != 1 || strategies[0].ID != "test-window" {
 		t.Fatalf("strategies = %#v, want registered test strategy", strategies)
+	}
+}
+
+func TestRateLimitEvaluatorSerializesConcurrentEvaluations(t *testing.T) {
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	strategy := &rateLimitBlockingStrategy{
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	registry := NewRateLimitStrategyRegistry(strategy)
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	now := time.Now().UTC().Truncate(time.Hour)
+	if _, err := store.upsertRuleWithRegistry(RateLimitRule{
+		ID:         "rule-blocking",
+		AccountKey: accountKey,
+		Strategy:   strategy.ID(),
+		Window:     "1h",
+		LimitValue: 1,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now, registry); err != nil {
+		t.Fatalf("upsert blocking rule: %v", err)
+	}
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now:      func() time.Time { return now },
+		Registry: registry,
+	})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- evaluator.EvaluateNow(context.Background())
+	}()
+	select {
+	case <-strategy.started:
+	case <-time.After(time.Second):
+		t.Fatal("first evaluation did not enter strategy")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- evaluator.EvaluateAccountNow(context.Background(), accountKey)
+	}()
+	select {
+	case <-strategy.started:
+		t.Fatal("second evaluation entered strategy before first evaluation finished")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(strategy.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first evaluation: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second evaluation: %v", err)
 	}
 }
 
@@ -460,7 +707,7 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 	}
 
 	createBody := `{
-		"account_key":"codex-api-key:stable-001",
+		"account_key":"acct_00000000-0000-4000-8000-000000000001",
 		"strategy":"request-window",
 		"window":"1h",
 		"limit_value":2,
@@ -486,7 +733,7 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 			CompletedAtUnixMs: now.Add(time.Duration(index) * time.Minute).UnixMilli(),
 			AttributionKey:    "auth-id:codex:apikey:abc123",
 			AttributionKind:   "auth_id",
-			AccountKey:        "codex-api-key:stable-001",
+			AccountKey:        "acct_00000000-0000-4000-8000-000000000001",
 			Provider:          "codex",
 			RequestedModel:    "gpt-5.4",
 			TotalTokens:       50,
@@ -499,7 +746,7 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	status := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-status?account_key=codex-api-key:stable-001", "")
+	status := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-status?account_key=acct_00000000-0000-4000-8000-000000000001", "")
 	var state RateLimitState
 	if err := json.Unmarshal(status.Body.Bytes(), &state); err != nil {
 		t.Fatalf("decode status: %v", err)
@@ -507,8 +754,23 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 	if !state.Blocked || state.BlockReason != "1h requests 已满" {
 		t.Fatalf("state = %#v, want blocked request window", state)
 	}
+	if state.LastEvaluatedAt == "" || state.UpdatedAt != state.LastEvaluatedAt {
+		t.Fatalf("state timestamps = updated %q last %q, want last evaluated mirrored", state.UpdatedAt, state.LastEvaluatedAt)
+	}
+	if len(state.Sources) != 1 {
+		t.Fatalf("state sources = %#v, want one rate-limit source", state.Sources)
+	}
+	if state.Sources[0].Source != AccountRouteGuardSourceRateLimit || state.Sources[0].RuleID != ruleID || state.Sources[0].UsageValue != 2 || state.Sources[0].LimitValue != 2 {
+		t.Fatalf("state source = %#v, want rate-limit rule usage explain", state.Sources[0])
+	}
+	if state.NextReset == "" || state.Sources[0].NextReset == "" {
+		t.Fatalf("state next reset missing: %#v", state)
+	}
+	if len(state.Rules) != 1 || state.Rules[0].WindowStart == "" || state.Rules[0].WindowEnd == "" || state.Rules[0].NextReset == "" || state.Rules[0].LimitValue != 2 {
+		t.Fatalf("rule state missing window explain: %#v", state.Rules)
+	}
 
-	events := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-events?account_key=codex-api-key:stable-001", "")
+	events := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-events?account_key=acct_00000000-0000-4000-8000-000000000001", "")
 	var eventsResponse struct {
 		Items []RateLimitEvent `json:"items"`
 	}
@@ -523,12 +785,128 @@ func TestRateLimitManagementRoutesExposeStrategiesCRUDStatusAndEvents(t *testing
 	if deleteResponse.Code != http.StatusOK {
 		t.Fatalf("delete status = %d, want 200", deleteResponse.Code)
 	}
-	listResponse := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-rules?account_key=codex-api-key:stable-001", "")
+	listResponse := performRateLimitRequest(t, router, http.MethodGet, "/v0/management/gettokens/rate-limit-rules?account_key=acct_00000000-0000-4000-8000-000000000001", "")
 	if err := json.Unmarshal(listResponse.Body.Bytes(), &rulesResponse); err != nil {
 		t.Fatalf("decode listed rules: %v", err)
 	}
 	if len(rulesResponse.Items) != 0 {
 		t.Fatalf("rules after delete = %#v, want empty", rulesResponse.Items)
+	}
+}
+
+func TestRateLimitManagementRoutesReturnEvaluationError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	accountKey := "acct_00000000-0000-4000-8000-000000000004"
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Registry: NewRateLimitStrategyRegistry(rateLimitFailingStrategy{}),
+	})
+	rateLimitMu.Lock()
+	previousStore := defaultRateLimitStore
+	previousEval := defaultRateLimitEval
+	defaultRateLimitStore = store
+	defaultRateLimitEval = evaluator
+	rateLimitMu.Unlock()
+	t.Cleanup(func() {
+		rateLimitMu.Lock()
+		defaultRateLimitStore = previousStore
+		defaultRateLimitEval = previousEval
+		rateLimitMu.Unlock()
+	})
+
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureRateLimitRoutes(group, nil, nil)
+
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/rate-limit-rules", strings.NewReader(`{
+		"account_key":"`+accountKey+`",
+		"strategy":"failing-window",
+		"window":"1h",
+		"limit_value":1,
+		"action":"block",
+		"enabled":true
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want evaluation error", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "forced rate limit evaluation failure") {
+		t.Fatalf("body = %s, want evaluation error detail", response.Body.String())
+	}
+	rules, err := store.listRules(accountKey)
+	if err != nil {
+		t.Fatalf("list rules after failed create: %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("rules after failed create = %#v, want rollback", rules)
+	}
+}
+
+func TestRateLimitManagementRoutesRollbackFailedDelete(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	registry := NewRateLimitStrategyRegistry(rateLimitRequestWindowStrategy{}, rateLimitFailingStrategy{})
+	accountKey := "acct_00000000-0000-4000-8000-000000000005"
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := store.upsertRuleWithRegistry(RateLimitRule{
+		ID:         "delete-target",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyRequestWindow,
+		Window:     "1h",
+		LimitValue: 10,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now, registry); err != nil {
+		t.Fatalf("upsert delete target: %v", err)
+	}
+	if _, err := store.upsertRuleWithRegistry(RateLimitRule{
+		ID:         "remaining-failing",
+		AccountKey: accountKey,
+		Strategy:   "failing-window",
+		Window:     "1h",
+		LimitValue: 1,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now, registry); err != nil {
+		t.Fatalf("upsert failing rule: %v", err)
+	}
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{Registry: registry})
+	rateLimitMu.Lock()
+	previousStore := defaultRateLimitStore
+	previousEval := defaultRateLimitEval
+	defaultRateLimitStore = store
+	defaultRateLimitEval = evaluator
+	rateLimitMu.Unlock()
+	t.Cleanup(func() {
+		rateLimitMu.Lock()
+		defaultRateLimitStore = previousStore
+		defaultRateLimitEval = previousEval
+		rateLimitMu.Unlock()
+	})
+
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureRateLimitRoutes(group, nil, nil)
+
+	request := httptest.NewRequest(http.MethodDelete, "/v0/management/gettokens/rate-limit-rules/delete-target", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want evaluation error", response.Code, response.Body.String())
+	}
+	if _, exists, err := store.getRule("delete-target"); err != nil {
+		t.Fatalf("get delete target after failed delete: %v", err)
+	} else if !exists {
+		t.Fatal("delete target missing after failed evaluation, want rollback")
 	}
 }
 
@@ -560,4 +938,41 @@ func (rateLimitTestStrategy) UsageForRule(context.Context, *rateLimitStore, Rate
 
 func (rateLimitTestStrategy) FormatReason(rule RateLimitRule) string {
 	return rateLimitRuleWindow(rule) + " test 已满"
+}
+
+type rateLimitFailingStrategy struct{}
+
+func (rateLimitFailingStrategy) ID() string { return "failing-window" }
+
+func (rateLimitFailingStrategy) Name() string { return "失败窗口限流" }
+
+func (rateLimitFailingStrategy) SupportedWindows() []string { return []string{"1h"} }
+
+func (rateLimitFailingStrategy) UsageForRule(context.Context, *rateLimitStore, RateLimitRule, time.Time) (int64, error) {
+	return 0, errors.New("forced rate limit evaluation failure")
+}
+
+func (rateLimitFailingStrategy) FormatReason(rule RateLimitRule) string {
+	return rateLimitRuleWindow(rule) + " failing 已满"
+}
+
+type rateLimitBlockingStrategy struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (rateLimitBlockingStrategy) ID() string { return "blocking-window" }
+
+func (rateLimitBlockingStrategy) Name() string { return "阻塞窗口限流" }
+
+func (rateLimitBlockingStrategy) SupportedWindows() []string { return []string{"1h"} }
+
+func (s *rateLimitBlockingStrategy) UsageForRule(context.Context, *rateLimitStore, RateLimitRule, time.Time) (int64, error) {
+	s.started <- struct{}{}
+	<-s.release
+	return 1, nil
+}
+
+func (rateLimitBlockingStrategy) FormatReason(rule RateLimitRule) string {
+	return rateLimitRuleWindow(rule) + " blocking 已满"
 }

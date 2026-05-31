@@ -222,3 +222,73 @@ func authsFromRouteCandidates(candidates []gettokensrouting.RouteCandidate, auth
 	}
 	return out
 }
+
+func admitAuthCandidate(ctx context.Context, req routeRequest, auth *Auth) gettokensrouting.AdmissionDecision {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return gettokensrouting.AdmissionDecision{}
+	}
+	return gettokensrouting.AdmitCandidate(ctx, gettokensrouting.RouteContext{
+		Provider:     req.Provider,
+		Providers:    append([]string(nil), req.Providers...),
+		Model:        req.Model,
+		Options:      req.Options,
+		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
+		Candidates: []gettokensrouting.RouteCandidate{{
+			ID:    strings.TrimSpace(auth.ID),
+			Value: auth.Clone(),
+		}},
+		Tried: req.Tried,
+		Now:   req.Now,
+	}, gettokensrouting.RouteCandidate{
+		ID:    strings.TrimSpace(auth.ID),
+		Value: auth.Clone(),
+	})
+}
+
+func markAdmissionDenied(tried map[string]struct{}, auth *Auth) map[string]struct{} {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return tried
+	}
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
+	tried[auth.ID] = struct{}{}
+	return tried
+}
+
+func wrapAdmissionStreamResult(ctx context.Context, result *cliproxyexecutor.StreamResult, lease gettokensrouting.AdmissionLease) *cliproxyexecutor.StreamResult {
+	if result == nil || !lease.Active() {
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		success := true
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				success = false
+			}
+			if ctx == nil {
+				out <- chunk
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				success = false
+				discardStreamChunks(result.Chunks)
+				lease.Release(ctx)
+				return
+			case out <- chunk:
+			}
+		}
+		if success {
+			lease.Commit(ctx)
+		} else {
+			lease.Release(ctx)
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{
+		Headers: result.Headers,
+		Chunks:  out,
+	}
+}

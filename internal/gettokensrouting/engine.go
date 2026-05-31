@@ -42,12 +42,34 @@ type Policy struct {
 	Rewrite func(context.Context, RouteContext) PolicyDecision
 }
 
+type AdmissionPolicy struct {
+	Name  string
+	Admit func(context.Context, RouteContext, RouteCandidate) AdmissionDecision
+}
+
 type PolicyDecision struct {
 	AllowIDs      []string
 	DenyIDs       []string
 	OrderIDs      []string
 	AllowFallback *bool
 	Reason        string
+}
+
+type AdmissionDecision struct {
+	Active bool
+	Allow  bool
+	Reason string
+	Lease  AdmissionLease
+}
+
+type AdmissionLease struct {
+	state *admissionLeaseState
+}
+
+type admissionLeaseState struct {
+	once    sync.Once
+	commit  func(context.Context)
+	release func(context.Context)
 }
 
 type DecisionStep struct {
@@ -78,6 +100,12 @@ var registeredPolicies = struct {
 	items  map[int]Policy
 }{items: make(map[int]Policy)}
 
+var registeredAdmissionPolicies = struct {
+	sync.RWMutex
+	nextID int
+	items  map[int]AdmissionPolicy
+}{items: make(map[int]AdmissionPolicy)}
+
 // RegisterPolicy installs a process-wide GetTokens routing policy.
 func RegisterPolicy(policy Policy) func() {
 	if policy.Rewrite == nil {
@@ -93,6 +121,24 @@ func RegisterPolicy(policy Policy) func() {
 		registeredPolicies.Lock()
 		delete(registeredPolicies.items, id)
 		registeredPolicies.Unlock()
+	}
+}
+
+// RegisterAdmissionPolicy installs a process-wide GetTokens admission policy.
+func RegisterAdmissionPolicy(policy AdmissionPolicy) func() {
+	if policy.Admit == nil {
+		return func() {}
+	}
+	registeredAdmissionPolicies.Lock()
+	registeredAdmissionPolicies.nextID++
+	id := registeredAdmissionPolicies.nextID
+	registeredAdmissionPolicies.items[id] = policy
+	registeredAdmissionPolicies.Unlock()
+
+	return func() {
+		registeredAdmissionPolicies.Lock()
+		delete(registeredAdmissionPolicies.items, id)
+		registeredAdmissionPolicies.Unlock()
 	}
 }
 
@@ -113,6 +159,102 @@ func PolicySnapshot() []Policy {
 		}
 	}
 	return out
+}
+
+// AdmissionPolicySnapshot returns registered admission policies in registration order.
+func AdmissionPolicySnapshot() []AdmissionPolicy {
+	registeredAdmissionPolicies.RLock()
+	defer registeredAdmissionPolicies.RUnlock()
+	ids := make([]int, 0, len(registeredAdmissionPolicies.items))
+	for id := range registeredAdmissionPolicies.items {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	out := make([]AdmissionPolicy, 0, len(ids))
+	for _, id := range ids {
+		policy := registeredAdmissionPolicies.items[id]
+		if policy.Admit != nil {
+			out = append(out, policy)
+		}
+	}
+	return out
+}
+
+func NewAdmissionLease(commit func(context.Context), release func(context.Context)) AdmissionLease {
+	if commit == nil && release == nil {
+		return AdmissionLease{}
+	}
+	return AdmissionLease{state: &admissionLeaseState{commit: commit, release: release}}
+}
+
+func (l AdmissionLease) Commit(ctx context.Context) {
+	if l.state == nil {
+		return
+	}
+	l.state.once.Do(func() {
+		if l.state.commit != nil {
+			l.state.commit(ctx)
+		}
+	})
+}
+
+func (l AdmissionLease) Release(ctx context.Context) {
+	if l.state == nil {
+		return
+	}
+	l.state.once.Do(func() {
+		if l.state.release != nil {
+			l.state.release(ctx)
+		}
+	})
+}
+
+func (l AdmissionLease) Active() bool {
+	return l.state != nil
+}
+
+func AdmitCandidate(ctx context.Context, routeCtx RouteContext, candidate RouteCandidate) AdmissionDecision {
+	if strings.TrimSpace(candidate.ID) == "" {
+		return AdmissionDecision{}
+	}
+	policies := AdmissionPolicySnapshot()
+	if len(policies) == 0 {
+		return AdmissionDecision{}
+	}
+	if routeCtx.Now.IsZero() {
+		routeCtx.Now = time.Now()
+	}
+	leases := []AdmissionLease{}
+	active := false
+	for _, policy := range policies {
+		if policy.Admit == nil {
+			continue
+		}
+		decision := safeAdmitPolicy(policy, ctx, routeCtx, candidate)
+		if !decision.Active {
+			continue
+		}
+		active = true
+		if !decision.Allow {
+			releaseAdmissionLeases(ctx, leases)
+			return AdmissionDecision{
+				Active: true,
+				Allow:  false,
+				Reason: strings.TrimSpace(decision.Reason),
+			}
+		}
+		if decision.Lease.Active() {
+			leases = append(leases, decision.Lease)
+		}
+	}
+	if !active {
+		return AdmissionDecision{}
+	}
+	return AdmissionDecision{
+		Active: true,
+		Allow:  true,
+		Lease:  combineAdmissionLeases(leases),
+	}
 }
 
 func NewEngine(policies ...Policy) Engine {
@@ -171,6 +313,44 @@ func safeRewritePolicy(policy Policy, ctx context.Context, routeCtx RouteContext
 		}
 	}()
 	return policy.Rewrite(ctx, routeCtx)
+}
+
+func safeAdmitPolicy(policy AdmissionPolicy, ctx context.Context, routeCtx RouteContext, candidate RouteCandidate) (decision AdmissionDecision) {
+	defer func() {
+		if recover() != nil {
+			decision = AdmissionDecision{
+				Active: true,
+				Allow:  false,
+				Reason: "admission policy failed",
+			}
+		}
+	}()
+	return policy.Admit(ctx, routeCtx, candidate)
+}
+
+func combineAdmissionLeases(leases []AdmissionLease) AdmissionLease {
+	filtered := make([]AdmissionLease, 0, len(leases))
+	for _, lease := range leases {
+		if lease.Active() {
+			filtered = append(filtered, lease)
+		}
+	}
+	if len(filtered) == 0 {
+		return AdmissionLease{}
+	}
+	return NewAdmissionLease(func(ctx context.Context) {
+		for _, lease := range filtered {
+			lease.Commit(ctx)
+		}
+	}, func(ctx context.Context) {
+		releaseAdmissionLeases(ctx, filtered)
+	})
+}
+
+func releaseAdmissionLeases(ctx context.Context, leases []AdmissionLease) {
+	for i := len(leases) - 1; i >= 0; i-- {
+		leases[i].Release(ctx)
+	}
 }
 
 func policyStageRank(stage PolicyStage) int {

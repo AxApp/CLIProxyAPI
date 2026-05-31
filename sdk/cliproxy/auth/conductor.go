@@ -1399,9 +1399,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1411,12 +1409,28 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			tried[auth.ID] = struct{}{}
 			continue
 		}
+		admission := admitAuthCandidate(execCtx, routeRequest{
+			Provider:  provider,
+			Providers: append([]string(nil), providers...),
+			Model:     routeModel,
+			Options:   pickOpts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, auth)
+		if admission.Active && !admission.Allow {
+			tried = markAdmissionDenied(tried, auth)
+			continue
+		}
+		tried[auth.ID] = struct{}{}
+		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			admission.Lease.Release(execCtx)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
@@ -1435,6 +1449,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Latency: time.Since(startedAt)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1446,18 +1461,22 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			admission.Lease.Commit(execCtx)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				admission.Lease.Release(execCtx)
 				return cliproxyexecutor.Response{}, authErr
 			}
+			admission.Lease.Release(execCtx)
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
@@ -1499,9 +1518,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1511,12 +1528,28 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			tried[auth.ID] = struct{}{}
 			continue
 		}
+		admission := admitAuthCandidate(execCtx, routeRequest{
+			Provider:  provider,
+			Providers: append([]string(nil), providers...),
+			Model:     routeModel,
+			Options:   pickOpts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, auth)
+		if admission.Active && !admission.Allow {
+			tried = markAdmissionDenied(tried, auth)
+			continue
+		}
+		tried[auth.ID] = struct{}{}
+		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			admission.Lease.Release(execCtx)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
@@ -1535,6 +1568,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Latency: time.Since(startedAt)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1546,18 +1580,22 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			admission.Lease.Commit(execCtx)
 			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
+				admission.Lease.Release(execCtx)
 				return cliproxyexecutor.Response{}, authErr
 			}
+			admission.Lease.Release(execCtx)
 			lastErr = authErr
 			if homeMode {
 				homeAuthCount++
@@ -1599,9 +1637,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1609,12 +1645,28 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			tried[auth.ID] = struct{}{}
 			continue
 		}
+		admission := admitAuthCandidate(execCtx, routeRequest{
+			Provider:  provider,
+			Providers: append([]string(nil), providers...),
+			Model:     routeModel,
+			Options:   pickOpts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, auth)
+		if admission.Active && !admission.Allow {
+			tried = markAdmissionDenied(tried, auth)
+			continue
+		}
+		tried[auth.ID] = struct{}{}
+		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			admission.Lease.Release(execCtx)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: &Error{Message: errPrepare.Error()}}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errPrepare); ok && se != nil {
 				result.Error.HTTPStatus = se.StatusCode()
@@ -1626,18 +1678,21 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
+				admission.Lease.Release(execCtx)
 				return nil, errCtx
 			}
 			if isRequestInvalidError(errStream) {
+				admission.Lease.Release(execCtx)
 				return nil, errStream
 			}
+			admission.Lease.Release(execCtx)
 			lastErr = errStream
 			if homeMode {
 				homeAuthCount++
 			}
 			continue
 		}
-		return streamResult, nil
+		return wrapAdmissionStreamResult(execCtx, streamResult, admission.Lease), nil
 	}
 }
 

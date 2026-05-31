@@ -1629,8 +1629,10 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterRouteGuardBlock(t *testing.T) 
 
 func TestResponsesWebsocketRequestBoundaryReleaseUsesRouteGuard(t *testing.T) {
 	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
 	t.Cleanup(func() {
 		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
 	})
 
 	auth := &coreauth.Auth{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive}
@@ -1641,19 +1643,27 @@ func TestResponsesWebsocketRequestBoundaryReleaseUsesRouteGuard(t *testing.T) {
 		return nil, false
 	}
 
-	next, forceReplay, released := responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve)
-	if released || forceReplay || next != auth.ID {
-		t.Fatalf("unguarded release = (%q, %v, %v), want unchanged", next, forceReplay, released)
+	result := responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve, nil)
+	if result.Released || result.ForceTranscriptReplay || result.NextPinnedAuthID != auth.ID {
+		t.Fatalf("unguarded release = %#v, want unchanged", result)
 	}
 
 	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
-		Source: gettokenshooks.AccountRouteGuardSourceManualDisabled,
+		Source: gettokenshooks.AccountRouteGuardSourceRateLimit,
 		AuthID: auth.ID,
-		Reason: "disabled by user",
+		Reason: "1h requests 已满",
 	})
-	next, forceReplay, released = responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve)
-	if !released || !forceReplay || next != "" {
-		t.Fatalf("guarded release = (%q, %v, %v), want released replay", next, forceReplay, released)
+	timelineLog := newInMemoryWebsocketTimelineLog()
+	result = responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve, timelineLog)
+	if !result.Released || !result.ForceTranscriptReplay || result.NextPinnedAuthID != "" {
+		t.Fatalf("guarded release = %#v, want released replay", result)
+	}
+	if result.Source != gettokenshooks.AccountRouteGuardSourceRateLimit || result.Reason != "1h requests 已满" {
+		t.Fatalf("guarded release source = (%q, %q), want rate-limit reason", result.Source, result.Reason)
+	}
+	timeline := timelineLog.String()
+	if !strings.Contains(timeline, `"source":"rate-limit"`) || !strings.Contains(timeline, `"reason":"1h requests 已满"`) {
+		t.Fatalf("timeline missing guard release explain: %s", timeline)
 	}
 }
 

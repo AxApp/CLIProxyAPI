@@ -238,8 +238,65 @@ func (s *AccountRouteGuardStore) IsAuthBlocked(auth *coreauth.Auth) bool {
 	return false
 }
 
+func (s *AccountRouteGuardStore) ActiveBlocksForAuth(auth *coreauth.Auth) []AccountRouteGuardBlock {
+	if s == nil || auth == nil {
+		return nil
+	}
+	now := time.Now()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []AccountRouteGuardBlock{}
+	seen := map[string]struct{}{}
+	for _, key := range accountRouteGuardKeysForAuth(auth) {
+		blocks := s.lookup[strings.TrimSpace(key)]
+		for blockKey, block := range blocks {
+			if !block.ExpiresAt.IsZero() && !block.ExpiresAt.After(now) {
+				continue
+			}
+			if _, exists := seen[blockKey]; exists {
+				continue
+			}
+			seen[blockKey] = struct{}{}
+			block.LookupKeys = append([]string(nil), block.LookupKeys...)
+			out = append(out, block)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return accountRouteGuardBlockKey(out[i]) < accountRouteGuardBlockKey(out[j])
+	})
+	return out
+}
+
+func (s *AccountRouteGuardStore) ActiveBlocksForCandidates(candidates []*coreauth.Auth) map[string][]AccountRouteGuardBlock {
+	if s == nil || len(candidates) == 0 {
+		return nil
+	}
+	out := map[string][]AccountRouteGuardBlock{}
+	for _, candidate := range candidates {
+		if candidate == nil || strings.TrimSpace(candidate.ID) == "" {
+			continue
+		}
+		blocks := s.ActiveBlocksForAuth(candidate)
+		if len(blocks) == 0 {
+			continue
+		}
+		out[strings.TrimSpace(candidate.ID)] = blocks
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func AccountRouteGuardBlocksAuth(auth *coreauth.Auth) bool {
 	return defaultAccountRouteGuardStore.IsAuthBlocked(auth)
+}
+
+func ActiveAccountRouteGuardBlocksForAuth(auth *coreauth.Auth) []AccountRouteGuardBlock {
+	return defaultAccountRouteGuardStore.ActiveBlocksForAuth(auth)
 }
 
 func (s *AccountRouteGuardStore) lookupHasActiveBlockLocked(key string, now time.Time) bool {
@@ -314,11 +371,50 @@ func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req gett
 	if store == nil {
 		store = defaultAccountRouteGuardStore
 	}
-	deny := store.DenyIDsForCandidates(authCandidatesFromRouteContext(req))
+	blocksByID := store.ActiveBlocksForCandidates(authCandidatesFromRouteContext(req))
+	if len(blocksByID) == 0 {
+		return gettokensrouting.PolicyDecision{}
+	}
+	deny := make([]string, 0, len(blocksByID))
+	for id := range blocksByID {
+		deny = append(deny, id)
+	}
+	sort.Strings(deny)
 	if len(deny) == 0 {
 		return gettokensrouting.PolicyDecision{}
 	}
-	return gettokensrouting.PolicyDecision{DenyIDs: deny, Reason: "gettokens account route guard"}
+	return gettokensrouting.PolicyDecision{DenyIDs: deny, Reason: accountRouteGuardDecisionReason(blocksByID)}
+}
+
+func accountRouteGuardDecisionReason(blocksByID map[string][]AccountRouteGuardBlock) string {
+	const base = "gettokens account route guard"
+	if len(blocksByID) == 0 {
+		return base
+	}
+	parts := []string{}
+	seen := map[string]struct{}{}
+	for _, blocks := range blocksByID {
+		for _, block := range blocks {
+			source := strings.TrimSpace(block.Source)
+			if source == "" {
+				continue
+			}
+			part := source
+			if reason := strings.TrimSpace(block.Reason); reason != "" {
+				part += "=" + reason
+			}
+			if _, exists := seen[part]; exists {
+				continue
+			}
+			seen[part] = struct{}{}
+			parts = append(parts, part)
+		}
+	}
+	sort.Strings(parts)
+	if len(parts) == 0 {
+		return base
+	}
+	return base + ": " + strings.Join(parts, "; ")
 }
 
 func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteGuardBlock {

@@ -3,9 +3,11 @@ package openai
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenscodex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
@@ -111,6 +114,163 @@ func TestCodexModelRoutingResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for route context")
+	}
+}
+
+func TestCodexResponsesDevSmokeRequestWindowAdmissionFallsBackWithMockUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit) })
+
+	tempDir := t.TempDir()
+	t.Setenv("GETTOKENS_USAGE_ATTRIBUTION_SQLITE_PATH", filepath.Join(tempDir, "usage-attribution.sqlite"))
+	if err := gettokenshooks.InstallRateLimitHook(gettokenshooks.UsageAttributionOptions{WritableBase: tempDir}); err != nil {
+		t.Fatalf("install rate-limit hook: %v", err)
+	}
+
+	const (
+		accountA = "acct_00000000-0000-4000-8000-0000000000a1"
+		accountB = "acct_00000000-0000-4000-8000-0000000000b2"
+		model    = "smoke-rate-limit-model"
+	)
+
+	managementRouter := gin.New()
+	gettokenshooks.ConfigureRateLimitRoutes(managementRouter.Group("/v0/management"), nil, nil)
+	ruleBody := `{"id":"rlr-smoke-dev","account_key":"` + accountA + `","strategy":"request-window","window":"1h","limit_value":1,"action":"block","enabled":true}`
+	ruleReq := httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/rate-limit-rules", strings.NewReader(ruleBody))
+	ruleReq.Header.Set("Content-Type", "application/json")
+	ruleResp := httptest.NewRecorder()
+	managementRouter.ServeHTTP(ruleResp, ruleReq)
+	if ruleResp.Code != http.StatusOK {
+		t.Fatalf("create rate-limit rule status = %d, want 200; body=%s", ruleResp.Code, ruleResp.Body.String())
+	}
+
+	upstreamAStarted := make(chan struct{}, 1)
+	releaseUpstreamA := make(chan struct{})
+	upstreamABody := make(chan []byte, 1)
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream A path = %s, want /responses", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream A body: %v", err)
+		}
+		upstreamABody <- bytes.Clone(body)
+		upstreamAStarted <- struct{}{}
+		select {
+		case <-releaseUpstreamA:
+		case <-r.Context().Done():
+			return
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting to release upstream A")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-smoke-a","output":[{"type":"message","id":"msg-a"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer upstreamA.Close()
+
+	upstreamBBody := make(chan []byte, 1)
+	upstreamBAuth := make(chan string, 1)
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("upstream B path = %s, want /responses", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream B body: %v", err)
+		}
+		upstreamBAuth <- r.Header.Get("Authorization")
+		upstreamBBody <- bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-smoke-b","output":[{"type":"message","id":"msg-b"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer upstreamB.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}}))
+	authA := &coreauth.Auth{
+		ID:         "auth-smoke-rate-a",
+		AccountKey: accountA,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"api_key": "sk-smoke-a", "base_url": upstreamA.URL},
+	}
+	authB := &coreauth.Auth{
+		ID:         "auth-smoke-rate-b",
+		AccountKey: accountB,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"api_key": "sk-smoke-b", "base_url": upstreamB.URL},
+	}
+	if _, err := manager.Register(context.Background(), authA); err != nil {
+		t.Fatalf("register auth A: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), authB); err != nil {
+		t.Fatalf("register auth B: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(authA.ID, authA.Provider, []*registry.ModelInfo{{ID: model}})
+	registry.GetGlobalRegistry().RegisterClient(authB.ID, authB.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(authA.ID)
+		registry.GetGlobalRegistry().UnregisterClient(authB.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+	downstream := httptest.NewServer(router)
+	defer downstream.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	firstDone := make(chan string, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		body, err := postSmokeResponsesRequest(client, downstream.URL, model, "msg-first")
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		firstDone <- body
+	}()
+
+	select {
+	case <-upstreamAStarted:
+	case err := <-firstErr:
+		t.Fatalf("first downstream request failed before reaching upstream A: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first request to reach upstream A")
+	}
+
+	secondBody, err := postSmokeResponsesRequest(client, downstream.URL, model, "msg-second")
+	if err != nil {
+		t.Fatalf("second downstream request failed: %v", err)
+	}
+	if !strings.Contains(secondBody, "resp-smoke-b") {
+		t.Fatalf("second downstream response = %s, want fallback upstream B", secondBody)
+	}
+	if got := waitSmokeString(t, upstreamBAuth); got != "Bearer sk-smoke-b" {
+		t.Fatalf("upstream B Authorization = %q, want Bearer sk-smoke-b", got)
+	}
+	if got := gjson.GetBytes(waitSmokeBody(t, upstreamBBody), "input.0.id").String(); got != "msg-second" {
+		t.Fatalf("upstream B body input id = %q, want msg-second", got)
+	}
+	if got := gjson.GetBytes(waitSmokeBody(t, upstreamABody), "input.0.id").String(); got != "msg-first" {
+		t.Fatalf("upstream A body input id = %q, want msg-first", got)
+	}
+
+	close(releaseUpstreamA)
+	select {
+	case body := <-firstDone:
+		if !strings.Contains(body, "resp-smoke-a") {
+			t.Fatalf("first downstream response = %s, want upstream A response", body)
+		}
+	case err := <-firstErr:
+		t.Fatalf("first downstream request failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first downstream response")
 	}
 }
 
@@ -304,4 +464,38 @@ func waitSmokeBody(t *testing.T, bodyCh <-chan []byte) []byte {
 		t.Fatal("timed out waiting for upstream body")
 	}
 	return nil
+}
+
+func waitSmokeString(t *testing.T, values <-chan string) string {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for smoke string")
+	}
+	return ""
+}
+
+func postSmokeResponsesRequest(client *http.Client, baseURL string, model string, inputID string) (string, error) {
+	payload := `{"model":"` + model + `","input":[{"type":"message","id":"` + inputID + `"}]}`
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/responses", strings.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setSmokeCodexHeaders(req.Header, "rate-limit")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return string(body), fmt.Errorf("status %d: %s", resp.StatusCode, body)
+	}
+	return string(body), nil
 }

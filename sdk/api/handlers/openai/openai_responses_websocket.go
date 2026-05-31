@@ -306,14 +306,22 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		wsTimelineLog.BeginRequest()
 		wsTimelineLog.Append("request", payload, time.Now())
 
-		if nextPinnedAuthID, forceReplay, released := responsesWebsocketReleasePinnedAuthAtRequestBoundary(
+		if release := responsesWebsocketReleasePinnedAuthAtRequestBoundary(
 			passthroughSessionID,
 			pinnedAuthID,
 			h.AuthManager,
 			sessionAuthByID,
-		); released {
-			pinnedAuthID = nextPinnedAuthID
-			forceTranscriptReplayNextRequest = forceReplay
+			wsTimelineLog,
+		); release.Released {
+			log.Infof(
+				"responses websocket: pinned auth released at request boundary id=%s auth=%s source=%s reason=%s",
+				passthroughSessionID,
+				pinnedAuthID,
+				release.Source,
+				release.Reason,
+			)
+			pinnedAuthID = release.NextPinnedAuthID
+			forceTranscriptReplayNextRequest = release.ForceTranscriptReplay
 		}
 
 		allowIncrementalInputWithPreviousResponseID := false
@@ -510,24 +518,80 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 }
 
+type responsesWebsocketPinnedAuthReleaseResult struct {
+	NextPinnedAuthID      string
+	ForceTranscriptReplay bool
+	Released              bool
+	Source                string
+	Reason                string
+}
+
 func responsesWebsocketReleasePinnedAuthAtRequestBoundary(
 	sessionID string,
 	pinnedAuthID string,
 	manager *coreauth.Manager,
 	resolveAuth func(string) (*coreauth.Auth, bool),
-) (nextPinnedAuthID string, forceTranscriptReplay bool, released bool) {
+	wsTimelineLog websocketTimelineAppender,
+) responsesWebsocketPinnedAuthReleaseResult {
 	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
 	if pinnedAuthID == "" || resolveAuth == nil {
-		return pinnedAuthID, false, false
+		return responsesWebsocketPinnedAuthReleaseResult{NextPinnedAuthID: pinnedAuthID}
 	}
 	pinnedAuth, ok := resolveAuth(pinnedAuthID)
-	if !ok || pinnedAuth == nil || !gettokenshooks.AccountRouteGuardBlocksAuth(pinnedAuth) {
-		return pinnedAuthID, false, false
+	if !ok || pinnedAuth == nil {
+		return responsesWebsocketPinnedAuthReleaseResult{NextPinnedAuthID: pinnedAuthID}
+	}
+	blocks := gettokenshooks.ActiveAccountRouteGuardBlocksForAuth(pinnedAuth)
+	if len(blocks) == 0 {
+		return responsesWebsocketPinnedAuthReleaseResult{NextPinnedAuthID: pinnedAuthID}
 	}
 	if manager != nil {
 		manager.CloseExecutionSession(sessionID)
 	}
-	return "", true, true
+	block := blocks[0]
+	appendResponsesWebsocketRouteGuardReleaseTimeline(wsTimelineLog, sessionID, pinnedAuthID, block)
+	return responsesWebsocketPinnedAuthReleaseResult{
+		NextPinnedAuthID:      "",
+		ForceTranscriptReplay: true,
+		Released:              true,
+		Source:                strings.TrimSpace(block.Source),
+		Reason:                strings.TrimSpace(block.Reason),
+	}
+}
+
+func appendResponsesWebsocketRouteGuardReleaseTimeline(
+	wsTimelineLog websocketTimelineAppender,
+	sessionID string,
+	authID string,
+	block gettokenshooks.AccountRouteGuardBlock,
+) {
+	if wsTimelineLog == nil {
+		return
+	}
+	payload := struct {
+		Type       string `json:"type"`
+		SessionID  string `json:"session_id,omitempty"`
+		AuthID     string `json:"auth_id,omitempty"`
+		AccountKey string `json:"account_key,omitempty"`
+		Source     string `json:"source,omitempty"`
+		Reason     string `json:"reason,omitempty"`
+		ExpiresAt  string `json:"expires_at,omitempty"`
+	}{
+		Type:       "route_guard_pinned_auth_released",
+		SessionID:  strings.TrimSpace(sessionID),
+		AuthID:     strings.TrimSpace(authID),
+		AccountKey: strings.TrimSpace(block.AccountKey),
+		Source:     strings.TrimSpace(block.Source),
+		Reason:     strings.TrimSpace(block.Reason),
+	}
+	if !block.ExpiresAt.IsZero() {
+		payload.ExpiresAt = block.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	wsTimelineLog.Append("guard", data, time.Now())
 }
 
 func websocketClientAddress(c *gin.Context) string {

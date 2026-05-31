@@ -367,6 +367,36 @@ func TestMixedSessionAffinityGetTokensRoutingDenyCannotBeBypassed(t *testing.T) 
 	}
 }
 
+func TestManagerAdmissionDenyFallsBackToNextAuth(t *testing.T) {
+	unregister := gettokensrouting.RegisterAdmissionPolicy(gettokensrouting.AdmissionPolicy{
+		Name: "test-admission-deny-first",
+		Admit: func(ctx context.Context, req gettokensrouting.RouteContext, candidate gettokensrouting.RouteCandidate) gettokensrouting.AdmissionDecision {
+			if candidate.ID == "auth-a" {
+				return gettokensrouting.AdmissionDecision{Active: true, Allow: false, Reason: "test admission deny"}
+			}
+			return gettokensrouting.AdmissionDecision{}
+		},
+	})
+	defer unregister()
+
+	executor := &admissionCaptureExecutor{id: "codex"}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = executor
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+
+	if _, err := manager.executeMixedOnce(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, 0); err != nil {
+		t.Fatalf("executeMixedOnce() error = %v", err)
+	}
+	if executor.lastAuthID != "auth-b" {
+		t.Fatalf("executed auth = %q, want fallback auth-b", executor.lastAuthID)
+	}
+}
+
 func TestSchedulerSessionAffinityStickyPolicyBindsSelectedAuth(t *testing.T) {
 	manager := NewManager(nil, NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
@@ -398,4 +428,39 @@ func TestSchedulerSessionAffinityStickyPolicyBindsSelectedAuth(t *testing.T) {
 	if first == nil || second == nil || first.ID != second.ID {
 		t.Fatalf("sticky picks = (%#v, %#v), want same auth", first, second)
 	}
+}
+
+type admissionCaptureExecutor struct {
+	id         string
+	lastAuthID string
+}
+
+func (e *admissionCaptureExecutor) Identifier() string { return e.id }
+
+func (e *admissionCaptureExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if auth != nil {
+		e.lastAuthID = auth.ID
+	}
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *admissionCaptureExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ch := make(chan cliproxyexecutor.StreamChunk)
+	close(ch)
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *admissionCaptureExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *admissionCaptureExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if auth != nil {
+		e.lastAuthID = auth.ID
+	}
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *admissionCaptureExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
 }

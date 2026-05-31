@@ -541,6 +541,10 @@ func (p usageAttributionPlugin) HandleUsage(ctx context.Context, record coreusag
 	}
 	if err := p.store.insert(event); err != nil {
 		log.WithError(err).Warn("gettokenshooks: persist usage attribution failed")
+		return
+	}
+	if err := completeRateLimitAfterUsage(ctx, event); err != nil {
+		log.WithError(err).WithField("account_key", event.AccountKey).Warn("gettokenshooks: refresh rate limit after usage failed")
 	}
 }
 

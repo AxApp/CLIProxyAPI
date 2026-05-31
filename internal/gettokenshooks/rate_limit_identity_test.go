@@ -115,7 +115,7 @@ func TestRateLimitEvaluatorUsesOnlyAccountKey(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	if err := store.upsertRule(RateLimitRule{
 		ID:         "rule-1",
-		AccountKey: "codex-api-key:stable-001",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
 		Strategy:   RateLimitStrategyRequestWindow,
 		Window:     "1h",
 		LimitValue: 1,
@@ -145,12 +145,34 @@ func TestRateLimitEvaluatorUsesOnlyAccountKey(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	state, ok := evaluator.StateForAccount("codex-api-key:stable-001")
+	state, ok := evaluator.StateForAccount("acct_00000000-0000-4000-8000-000000000001")
 	if !ok {
 		t.Fatal("missing account state")
 	}
 	if state.Blocked {
 		t.Fatalf("state = %#v, want no block because usage belongs to another account card", state)
+	}
+}
+
+func TestRateLimitRuleRejectsLegacyAccountKeys(t *testing.T) {
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	err = store.upsertRule(RateLimitRule{
+		ID:         "legacy-key-rule",
+		AccountKey: "codex-api-key:stable-001",
+		Strategy:   RateLimitStrategyRequestWindow,
+		Window:     "1h",
+		LimitValue: 1,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, time.Now().UTC())
+	if err == nil {
+		t.Fatal("upsert legacy account key succeeded, want acct_* validation error")
+	}
+	if !strings.Contains(err.Error(), "acct_") {
+		t.Fatalf("error = %v, want acct_* validation detail", err)
 	}
 }
 

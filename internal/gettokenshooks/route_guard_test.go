@@ -3,6 +3,7 @@ package gettokenshooks
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestAccountRouteGuardManualDisabledDeniesCandidate(t *testing.T) {
 	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "codex-auth-1" {
 		t.Fatalf("DenyIDs = %#v, want disabled auth only", decision.DenyIDs)
 	}
-	if decision.Reason != "gettokens account route guard" {
+	if !strings.Contains(decision.Reason, "gettokens account route guard") || !strings.Contains(decision.Reason, AccountRouteGuardSourceManualDisabled) {
 		t.Fatalf("Reason = %q", decision.Reason)
 	}
 	if !store.IsAuthBlocked(auth) {
@@ -61,6 +62,70 @@ func TestAccountRouteGuardSourcesDoNotUnblockEachOther(t *testing.T) {
 	store.ClearAuth(AccountRouteGuardSourceManualDisabled, authID)
 	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: authID}}); len(got) != 0 {
 		t.Fatalf("DenyIDs after clearing manual-disabled = %#v, want empty", got)
+	}
+}
+
+func TestAccountRouteGuardActiveBlocksForAuthReturnsSourceDetails(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	auth := &coreauth.Auth{
+		ID:         "codex-auth-1",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Provider:   "codex",
+	}
+	expiresAt := time.Now().UTC().Add(time.Hour)
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceRateLimit,
+		AccountKey: auth.AccountKey,
+		Reason:     "1h requests 已满",
+		ExpiresAt:  expiresAt,
+	})
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:    AccountRouteGuardSourceManualDisabled,
+		AuthID:    auth.ID,
+		Reason:    "disabled by user",
+		ExpiresAt: time.Now().UTC().Add(-time.Minute),
+	})
+
+	blocks := store.ActiveBlocksForAuth(auth)
+	if len(blocks) != 1 {
+		t.Fatalf("active blocks = %#v, want only unexpired rate-limit block", blocks)
+	}
+	if blocks[0].Source != AccountRouteGuardSourceRateLimit || blocks[0].Reason != "1h requests 已满" {
+		t.Fatalf("active block = %#v, want rate-limit source details", blocks[0])
+	}
+	if !blocks[0].ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("ExpiresAt = %v, want %v", blocks[0].ExpiresAt, expiresAt)
+	}
+}
+
+func TestAccountRouteGuardPolicyReasonIncludesActiveSources(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	authA := &coreauth.Auth{ID: "auth-a", AccountKey: "acct_00000000-0000-4000-8000-000000000001", Provider: "codex"}
+	authB := &coreauth.Auth{ID: "auth-b", AccountKey: "acct_00000000-0000-4000-8000-000000000002", Provider: "codex"}
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceManualDisabled,
+		AuthID:     authA.ID,
+		AccountKey: authA.AccountKey,
+		Reason:     "disabled by user",
+	})
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceRateLimit,
+		AccountKey: authB.AccountKey,
+		Reason:     "1h requests 已满",
+	})
+
+	decision := accountRouteGuardPolicy{store: store}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: authA.ID, Value: authA},
+			{ID: authB.ID, Value: authB},
+		},
+	})
+
+	if len(decision.DenyIDs) != 2 || decision.DenyIDs[0] != authA.ID || decision.DenyIDs[1] != authB.ID {
+		t.Fatalf("DenyIDs = %#v, want both guarded auths", decision.DenyIDs)
+	}
+	if !strings.Contains(decision.Reason, AccountRouteGuardSourceManualDisabled) || !strings.Contains(decision.Reason, AccountRouteGuardSourceRateLimit) {
+		t.Fatalf("Reason = %q, want active guard sources", decision.Reason)
 	}
 }
 
