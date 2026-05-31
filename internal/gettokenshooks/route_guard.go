@@ -16,6 +16,7 @@ import (
 const (
 	AccountRouteGuardSourceManualDisabled       = "manual-disabled"
 	AccountRouteGuardSourceRateLimit            = "rate-limit"
+	AccountRouteGuardSourceQuotaEmpty           = "quota-empty"
 	AccountRouteGuardSourceAuthError            = "auth-error"
 	AccountRouteGuardSourceUpstreamRateLimit    = "upstream-rate-limit"
 	AccountRouteGuardSourceUpstreamTransientErr = "upstream-error"
@@ -100,10 +101,35 @@ type AccountRouteGuardResultHook struct {
 	Store *AccountRouteGuardStore
 }
 
+func (h AccountRouteGuardResultHook) OnAuthRegistered(_ context.Context, auth *coreauth.Auth) {
+	store := h.Store
+	if store == nil {
+		store = defaultAccountRouteGuardStore
+	}
+	store.SyncQuotaEmptyAuth(auth, time.Now().UTC())
+}
+
+func (h AccountRouteGuardResultHook) OnAuthUpdated(_ context.Context, auth *coreauth.Auth) {
+	store := h.Store
+	if store == nil {
+		store = defaultAccountRouteGuardStore
+	}
+	store.SyncQuotaEmptyAuth(auth, time.Now().UTC())
+}
+
 func (h AccountRouteGuardResultHook) OnResult(_ context.Context, result coreauth.Result) {
 	store := h.Store
 	if store == nil {
 		store = defaultAccountRouteGuardStore
+	}
+	if result.Success {
+		store.ClearAuth(AccountRouteGuardSourceQuotaEmpty, result.AuthID)
+		store.MarkResult(result)
+		return
+	}
+	if block, ok := quotaEmptyRouteGuardBlockForResult(result, time.Now().UTC()); ok {
+		store.MarkBlocked(block)
+		return
 	}
 	store.MarkResult(result)
 }
@@ -193,6 +219,7 @@ func (s *AccountRouteGuardStore) ClearAuth(source string, authID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.removeLocked(source, authID)
+	s.removeLookupKeyLocked(source, authID)
 }
 
 func (s *AccountRouteGuardStore) DenyIDsForCandidates(candidates []*coreauth.Auth) []string {
@@ -339,6 +366,29 @@ func (s *AccountRouteGuardStore) removeLocked(source string, key string) {
 				delete(s.lookup, lookupKey)
 			}
 		}
+	}
+}
+
+func (s *AccountRouteGuardStore) removeLookupKeyLocked(source string, lookupKey string) {
+	lookupKey = strings.TrimSpace(lookupKey)
+	if lookupKey == "" {
+		return
+	}
+	entries := s.lookup[lookupKey]
+	if len(entries) == 0 {
+		return
+	}
+	blockKeys := make([]string, 0, len(entries))
+	for _, block := range entries {
+		if strings.TrimSpace(block.Source) != source {
+			continue
+		}
+		if key := accountRouteGuardBlockKey(block); key != "" {
+			blockKeys = append(blockKeys, key)
+		}
+	}
+	for _, key := range blockKeys {
+		s.removeLocked(source, key)
 	}
 }
 

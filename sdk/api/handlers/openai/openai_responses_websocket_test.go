@@ -1630,9 +1630,11 @@ func TestResponsesWebsocketReleasesPinnedAuthAfterRouteGuardBlock(t *testing.T) 
 func TestResponsesWebsocketRequestBoundaryReleaseUsesRouteGuard(t *testing.T) {
 	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
 	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceQuotaEmpty)
 	t.Cleanup(func() {
 		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceManualDisabled)
 		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceQuotaEmpty)
 	})
 
 	auth := &coreauth.Auth{ID: "auth-a", Provider: "codex", Status: coreauth.StatusActive}
@@ -1664,6 +1666,26 @@ func TestResponsesWebsocketRequestBoundaryReleaseUsesRouteGuard(t *testing.T) {
 	timeline := timelineLog.String()
 	if !strings.Contains(timeline, `"source":"rate-limit"`) || !strings.Contains(timeline, `"reason":"1h requests 已满"`) {
 		t.Fatalf("timeline missing guard release explain: %s", timeline)
+	}
+
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)
+	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
+		Source:    gettokenshooks.AccountRouteGuardSourceQuotaEmpty,
+		AuthID:    auth.ID,
+		Reason:    "quota empty: requests_5h",
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	timelineLog = newInMemoryWebsocketTimelineLog()
+	result = responsesWebsocketReleasePinnedAuthAtRequestBoundary("session-a", auth.ID, nil, resolve, timelineLog)
+	if !result.Released || !result.ForceTranscriptReplay || result.NextPinnedAuthID != "" {
+		t.Fatalf("quota guarded release = %#v, want released replay", result)
+	}
+	if result.Source != gettokenshooks.AccountRouteGuardSourceQuotaEmpty || result.Reason != "quota empty: requests_5h" {
+		t.Fatalf("quota guarded release source = (%q, %q), want quota-empty reason", result.Source, result.Reason)
+	}
+	timeline = timelineLog.String()
+	if !strings.Contains(timeline, `"source":"quota-empty"`) || !strings.Contains(timeline, `"reason":"quota empty: requests_5h"`) {
+		t.Fatalf("timeline missing quota guard release explain: %s", timeline)
 	}
 }
 

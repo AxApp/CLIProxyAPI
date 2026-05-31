@@ -1783,6 +1783,7 @@ func rollbackRateLimitRuleChange(store *rateLimitStore, evaluator *RateLimitEval
 
 func ConfigureGetTokensManagementRoutes(group *gin.RouterGroup, handler *handlers.BaseAPIHandler, cfg *config.Config) {
 	ConfigureUsageAttributionRoutes(group, handler, cfg)
+	ConfigureQuotaRuntimeRoutes(group, handler, cfg)
 	ConfigureRateLimitRoutes(group, handler, cfg)
 	ConfigureLiveSessionRoutes(group, handler, cfg)
 }
