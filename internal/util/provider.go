@@ -101,8 +101,8 @@ func IsOpenAICompatibilityAlias(modelName string, cfg *config.Config) bool {
 		if compat.Disabled {
 			continue
 		}
-		for _, model := range compat.Models {
-			if model.Alias == modelName {
+		for _, model := range openAICompatibilityModelsForLookup(compat) {
+			if openAICompatibilityClientModelName(model) == strings.TrimSpace(modelName) {
 				return true
 			}
 		}
@@ -129,13 +129,35 @@ func GetOpenAICompatibilityConfig(alias string, cfg *config.Config) (*config.Ope
 		if compat.Disabled {
 			continue
 		}
-		for _, model := range compat.Models {
-			if model.Alias == alias {
+		for _, model := range openAICompatibilityModelsForLookup(compat) {
+			if openAICompatibilityClientModelName(model) == strings.TrimSpace(alias) {
 				return &compat, &model
 			}
 		}
 	}
 	return nil, nil
+}
+
+func openAICompatibilityClientModelName(model config.OpenAICompatibilityModel) string {
+	if alias := strings.TrimSpace(model.Alias); alias != "" {
+		return alias
+	}
+	return strings.TrimSpace(model.Name)
+}
+
+func openAICompatibilityModelsForLookup(compat config.OpenAICompatibility) []config.OpenAICompatibilityModel {
+	if len(compat.Models) > 0 {
+		return compat.Models
+	}
+	name := strings.ToLower(strings.TrimSpace(compat.Name))
+	baseURL := strings.ToLower(strings.TrimSpace(compat.BaseURL))
+	if name != "deepseek" && !strings.Contains(baseURL, "api.deepseek.com") {
+		return nil
+	}
+	return []config.OpenAICompatibilityModel{
+		{Name: "deepseek-v4-flash"},
+		{Name: "deepseek-v4-pro"},
+	}
 }
 
 // InArray checks if a string exists in a slice of strings.

@@ -17,6 +17,7 @@ var providerAppliers = map[string]ProviderApplier{
 	"openai":      nil,
 	"codex":       nil,
 	"antigravity": nil,
+	"deepseek":    nil,
 	"kimi":        nil,
 	"xai":         nil,
 }
@@ -324,6 +325,8 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 	case "gemini", "gemini-cli", "antigravity":
 		return extractGeminiConfig(body, provider)
 	case "openai":
+		return extractOpenAIConfig(body)
+	case "deepseek":
 		return extractOpenAIConfig(body)
 	case "codex", "xai":
 		return extractCodexConfig(body)

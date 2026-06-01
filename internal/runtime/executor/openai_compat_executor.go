@@ -113,7 +113,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	thinkingTo := e.thinkingProviderFormat(auth, baseURL)
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingTo, thinkingTo)
 	if err != nil {
 		return resp, err
 	}
@@ -312,7 +313,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	thinkingTo := e.thinkingProviderFormat(auth, baseURL)
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingTo, thinkingTo)
 	if err != nil {
 		return nil, err
 	}
@@ -737,6 +739,36 @@ func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (base
 		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 	}
 	return
+}
+
+func (e *OpenAICompatExecutor) thinkingProviderFormat(auth *cliproxyauth.Auth, baseURL string) string {
+	if isDeepSeekOpenAICompat(auth, e.Identifier(), baseURL) {
+		return "deepseek"
+	}
+	return "openai"
+}
+
+func isDeepSeekOpenAICompat(auth *cliproxyauth.Auth, provider, baseURL string) bool {
+	parts := []string{provider, baseURL}
+	if auth != nil {
+		parts = append(parts, auth.Provider, auth.Label)
+		for _, key := range []string{"compat_name", "provider_key", "base_url"} {
+			if auth.Attributes == nil {
+				continue
+			}
+			parts = append(parts, auth.Attributes[key])
+		}
+	}
+	for _, part := range parts {
+		value := strings.ToLower(strings.TrimSpace(part))
+		if value == "" {
+			continue
+		}
+		if strings.Contains(value, "api.deepseek.com") || strings.Contains(value, "deepseek") {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *config.OpenAICompatibility {

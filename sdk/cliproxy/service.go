@@ -1628,13 +1628,20 @@ type modelEntry interface {
 }
 
 func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []*ModelInfo {
-	if compat == nil || len(compat.Models) == 0 {
+	if compat == nil {
+		return nil
+	}
+	configModels := compat.Models
+	if len(configModels) == 0 {
+		configModels = defaultOpenAICompatibilityModels(compat)
+	}
+	if len(configModels) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
-	models := make([]*ModelInfo, 0, len(compat.Models))
-	for i := range compat.Models {
-		model := compat.Models[i]
+	models := make([]*ModelInfo, 0, len(configModels))
+	for i := range configModels {
+		model := configModels[i]
 		modelID := strings.TrimSpace(model.Alias)
 		if modelID == "" {
 			modelID = strings.TrimSpace(model.Name)
@@ -1662,6 +1669,21 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 		})
 	}
 	return models
+}
+
+func defaultOpenAICompatibilityModels(compat *config.OpenAICompatibility) []config.OpenAICompatibilityModel {
+	if compat == nil {
+		return nil
+	}
+	name := strings.ToLower(strings.TrimSpace(compat.Name))
+	baseURL := strings.ToLower(strings.TrimSpace(compat.BaseURL))
+	if name != "deepseek" && !strings.Contains(baseURL, "api.deepseek.com") {
+		return nil
+	}
+	return []config.OpenAICompatibilityModel{
+		{Name: "deepseek-v4-flash"},
+		{Name: "deepseek-v4-pro"},
+	}
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {

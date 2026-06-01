@@ -132,3 +132,50 @@ func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 		t.Fatal("expected chat model to keep default thinking support")
 	}
 }
+
+func TestRegisterModelsForAuth_OpenAICompatibilityDeepSeekDefaults(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:    "deepseek",
+					BaseURL: "https://api.deepseek.com/v1",
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-openai-compat-deepseek-defaults",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":    "api_key",
+			"compat_name":  "deepseek",
+			"provider_key": "deepseek",
+		},
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := modelRegistry.GetModelsForClient(auth.ID)
+	for _, id := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+		found := false
+		for _, model := range models {
+			if model != nil && model.ID == id {
+				found = true
+				if model.Type != "openai-compatibility" {
+					t.Fatalf("%s type = %q, want openai-compatibility", id, model.Type)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected default DeepSeek model %s to be registered, got %#v", id, models)
+		}
+	}
+}

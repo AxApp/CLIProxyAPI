@@ -117,6 +117,163 @@ func TestCodexModelRoutingResponsesHTTPDownstreamUpstreamSmoke(t *testing.T) {
 	}
 }
 
+func TestCodexDeepSeekOpenAICompatibleResponsesHTTPDownstreamChatUpstreamSmoke(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	capturedHeaders := make(chan http.Header, 1)
+	capturedBody := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %s, want /v1/chat/completions", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		capturedHeaders <- r.Header.Clone()
+		capturedBody <- bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-deepseek-smoke","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewOpenAICompatExecutor("openai-compatibility", &config.Config{}))
+	auth := &coreauth.Auth{
+		ID:       "auth-smoke-deepseek-openai-compatible",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"compat_name": "deepseek",
+			"api_key":     "sk-smoke-deepseek",
+			"base_url":    upstream.URL + "/v1",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:       "deepseek-v4-flash",
+		Type:     "openai-compatibility",
+		OwnedBy:  "deepseek",
+		Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+	}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"deepseek-v4-flash","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"xhigh"},"stream":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	setSmokeCodexHeaders(req.Header, "review")
+	req.Header.Set("Authorization", "Bearer inbound-should-not-forward")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("downstream status = %d, want 200; body=%s", resp.Code, resp.Body.String())
+	}
+	if got := gjson.GetBytes(resp.Body.Bytes(), "object").String(); got != "response" {
+		t.Fatalf("downstream object = %q, want response; body=%s", got, resp.Body.String())
+	}
+
+	headers := waitSmokeHeaders(t, capturedHeaders)
+	body := waitSmokeBody(t, capturedBody)
+	if got := headers.Get("Authorization"); got != "Bearer sk-smoke-deepseek" {
+		t.Fatalf("upstream Authorization = %q, want Bearer sk-smoke-deepseek", got)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "deepseek-v4-flash" {
+		t.Fatalf("upstream body model = %q, want deepseek-v4-flash; body=%s", got, body)
+	}
+	if !gjson.GetBytes(body, "messages").Exists() || gjson.GetBytes(body, "input").Exists() {
+		t.Fatalf("upstream body should be chat completions shape only; body=%s", body)
+	}
+	if got := gjson.GetBytes(body, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("upstream thinking.type = %q, want enabled; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "max" {
+		t.Fatalf("upstream reasoning_effort = %q, want max; body=%s", got, body)
+	}
+}
+
+func TestCodexDeepSeekOpenAICompatibleResponsesStreamDownstreamChatSSEUpstreamSmoke(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	capturedBody := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("upstream path = %s, want /v1/chat/completions", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		capturedBody <- bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"id":"chatcmpl-deepseek-stream-smoke","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"id":"chatcmpl-deepseek-stream-smoke","object":"chat.completion.chunk","created":1773896263,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(runtimeexecutor.NewOpenAICompatExecutor("openai-compatibility", &config.Config{}))
+	auth := &coreauth.Auth{
+		ID:       "auth-smoke-deepseek-openai-compatible-stream",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"compat_name": "deepseek",
+			"api_key":     "sk-smoke-deepseek-stream",
+			"base_url":    upstream.URL + "/v1",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{
+		ID:       "deepseek-v4-flash",
+		Type:     "openai-compatibility",
+		OwnedBy:  "deepseek",
+		Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+	}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"deepseek-v4-flash","input":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	setSmokeCodexHeaders(req.Header, "review")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("downstream status = %d, want 200; body=%s", resp.Code, resp.Body.String())
+	}
+	output := resp.Body.String()
+	if !strings.Contains(output, "response.output_text.delta") || !strings.Contains(output, "response.completed") {
+		t.Fatalf("downstream SSE missing responses events: %s", output)
+	}
+
+	body := waitSmokeBody(t, capturedBody)
+	if got := gjson.GetBytes(body, "model").String(); got != "deepseek-v4-flash" {
+		t.Fatalf("upstream body model = %q, want deepseek-v4-flash; body=%s", got, body)
+	}
+	if !gjson.GetBytes(body, "messages").Exists() || gjson.GetBytes(body, "input").Exists() {
+		t.Fatalf("upstream stream body should be chat completions shape only; body=%s", body)
+	}
+}
+
 func TestCodexResponsesDevSmokeRequestWindowAdmissionFallsBackWithMockUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceRateLimit)

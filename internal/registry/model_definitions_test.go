@@ -27,6 +27,23 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	assertGPT55ModelInfo(t, "lookup", model)
 }
 
+func TestCodexStaticModelsIncludeDeepSeekV4OpenAICompatibleModels(t *testing.T) {
+	models := GetStaticModelDefinitionsByChannel("codex")
+	for _, id := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+		model := findModelInfo(models, id)
+		if model == nil {
+			t.Fatalf("expected codex static definitions to include %s", id)
+		}
+		if model.OwnedBy != "deepseek" {
+			t.Fatalf("%s OwnedBy = %q, want deepseek", id, model.OwnedBy)
+		}
+		if model.Type != "openai-compatibility" {
+			t.Fatalf("%s Type = %q, want openai-compatibility", id, model.Type)
+		}
+		assertThinkingLevels(t, id, model, []string{"low", "medium", "high", "xhigh", "max"})
+	}
+}
+
 func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 	found := false
@@ -129,6 +146,22 @@ func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {
 	}
 
 	want := []string{"low", "medium", "high", "xhigh"}
+	if len(model.Thinking.Levels) != len(want) {
+		t.Fatalf("%s thinking level count mismatch: got %d, want %d", source, len(model.Thinking.Levels), len(want))
+	}
+	for i, level := range want {
+		if model.Thinking.Levels[i] != level {
+			t.Fatalf("%s thinking level %d mismatch: got %q, want %q", source, i, model.Thinking.Levels[i], level)
+		}
+	}
+}
+
+func assertThinkingLevels(t *testing.T, source string, model *ModelInfo, want []string) {
+	t.Helper()
+
+	if model.Thinking == nil {
+		t.Fatalf("%s missing thinking support", source)
+	}
 	if len(model.Thinking.Levels) != len(want) {
 		t.Fatalf("%s thinking level count mismatch: got %d, want %d", source, len(model.Thinking.Levels), len(want))
 	}

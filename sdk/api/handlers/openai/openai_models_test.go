@@ -120,3 +120,61 @@ func TestOpenAIModelsReturnsCodexCatalogForClientVersionRequests(t *testing.T) {
 		t.Fatalf("expected context_window in Codex payload")
 	}
 }
+
+func TestOpenAIModelsReturnsDeepSeekOpenAICompatibleCodexCatalogEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	authID := "test-openai-models-deepseek-compat"
+	modelRegistry.RegisterClient(authID, "openai-compatibility", []*registry.ModelInfo{{
+		ID:            "deepseek-v4-flash",
+		Object:        "model",
+		Created:       1764547200,
+		OwnedBy:       "deepseek",
+		Type:          "openai-compatibility",
+		DisplayName:   "deepseek-v4-flash",
+		Description:   "DeepSeek OpenAI-compatible model exposed to the Codex channel.",
+		ContextLength: 1000000,
+		Thinking:      &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+	}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(authID)
+	})
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/models", h.OpenAIModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=0.124.0", nil)
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	var payload struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Models) != 1 {
+		t.Fatalf("models length = %d, want 1", len(payload.Models))
+	}
+	model := payload.Models[0]
+	if model["slug"] != "deepseek-v4-flash" {
+		t.Fatalf("slug = %#v, want deepseek-v4-flash", model["slug"])
+	}
+	if model["display_name"] != "deepseek-v4-flash" {
+		t.Fatalf("display_name = %#v, want deepseek-v4-flash", model["display_name"])
+	}
+	if model["prefer_websockets"] != false {
+		t.Fatalf("prefer_websockets = %#v, want false", model["prefer_websockets"])
+	}
+	if model["context_window"] != float64(1000000) && model["context_window"] != 1000000 {
+		t.Fatalf("context_window = %#v, want 1000000", model["context_window"])
+	}
+}

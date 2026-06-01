@@ -8,6 +8,8 @@ import (
 
 const (
 	codexBuiltinImageModelID      = "gpt-image-2"
+	codexBuiltinDeepSeekFlashID   = "deepseek-v4-flash"
+	codexBuiltinDeepSeekProID     = "deepseek-v4-pro"
 	xaiBuiltinImageModelID        = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID = "grok-imagine-image-quality"
 	xaiBuiltinVideoModelID        = "grok-imagine-video"
@@ -93,7 +95,7 @@ func GetXAIModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+	return upsertModelInfos(models, codexBuiltinImageModelInfo(), codexBuiltinDeepSeekModelInfo(codexBuiltinDeepSeekFlashID), codexBuiltinDeepSeekModelInfo(codexBuiltinDeepSeekProID))
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
@@ -111,6 +113,20 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func codexBuiltinDeepSeekModelInfo(id string) *ModelInfo {
+	return &ModelInfo{
+		ID:          id,
+		Object:      "model",
+		Created:     1764547200, // 2025-12-01
+		OwnedBy:     "deepseek",
+		Type:        "openai-compatibility",
+		DisplayName: id,
+		Name:        id,
+		Description: "DeepSeek OpenAI-compatible model exposed to the Codex channel.",
+		Thinking:    &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}},
 	}
 }
 
