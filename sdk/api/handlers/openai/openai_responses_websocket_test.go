@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -2161,6 +2162,74 @@ func TestNormalizeSubsequentRequestIncrementalInputStillMerges(t *testing.T) {
 		if got != want {
 			t.Fatalf("input[%d].id = %q, want %q", i, got, want)
 		}
+	}
+}
+
+func TestNormalizeSubsequentRequestDedupesInputItemsByIDKeepingLast(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[
+		{"type":"message","role":"user","id":"msg-1","content":"hello"},
+		{"type":"message","role":"user","content":"no id from request"},
+		{"type":"message","role":"assistant","id":"dup-1","content":"stale"}
+	]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","role":"assistant","id":"dup-1","content":"middle"},
+		{"type":"message","role":"assistant","content":"no id from output"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[
+		{"type":"message","role":"user","id":"dup-1","content":"latest"},
+		{"type":"message","role":"user","id":"msg-2","content":"next"}
+	]}`)
+
+	normalized, next, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 5 {
+		t.Fatalf("input len = %d, want 5: %s", len(input), normalized)
+	}
+	wantIDs := []string{"msg-1", "", "", "dup-1", "msg-2"}
+	for i, want := range wantIDs {
+		if got := input[i].Get("id").String(); got != want {
+			t.Fatalf("input[%d].id = %q, want %q: %s", i, got, want, normalized)
+		}
+	}
+	if got := input[3].Get("content").String(); got != "latest" {
+		t.Fatalf("deduped item content = %q, want latest", got)
+	}
+	if string(next) != string(normalized) {
+		t.Fatalf("last request snapshot must use deduped input: next=%s normalized=%s", next, normalized)
+	}
+}
+
+func TestRepairResponsesWebsocketToolCallsThenDedupesTopLevelInput(t *testing.T) {
+	outputCache := newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
+	callCache := newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
+	sessionKey := "session-dedupe"
+	callCache.record(sessionKey, "call-1", json.RawMessage(`{"type":"function_call","call_id":"call-1","id":"fc-inserted","name":"tool"}`))
+
+	payload := []byte(`{"model":"gpt-5.4","input":[
+		{"type":"message","id":"msg-1","content":"keep"},
+		{"type":"message","id":"dup-1","content":"old"},
+		{"type":"function_call_output","call_id":"call-1","id":"out-1","output":"done"},
+		{"type":"message","id":"dup-1","content":"new"},
+		{"type":"message","content":"no id"}
+	]}`)
+
+	repaired := repairResponsesWebsocketToolCallsThenDedupe(outputCache, callCache, sessionKey, payload)
+	input := gjson.GetBytes(repaired, "input").Array()
+	if len(input) != 5 {
+		t.Fatalf("input len = %d, want 5: %s", len(input), repaired)
+	}
+	wantIDs := []string{"msg-1", "fc-inserted", "out-1", "dup-1", ""}
+	for i, want := range wantIDs {
+		if got := input[i].Get("id").String(); got != want {
+			t.Fatalf("input[%d].id = %q, want %q: %s", i, got, want, repaired)
+		}
+	}
+	if got := input[3].Get("content").String(); got != "new" {
+		t.Fatalf("deduped item content = %q, want new", got)
 	}
 }
 

@@ -217,6 +217,54 @@ func TestNormalizeAmpToolNames_GlobPreserved(t *testing.T) {
 	}
 }
 
+func TestResponseRewriter_RestoresRequestToolCasing_NonStreaming(t *testing.T) {
+	requestBody := []byte(`{"tools":[{"name":"Glob","input_schema":{"type":"object"}}]}`)
+	rw := NewResponseRewriterForRequest(nil, "", requestBody)
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"glob","input":{"pattern":"*.go"}}]}`)
+
+	result := rw.rewriteModelInResponse(input)
+
+	if !contains(result, []byte(`"name":"Glob"`)) {
+		t.Fatalf("expected glob to be restored to request casing Glob, got %s", string(result))
+	}
+}
+
+func TestResponseRewriter_RestoresRequestToolCasing_Streaming(t *testing.T) {
+	requestBody := []byte(`{"tools":[{"name":"Glob","input_schema":{"type":"object"}}]}`)
+	rw := NewResponseRewriterForRequest(nil, "", requestBody)
+	input := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"glob\",\"id\":\"toolu_01\",\"input\":{}}}\n\n")
+
+	result := rw.rewriteStreamChunk(input)
+
+	if !contains(result, []byte(`"name":"Glob"`)) {
+		t.Fatalf("expected streaming glob to be restored to request casing Glob, got %s", string(result))
+	}
+}
+
+func TestResponseRewriter_RestoresToolChoiceCasing(t *testing.T) {
+	requestBody := []byte(`{"tool_choice":{"type":"tool","name":"Glob"}}`)
+	rw := NewResponseRewriterForRequest(nil, "", requestBody)
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"glob","input":{"pattern":"*.go"}}]}`)
+
+	result := rw.rewriteModelInResponse(input)
+
+	if !contains(result, []byte(`"name":"Glob"`)) {
+		t.Fatalf("expected tool_choice casing to restore glob->Glob, got %s", string(result))
+	}
+}
+
+func TestResponseRewriter_RequestToolCasingConflictDoesNotForceRewrite(t *testing.T) {
+	requestBody := []byte(`{"tools":[{"name":"Glob","input_schema":{"type":"object"}},{"name":"glob","input_schema":{"type":"object"}}]}`)
+	rw := NewResponseRewriterForRequest(nil, "", requestBody)
+	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"glob","input":{"pattern":"*.go"}}]}`)
+
+	result := rw.rewriteModelInResponse(input)
+
+	if contains(result, []byte(`"name":"Glob"`)) {
+		t.Fatalf("expected conflicting Glob/glob request declarations not to force rewrite, got %s", string(result))
+	}
+}
+
 func TestNormalizeAmpToolNames_UnknownToolUntouched(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_use","id":"toolu_01","name":"edit_file","input":{"path":"/tmp/x"}}]}`)
 	result := normalizeAmpToolNames(input)

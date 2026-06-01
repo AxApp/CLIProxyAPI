@@ -44,6 +44,24 @@ func TestCodexStaticModelsIncludeDeepSeekV4OpenAICompatibleModels(t *testing.T) 
 	}
 }
 
+func TestClaudeStaticModelsIncludeOpus48(t *testing.T) {
+	model := findModelInfo(GetClaudeModels(), "claude-opus-4-8")
+	if model == nil {
+		t.Fatal("expected Claude static definitions to include claude-opus-4-8")
+	}
+	if model.OwnedBy != "anthropic" {
+		t.Fatalf("OwnedBy = %q, want anthropic", model.OwnedBy)
+	}
+	if model.Type != "claude" {
+		t.Fatalf("Type = %q, want claude", model.Type)
+	}
+	assertThinkingLevels(t, "claude-opus-4-8", model, []string{"low", "medium", "high", "xhigh", "max"})
+
+	if LookupStaticModelInfo("claude-opus-4-8") == nil {
+		t.Fatal("expected LookupStaticModelInfo to find claude-opus-4-8")
+	}
+}
+
 func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 	found := false
@@ -57,6 +75,19 @@ func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected %s builtin model", xaiBuiltinVideoModelID)
+	}
+}
+
+func TestWithXAIBuiltinsAddsPreviewVideoModel(t *testing.T) {
+	model := findModelInfo(WithXAIBuiltins(nil), xaiBuiltinVideo15PreviewModelID)
+	if model == nil {
+		t.Fatalf("expected %s builtin model", xaiBuiltinVideo15PreviewModelID)
+	}
+	if model.OwnedBy != "xai" {
+		t.Fatalf("OwnedBy = %q, want xai", model.OwnedBy)
+	}
+	if model.Type != "xai" {
+		t.Fatalf("Type = %q, want xai", model.Type)
 	}
 }
 
