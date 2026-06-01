@@ -11,6 +11,11 @@ var installRoutingPoliciesOnce sync.Once
 
 // InstallRoutingPolicies installs GetTokens-owned routing policies.
 func InstallRoutingPolicies() {
+	InstallRoutingPoliciesWithConfigPath("")
+}
+
+func InstallRoutingPoliciesWithConfigPath(configPath string) {
+	SetChannelRoutingPolicyConfigPathFromConfig(configPath)
 	installRoutingPoliciesOnce.Do(func() {
 		gettokensrouting.RegisterPolicy(channelRoutingPolicy())
 		gettokensrouting.RegisterPolicy(accountRouteGuardRoutingPolicy(nil))

@@ -53,7 +53,8 @@ func TestInstallGetTokensHooksInstallsRoutingPolicy(t *testing.T) {
 func TestInstallGetTokensHooksChannelRoutingBypassesFillFirstStrategy(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	channelConfigPath := filepath.Join(home, ".config", "gettokens-data", "channel-routing", "config.json")
+	configPath := filepath.Join(home, ".config", "gettokens-dev", "config.yaml")
+	channelConfigPath := filepath.Join(filepath.Dir(configPath), "channel-routing", "config.json")
 	if err := os.MkdirAll(filepath.Dir(channelConfigPath), 0o700); err != nil {
 		t.Fatalf("mkdir channel routing config: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestInstallGetTokensHooksChannelRoutingBypassesFillFirstStrategy(t *testing
 }`), 0o600); err != nil {
 		t.Fatalf("write channel routing config: %v", err)
 	}
-	if err := installGetTokensHooks(&config.Config{}, t.TempDir()); err != nil {
+	if err := installGetTokensHooks(&config.Config{}, configPath); err != nil {
 		t.Fatalf("install hooks: %v", err)
 	}
 

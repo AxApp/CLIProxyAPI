@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -32,6 +33,11 @@ type channelRoutingPolicyAccountGroup struct {
 }
 
 var channelRoutingActiveSessionsByAuthID = currentLiveSessionActiveAuthCounts
+
+var channelRoutingPolicyConfigPathState struct {
+	sync.RWMutex
+	path string
+}
 
 func channelRoutingPolicy() gettokensrouting.Policy {
 	return gettokensrouting.Policy{
@@ -94,7 +100,33 @@ func loadChannelRoutingPolicyConfig(channel string) (channelRoutingPolicyConfig,
 	return cfg, true
 }
 
+func SetChannelRoutingPolicyConfigPathFromConfig(configPath string) {
+	path, err := channelRoutingPolicyConfigPathFromConfig(configPath)
+	if err != nil {
+		return
+	}
+	channelRoutingPolicyConfigPathState.Lock()
+	channelRoutingPolicyConfigPathState.path = path
+	channelRoutingPolicyConfigPathState.Unlock()
+}
+
 func channelRoutingPolicyConfigPath() (string, error) {
+	channelRoutingPolicyConfigPathState.RLock()
+	path := channelRoutingPolicyConfigPathState.path
+	channelRoutingPolicyConfigPathState.RUnlock()
+	if strings.TrimSpace(path) != "" {
+		return path, nil
+	}
+	return channelRoutingPolicyConfigPathFromConfig("")
+}
+
+func channelRoutingPolicyConfigPathFromConfig(configPath string) (string, error) {
+	if dir := strings.TrimSpace(configPath); dir != "" {
+		if strings.EqualFold(filepath.Base(dir), "config.yaml") || strings.EqualFold(filepath.Base(dir), "config.yml") {
+			dir = filepath.Dir(dir)
+		}
+		return filepath.Join(dir, "channel-routing", "config.json"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
