@@ -263,7 +263,6 @@ func (h *Handler) GetAccountModels(c *gin.Context) {
 					}
 				}
 			}
-			_ = store.Close()
 		}
 	}
 	if authID == "" {
@@ -329,7 +328,6 @@ func (h *Handler) saveTokenRecordToAccountStore(ctx context.Context, record *cor
 	if err != nil {
 		return "", err
 	}
-	defer store.Close()
 	payload, email, planType, accountID, err := accountStoreAuthFilePayload(record)
 	if err != nil {
 		return "", err

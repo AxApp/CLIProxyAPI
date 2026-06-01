@@ -50,6 +50,8 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open account store sqlite: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping account store sqlite: %w", err)
@@ -68,6 +70,7 @@ func sqliteDSN(path string) string {
 	query := dsn.Query()
 	query.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMs))
 	query.Add("_pragma", "foreign_keys(1)")
+	query.Add("_pragma", "journal_mode(WAL)")
 	dsn.RawQuery = query.Encode()
 	return dsn.String()
 }

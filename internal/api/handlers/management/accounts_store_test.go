@@ -3,17 +3,52 @@ package management
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 )
+
+func TestOpenAccountStoreReusesInitializedStoreWhenExternalWriterHoldsLock(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(context.Background())
+	if err != nil {
+		t.Fatalf("openAccountStore initial: %v", err)
+	}
+	defer store.Close()
+
+	locker, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite locker: %v", err)
+	}
+	defer locker.Close()
+	if _, err := locker.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("begin external write transaction: %v", err)
+	}
+	defer locker.Exec("ROLLBACK")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	reused, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("openAccountStore with external writer lock: %v", err)
+	}
+	if reused != store {
+		t.Fatal("openAccountStore should reuse the initialized store instead of opening and ensuring schema again")
+	}
+}
 
 func TestAccountMigrationDryRunAndCommitEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)

@@ -49,6 +49,9 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	accountStorePath    string
+	accountStoreMu      sync.Mutex
+	accountStore        *accountstore.Store
+	accountStoreDBPath  string
 	accountStoreApply   func(context.Context) error
 	accountStoreStatus  func(context.Context, accountstore.AccountRecord) error
 }
@@ -152,7 +155,18 @@ func (h *Handler) SetAccountStorePath(path string) {
 	if h == nil {
 		return
 	}
-	h.accountStorePath = strings.TrimSpace(path)
+	h.accountStoreMu.Lock()
+	defer h.accountStoreMu.Unlock()
+	nextPath := strings.TrimSpace(path)
+	if h.accountStorePath == nextPath {
+		return
+	}
+	h.accountStorePath = nextPath
+	if h.accountStore != nil {
+		_ = h.accountStore.Close()
+		h.accountStore = nil
+		h.accountStoreDBPath = ""
+	}
 }
 
 func (h *Handler) SetAccountStoreApplyHook(hook func(context.Context) error) {

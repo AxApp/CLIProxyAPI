@@ -45,7 +45,6 @@ func (h *Handler) GetAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	account, err := store.GetAccount(c.Request.Context(), c.Param("account_key"))
 	if err != nil {
 		writeAccountStoreError(c, err)
@@ -66,7 +65,6 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	account, err := store.CreateAccount(c.Request.Context(), write)
 	if err != nil {
 		writeAccountStoreError(c, err)
@@ -87,7 +85,6 @@ func (h *Handler) PatchAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	account, err := store.UpdateAccount(c.Request.Context(), c.Param("account_key"), write)
 	if err != nil {
 		writeAccountStoreError(c, err)
@@ -103,7 +100,6 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	if err := store.DeleteAccount(c.Request.Context(), c.Param("account_key")); err != nil {
 		writeAccountStoreError(c, err)
 		return
@@ -125,7 +121,6 @@ func (h *Handler) PatchAccountStatus(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	account, err := store.SetAccountStatus(c.Request.Context(), c.Param("account_key"), body.Disabled)
 	if err != nil {
 		writeAccountStoreError(c, err)
@@ -148,7 +143,6 @@ func (h *Handler) PatchAccountPriority(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	account, err := store.SetAccountPriority(c.Request.Context(), c.Param("account_key"), body.Priority)
 	if err != nil {
 		writeAccountStoreError(c, err)
@@ -164,7 +158,6 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	accounts, err := store.ListAccounts(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -268,7 +261,6 @@ func (h *Handler) CommitAccountMigration(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	commit, err := store.CommitImport(c.Request.Context(), report)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -307,7 +299,6 @@ func (h *Handler) DeleteLegacyAccountSources(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 	sources, err := store.ListUndeletedMigrationSources(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -448,9 +439,22 @@ func (h *Handler) buildAccountMigrationReport(ctx context.Context, req accountMi
 }
 
 func (h *Handler) openAccountStore(ctx context.Context) (*accountstore.Store, error) {
+	if h == nil {
+		return nil, fmt.Errorf("management handler is nil")
+	}
+	h.accountStoreMu.Lock()
+	defer h.accountStoreMu.Unlock()
 	dbPath, err := h.resolveAccountStorePath()
 	if err != nil {
 		return nil, err
+	}
+	if h.accountStore != nil && h.accountStoreDBPath == dbPath {
+		return h.accountStore, nil
+	}
+	if h.accountStore != nil {
+		_ = h.accountStore.Close()
+		h.accountStore = nil
+		h.accountStoreDBPath = ""
 	}
 	store, err := accountstore.Open(dbPath)
 	if err != nil {
@@ -460,6 +464,8 @@ func (h *Handler) openAccountStore(ctx context.Context) (*accountstore.Store, er
 		_ = store.Close()
 		return nil, err
 	}
+	h.accountStore = store
+	h.accountStoreDBPath = dbPath
 	return store, nil
 }
 

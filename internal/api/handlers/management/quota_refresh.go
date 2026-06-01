@@ -81,7 +81,6 @@ func (h *Handler) RefreshAccountQuota(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer store.Close()
 
 	account, err := store.GetAccount(c.Request.Context(), accountKey)
 	if err != nil {
