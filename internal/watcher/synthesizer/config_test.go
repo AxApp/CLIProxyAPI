@@ -95,6 +95,41 @@ func TestConfigSynthesizer_SynthesizesAccountStoreAuthFilesWhenStoreOwnsCodex(t 
 	}
 }
 
+func TestAccountStoreAccountsCachesWithinSynthesisPass(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "Plus",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "codex-plus.json",
+			AuthJSON:       `{"type":"codex","access_token":"token","account_id":"acct_chatgpt"}`,
+			AuthType:       "codex",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	ctx := &SynthesisContext{Config: &config.Config{AccountStoreDB: dbPath}}
+	accounts, active := accountStoreAccounts(ctx)
+	if !active || len(accounts) != 1 {
+		t.Fatalf("accountStoreAccounts active=%t len=%d, want one active account", active, len(accounts))
+	}
+	ctx.Config.AccountStoreDB = filepath.Join(t.TempDir(), "missing.sqlite")
+	if !accountStoreHasKind(ctx, accountstore.KindAuthFile) {
+		t.Fatal("accountStoreHasKind should use the synthesis-pass account store cache")
+	}
+}
+
 func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	tests := []struct {
 		name       string

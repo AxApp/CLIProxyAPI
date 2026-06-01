@@ -84,7 +84,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte, sk
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
-	if skipAccountStoreOwnedCodex && provider == "codex" && accountStoreHasKind(ctx.Config, accountstore.KindAuthFile) {
+	if skipAccountStoreOwnedCodex && provider == "codex" && accountStoreHasKind(ctx, accountstore.KindAuthFile) {
 		return nil
 	}
 	label := provider

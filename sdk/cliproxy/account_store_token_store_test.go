@@ -177,6 +177,66 @@ func TestAccountStoreTokenStoreSaveDoesNotFallbackForAccountStoreNonAuthFile(t *
 	}
 }
 
+func TestAccountStoreTokenStoreReusesSQLiteStore(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	created, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "Codex",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceLegacyAuthFile,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "codex-user-plus.json",
+			AuthJSON:       `{"type":"codex","access_token":"old","email":"user@example.com"}`,
+			AuthType:       "codex",
+			Email:          "user@example.com",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tokenStore := newAccountStoreTokenStore(&countingTokenStore{}, &config.Config{AccountStoreDB: dbPath})
+	accountStoreTokens, ok := tokenStore.(*accountStoreTokenStore)
+	if !ok {
+		t.Fatal("newAccountStoreTokenStore did not return accountStoreTokenStore")
+	}
+	auth := &coreauth.Auth{
+		ID:         "codex-user-plus.json",
+		AccountKey: created.AccountKey,
+		Provider:   "codex",
+		FileName:   "codex-user-plus.json",
+		Metadata: map[string]any{
+			"type":         "codex",
+			"access_token": "new-access",
+			"email":        "user@example.com",
+		},
+	}
+	if _, err := tokenStore.Save(ctx, auth); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	firstStore := accountStoreTokens.accountStore
+	if firstStore == nil {
+		t.Fatal("first Save did not cache the account store")
+	}
+	if _, err := tokenStore.Save(ctx, auth); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if accountStoreTokens.accountStore != firstStore {
+		t.Fatal("account store token saves should reuse the SQLite store for the same db path")
+	}
+}
+
 func TestAccountStoreTokenStoreSaveFallsBackForNonAccountStoreAuth(t *testing.T) {
 	fallback := &countingTokenStore{}
 	tokenStore := newAccountStoreTokenStore(fallback, &config.Config{AccountStoreDB: filepath.Join(t.TempDir(), "accounts-v1.sqlite")})

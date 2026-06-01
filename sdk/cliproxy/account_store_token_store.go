@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
@@ -15,8 +16,11 @@ import (
 )
 
 type accountStoreTokenStore struct {
-	fallback coreauth.Store
-	cfg      *config.Config
+	fallback           coreauth.Store
+	cfg                *config.Config
+	accountStoreMu     sync.Mutex
+	accountStore       *accountstore.Store
+	accountStoreDBPath string
 }
 
 func newAccountStoreTokenStore(fallback coreauth.Store, cfg *config.Config) coreauth.Store {
@@ -58,12 +62,10 @@ func (s *accountStoreTokenStore) saveAccountStoreAuth(ctx context.Context, auth 
 	if strings.TrimSpace(dbPath) == "" {
 		return "", false, nil
 	}
-	store, err := accountstore.Open(dbPath)
+	s.accountStoreMu.Lock()
+	defer s.accountStoreMu.Unlock()
+	store, err := s.openAccountStoreLocked(ctx, dbPath)
 	if err != nil {
-		return "", true, err
-	}
-	defer store.Close()
-	if err := store.EnsureSchema(ctx); err != nil {
 		return "", true, err
 	}
 	account, err := store.GetAccount(ctx, auth.AccountKey)
@@ -81,6 +83,28 @@ func (s *accountStoreTokenStore) saveAccountStoreAuth(ctx context.Context, auth 
 		return "", true, err
 	}
 	return "account-store:" + auth.AccountKey, true, nil
+}
+
+func (s *accountStoreTokenStore) openAccountStoreLocked(ctx context.Context, dbPath string) (*accountstore.Store, error) {
+	if s.accountStore != nil && s.accountStoreDBPath == dbPath {
+		return s.accountStore, nil
+	}
+	if s.accountStore != nil {
+		_ = s.accountStore.Close()
+		s.accountStore = nil
+		s.accountStoreDBPath = ""
+	}
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	s.accountStore = store
+	s.accountStoreDBPath = dbPath
+	return store, nil
 }
 
 func authFileCredentialFromRuntimeAuth(auth *coreauth.Auth, existing *accountstore.AuthFileCredential) (accountstore.AuthFileCredential, error) {

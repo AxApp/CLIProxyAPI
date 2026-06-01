@@ -50,21 +50,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 }
 
 func (s *ConfigSynthesizer) synthesizeAccountStore(ctx *SynthesisContext) ([]*coreauth.Auth, bool) {
-	path := strings.TrimSpace(ctx.Config.AccountStoreDB)
-	if path == "" {
-		return nil, false
-	}
-	path = expandAccountStorePath(path)
-	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
-		return nil, false
-	}
-	store, err := accountstore.Open(path)
-	if err != nil {
-		return nil, false
-	}
-	defer store.Close()
-	accounts, err := store.ListAccounts(context.Background())
-	if err != nil {
+	accounts, active := accountStoreAccounts(ctx)
+	if !active {
 		return nil, false
 	}
 	out := make([]*coreauth.Auth, 0, len(accounts))
@@ -83,25 +70,9 @@ func (s *ConfigSynthesizer) synthesizeAccountStore(ctx *SynthesisContext) ([]*co
 	return out, len(accounts) > 0
 }
 
-func accountStoreHasKind(cfg *config.Config, kind accountstore.AccountKind) bool {
-	if cfg == nil {
-		return false
-	}
-	path := strings.TrimSpace(cfg.AccountStoreDB)
-	if path == "" {
-		return false
-	}
-	path = expandAccountStorePath(path)
-	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
-		return false
-	}
-	store, err := accountstore.Open(path)
-	if err != nil {
-		return false
-	}
-	defer store.Close()
-	accounts, err := store.ListAccounts(context.Background())
-	if err != nil {
+func accountStoreHasKind(ctx *SynthesisContext, kind accountstore.AccountKind) bool {
+	accounts, active := accountStoreAccounts(ctx)
+	if !active {
 		return false
 	}
 	for _, account := range accounts {
@@ -110,6 +81,35 @@ func accountStoreHasKind(cfg *config.Config, kind accountstore.AccountKind) bool
 		}
 	}
 	return false
+}
+
+func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, bool) {
+	if ctx == nil || ctx.Config == nil {
+		return nil, false
+	}
+	if ctx.AccountStoreLoaded {
+		return ctx.AccountStoreAccounts, len(ctx.AccountStoreAccounts) > 0
+	}
+	ctx.AccountStoreLoaded = true
+	path := strings.TrimSpace(ctx.Config.AccountStoreDB)
+	if path == "" {
+		return nil, false
+	}
+	path = expandAccountStorePath(path)
+	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		return nil, false
+	}
+	store, err := accountstore.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer store.Close()
+	accounts, err := store.ListAccounts(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	ctx.AccountStoreAccounts = accounts
+	return accounts, len(accounts) > 0
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.

@@ -51,6 +51,7 @@ type Watcher struct {
 	authQueue         chan<- AuthUpdate
 	currentAuths      map[string]*coreauth.Auth
 	runtimeAuths      map[string]*coreauth.Auth
+	authRefreshMu     sync.Mutex
 	dispatchMu        sync.Mutex
 	dispatchCond      *sync.Cond
 	pendingUpdates    map[string]AuthUpdate

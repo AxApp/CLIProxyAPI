@@ -78,6 +78,9 @@ func (w *Watcher) dispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 }
 
 func (w *Watcher) refreshAuthState(force bool) {
+	w.authRefreshMu.Lock()
+	defer w.authRefreshMu.Unlock()
+
 	w.clientsMutex.RLock()
 	cfg := w.config
 	authDir := w.authDir
