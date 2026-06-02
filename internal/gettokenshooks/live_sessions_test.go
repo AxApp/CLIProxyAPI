@@ -3,6 +3,7 @@ package gettokenshooks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -171,6 +172,31 @@ func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testin
 	usage := detail.Requests[0].Usage
 	if usage == nil || usage.OutputTokens != 60 {
 		t.Fatalf("usage not applied to websocket request: %#v", detail.Requests[0])
+	}
+}
+
+func TestLiveSessionsSnapshotHidesRuntimeSessionsWithoutRequests(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	RecordDownstreamWebsocketConnected("passthrough-empty", "127.0.0.1")
+	RecordDownstreamWebsocketDisconnected("passthrough-empty", nil)
+	RecordCodexLiveUpstreamDisconnected("upstream-empty", errors.New("upstream closed before request"))
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 0 {
+		t.Fatalf("sessions = %d, want 0 for requestless runtime rows: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if snapshot.Summary.WebsocketSessions != 0 || snapshot.Summary.ActiveRequests != 0 {
+		t.Fatalf("summary counted requestless runtime rows: %#v", snapshot.Summary)
+	}
+
+	RecordDownstreamWebsocketRequest("passthrough-empty", "ws-req-1", "gpt-5.5")
+	snapshot = CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1 after real request: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if snapshot.Sessions[0].SessionID != "passthrough-empty" || snapshot.Sessions[0].RequestCount != 1 {
+		t.Fatalf("unexpected request-backed session: %#v", snapshot.Sessions[0])
 	}
 }
 

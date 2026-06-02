@@ -664,6 +664,9 @@ func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
 	t.pruneLocked(now)
 	items := make([]LiveSession, 0, len(t.sessions))
 	for _, state := range t.sessions {
+		if state == nil || len(state.requests) == 0 || strings.TrimSpace(state.session.SessionID) == "" {
+			continue
+		}
 		session := state.cloneRow(now)
 		items = append(items, session)
 	}
