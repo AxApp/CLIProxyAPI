@@ -66,20 +66,7 @@ func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T
 }
 
 func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
-	service := &Service{
-		cfg: &config.Config{
-			OpenAICompatibility: []config.OpenAICompatibility{
-				{
-					Name:    "images",
-					BaseURL: "https://example.com/v1",
-					Models: []config.OpenAICompatibilityModel{
-						{Name: "upstream-image", Alias: "compat-image", Image: true},
-						{Name: "upstream-chat", Alias: "compat-chat"},
-					},
-				},
-			},
-		},
-	}
+	service := &Service{cfg: &config.Config{}}
 	auth := &coreauth.Auth{
 		ID:       "auth-openai-compat-image",
 		Provider: "openai-compatibility",
@@ -88,6 +75,11 @@ func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 			"auth_kind":    "api_key",
 			"compat_name":  "images",
 			"provider_key": "images",
+			"base_url":     "https://example.com/v1",
+			"openai_compat_models": `[
+				{"name":"upstream-image","alias":"compat-image","image":true},
+				{"name":"upstream-chat","alias":"compat-chat"}
+			]`,
 		},
 	}
 
@@ -133,25 +125,18 @@ func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 	}
 }
 
-func TestRegisterModelsForAuth_OpenAICompatibilityDeepSeekDefaults(t *testing.T) {
-	service := &Service{
-		cfg: &config.Config{
-			OpenAICompatibility: []config.OpenAICompatibility{
-				{
-					Name:    "deepseek",
-					BaseURL: "https://api.deepseek.com/v1",
-				},
-			},
-		},
-	}
+func TestRegisterModelsForAuth_OpenAICompatibilityUsesAuthModelAttributes(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
 	auth := &coreauth.Auth{
-		ID:       "auth-openai-compat-deepseek-defaults",
+		ID:       "auth-openai-compat-model-attrs",
 		Provider: "openai-compatibility",
 		Status:   coreauth.StatusActive,
 		Attributes: map[string]string{
-			"auth_kind":    "api_key",
-			"compat_name":  "deepseek",
-			"provider_key": "deepseek",
+			"auth_kind":            "api_key",
+			"compat_name":          "deepseek",
+			"provider_key":         "deepseek",
+			"base_url":             "https://api.deepseek.com/v1",
+			"openai_compat_models": `[{"name":"deepseek-v4-flash"},{"name":"deepseek-v4-pro"}]`,
 		},
 	}
 
@@ -177,5 +162,87 @@ func TestRegisterModelsForAuth_OpenAICompatibilityDeepSeekDefaults(t *testing.T)
 		if !found {
 			t.Fatalf("expected default DeepSeek model %s to be registered, got %#v", id, models)
 		}
+	}
+}
+
+func TestRegisterModelsForAuth_OpenAICompatibilityDoesNotFallbackToConfig(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:    "deepseek",
+					BaseURL: "https://api.deepseek.com/v1",
+					Models: []config.OpenAICompatibilityModel{
+						{Name: "deepseek-v4-flash"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:       "auth-openai-compat-no-model-attrs",
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":    "api_key",
+			"compat_name":  "deepseek",
+			"provider_key": "deepseek",
+			"base_url":     "https://api.deepseek.com/v1",
+		},
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	if models := modelRegistry.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("models len = %d, want 0 without openai_compat_models attr; models=%#v", len(models), models)
+	}
+}
+
+func TestRegisterModelsForAuth_AccountStoreOpenAICompatibilityModels(t *testing.T) {
+	service := &Service{cfg: &config.Config{AccountStoreDB: "/tmp/accounts-v1.sqlite"}}
+	auth := &coreauth.Auth{
+		ID:       "auth-account-store-openai-compat-deepseek",
+		Provider: "deepseek",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"auth_kind":            "api_key",
+			"compat_name":          "deepseek",
+			"provider_key":         "deepseek",
+			"base_url":             "https://api.deepseek.com/v1",
+			"openai_compat_models": `[{"name":"deepseek-v4-flash"}]`,
+		},
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := modelRegistry.GetModelsForClient(auth.ID)
+	if len(models) != 1 {
+		t.Fatalf("models len = %d, want 1; models=%#v", len(models), models)
+	}
+	if models[0].ID != "deepseek-v4-flash" {
+		t.Fatalf("model ID = %q, want deepseek-v4-flash", models[0].ID)
+	}
+	providers := modelRegistry.GetModelProviders("deepseek-v4-flash")
+	found := false
+	for _, provider := range providers {
+		if provider == "deepseek" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("deepseek-v4-flash providers = %v, want deepseek", providers)
 	}
 }

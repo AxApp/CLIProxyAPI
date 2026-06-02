@@ -604,7 +604,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 		if session := t.sessions[sessionID]; session != nil {
 			if req := session.requests[requestID]; req != nil {
 				req.request.Usage = liveUsage(record.Detail)
-				fillTiming(&req.request, record.Detail, now)
+				fillTimingFromUsageRecord(&req.request, record, now)
 				persistLiveRequestHistory(session.session, req.request)
 				compactLiveRequestForMemory(req)
 				return
@@ -629,7 +629,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 	req.request.Status = "completed"
 	req.request.CompletedAt = formatLiveTime(now)
 	req.request.Usage = liveUsage(record.Detail)
-	fillTiming(&req.request, record.Detail, now)
+	fillTimingFromUsageRecord(&req.request, record, now)
 	req.request.Timeline = append(req.request.Timeline, liveEvent(t.nextEventIDLocked(), now, "sidecar", "completed", "HTTP request completed", "success", ""))
 	t.requestMap[requestID] = sessionID
 	persistLiveRequestHistory(session.session, req.request)
@@ -1568,6 +1568,44 @@ func fillTiming(req *LiveRequest, detail coreusage.Detail, now time.Time) {
 	total := detail.TotalTokens
 	if total == 0 {
 		total = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+	}
+	if total > 0 {
+		req.Timing.TotalTokensPerSecond = float64(total) / seconds
+	}
+}
+
+func fillTimingFromUsageRecord(req *LiveRequest, record coreusage.Record, now time.Time) {
+	if req == nil {
+		return
+	}
+	fillTiming(req, record.Detail, now)
+	hasUsageLatency := false
+	if record.Latency > 0 {
+		req.Timing.TotalDurationMs = maxInt64(1, record.Latency.Milliseconds())
+		hasUsageLatency = true
+	}
+	if record.TTFT > 0 {
+		ttftMs := maxInt64(1, record.TTFT.Milliseconds())
+		if req.Timing.FirstEventMs == 0 {
+			req.Timing.FirstEventMs = ttftMs
+		}
+		if req.Timing.FirstTokenMs == 0 {
+			req.Timing.FirstTokenMs = ttftMs
+		}
+	}
+	if (req.Timing.StreamDurationMs == 0 || hasUsageLatency) && req.Timing.TotalDurationMs > 0 && req.Timing.FirstEventMs > 0 {
+		req.Timing.StreamDurationMs = maxInt64(0, req.Timing.TotalDurationMs-req.Timing.FirstEventMs)
+	}
+	seconds := float64(req.Timing.TotalDurationMs) / 1000
+	if seconds <= 0 {
+		return
+	}
+	if record.Detail.OutputTokens > 0 {
+		req.Timing.OutputTokensPerSecond = float64(record.Detail.OutputTokens) / seconds
+	}
+	total := record.Detail.TotalTokens
+	if total == 0 {
+		total = record.Detail.InputTokens + record.Detail.OutputTokens + record.Detail.ReasoningTokens
 	}
 	if total > 0 {
 		req.Timing.TotalTokensPerSecond = float64(total) / seconds

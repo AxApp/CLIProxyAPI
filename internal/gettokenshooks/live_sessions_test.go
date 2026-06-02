@@ -86,6 +86,7 @@ func TestLiveSessionsRouteReturnsWebsocketRequestSnapshot(t *testing.T) {
 func TestLiveSessionsObserveUsageRecordCreatesHTTPCompletedSession(t *testing.T) {
 	resetLiveSessionTrackerForTest(t)
 
+	requestedAt := time.Now().Add(-2 * time.Second)
 	ctx := internallogging.WithRequestID(context.Background(), "http-req-1")
 	ctx = internallogging.WithEndpoint(ctx, "POST /v1/responses")
 	ObserveCodexLiveUsage(ctx, coreusage.Record{
@@ -94,8 +95,9 @@ func TestLiveSessionsObserveUsageRecordCreatesHTTPCompletedSession(t *testing.T)
 		Alias:       "gpt-5.4",
 		AuthID:      "codex:apikey:local-1",
 		AuthType:    "api-key",
-		RequestedAt: time.Now().Add(-2 * time.Second),
+		RequestedAt: requestedAt,
 		Latency:     2 * time.Second,
+		TTFT:        450 * time.Millisecond,
 		Detail:      coreusage.Detail{OutputTokens: 80, TotalTokens: 120},
 	})
 
@@ -109,6 +111,36 @@ func TestLiveSessionsObserveUsageRecordCreatesHTTPCompletedSession(t *testing.T)
 	}
 	if session.Status != "completed" {
 		t.Fatalf("status = %q, want completed", session.Status)
+	}
+	if session.TimingSummary == nil {
+		t.Fatal("timing summary is nil")
+	}
+	if got := liveTimingSummaryInt64Value(t, session.TimingSummary.Averages.TotalDurationMs); got != 2000 {
+		t.Fatalf("summary total duration = %d, want 2000", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, session.TimingSummary.Averages.FirstEventMs); got != 450 {
+		t.Fatalf("summary ttft = %d, want 450", got)
+	}
+	if got := liveTimingSummaryInt64Value(t, session.TimingSummary.Averages.FirstTokenMs); got != 450 {
+		t.Fatalf("summary first token = %d, want 450", got)
+	}
+
+	detail := currentLiveSessionDetailSnapshotForTest(t, "http-req-1")
+	if len(detail.Requests) != 1 {
+		t.Fatalf("detail requests = %d, want 1: %#v", len(detail.Requests), detail.Requests)
+	}
+	request := detail.Requests[0]
+	if request.Timing.TotalDurationMs != 2000 {
+		t.Fatalf("request total duration = %d, want 2000", request.Timing.TotalDurationMs)
+	}
+	if request.Timing.FirstEventMs != 450 {
+		t.Fatalf("request ttft = %d, want 450", request.Timing.FirstEventMs)
+	}
+	if request.Timing.FirstTokenMs != 450 {
+		t.Fatalf("request first token = %d, want 450", request.Timing.FirstTokenMs)
+	}
+	if request.Timing.StreamDurationMs != 1550 {
+		t.Fatalf("request stream duration = %d, want 1550", request.Timing.StreamDurationMs)
 	}
 }
 
@@ -158,6 +190,7 @@ func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testin
 		AuthID:      "auth-file:team-codex",
 		RequestedAt: time.Now().Add(-1 * time.Second),
 		Latency:     time.Second,
+		TTFT:        300 * time.Millisecond,
 		Detail:      coreusage.Detail{OutputTokens: 60, TotalTokens: 100},
 	})
 
@@ -172,6 +205,12 @@ func TestLiveSessionsObserveUsageRecordUpdatesExistingWebsocketRequest(t *testin
 	usage := detail.Requests[0].Usage
 	if usage == nil || usage.OutputTokens != 60 {
 		t.Fatalf("usage not applied to websocket request: %#v", detail.Requests[0])
+	}
+	if detail.Requests[0].Timing.FirstEventMs != 300 || detail.Requests[0].Timing.FirstTokenMs != 300 {
+		t.Fatalf("ttft not applied to websocket request: %#v", detail.Requests[0].Timing)
+	}
+	if detail.Requests[0].Timing.StreamDurationMs != 700 {
+		t.Fatalf("stream duration = %d, want 700", detail.Requests[0].Timing.StreamDurationMs)
 	}
 }
 

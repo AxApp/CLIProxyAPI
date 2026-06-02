@@ -585,6 +585,9 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	if auths[1].Provider != "deepseek" || auths[1].Attributes["api_key"] != "sk-db-ds" {
 		t.Fatalf("compat auth not synthesized from db: provider=%s attrs=%+v", auths[1].Provider, auths[1].Attributes)
 	}
+	if auths[1].Attributes["openai_compat_models"] != `[{"name":"deepseek-chat","alias":"deepseek-chat"}]` {
+		t.Fatalf("compat models not synthesized from db: %+v", auths[1].Attributes)
+	}
 }
 
 func TestConfigSynthesizer_AccountStoreExistsWithNoActiveAccountsSuppressesLegacyCodexSources(t *testing.T) {
@@ -848,6 +851,66 @@ func TestConfigSynthesizer_OpenAICompat_WithModelsHash(t *testing.T) {
 	}
 	if auths[0].Attributes["api_key"] != "key-with-models" {
 		t.Errorf("expected api_key key-with-models, got %s", auths[0].Attributes["api_key"])
+	}
+}
+
+func TestConfigSynthesizer_AccountStoreOpenAICompat_DeepSeekDefaultsMaterialized(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindOpenAICompatible,
+		Title:            "DeepSeek",
+		Provider:         "deepseek",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		OpenAICompatible: &accountstore.OpenAICompatibleCredential{
+			ProviderName:      "deepseek",
+			BaseURL:           "https://api.deepseek.com/v1",
+			APIKeyEntriesJSON: `[{"api-key":"key-deepseek"}]`,
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount compat: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			AccountStoreDB: dbPath,
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	models := decodeOpenAICompatModels(auths[0].Attributes["openai_compat_models"])
+	if len(models) != 2 {
+		t.Fatalf("models len = %d, want 2; attr=%q", len(models), auths[0].Attributes["openai_compat_models"])
+	}
+	want := map[string]bool{
+		"deepseek-v4-flash": false,
+		"deepseek-v4-pro":   false,
+	}
+	for _, model := range models {
+		if _, ok := want[model.Name]; ok {
+			want[model.Name] = true
+		}
+	}
+	for model, found := range want {
+		if !found {
+			t.Fatalf("expected default model %s in %q", model, auths[0].Attributes["openai_compat_models"])
+		}
 	}
 }
 

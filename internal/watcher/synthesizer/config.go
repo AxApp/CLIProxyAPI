@@ -349,6 +349,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 	prefix := strings.TrimSpace(compat.Prefix)
 	headers := decodeStringMap(compat.HeadersJSON)
 	models := decodeOpenAICompatModels(compat.ModelsJSON)
+	modelsAttr := openAICompatModelsJSONAttr(compat.ModelsJSON, compat.ProviderName, base, models)
 	entries := decodeOpenAICompatAPIKeys(compat.APIKeyEntriesJSON)
 	if len(entries) == 0 {
 		entries = []config.OpenAICompatibilityAPIKey{{}}
@@ -373,8 +374,11 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 		if key != "" {
 			attrs["api_key"] = key
 		}
-		if hash := diff.ComputeOpenAICompatModelsHash(models); hash != "" {
+		if hash := diff.ComputeOpenAICompatModelsHash(openAICompatModelsWithDefaults(compat.ProviderName, base, models)); hash != "" {
 			attrs["models_hash"] = hash
+		}
+		if modelsAttr != "" {
+			attrs["openai_compat_models"] = modelsAttr
 		}
 		for header, value := range headers {
 			attrs["header:"+header] = value
@@ -607,6 +611,39 @@ func decodeOpenAICompatAPIKeys(raw string) []config.OpenAICompatibilityAPIKey {
 	var entries []config.OpenAICompatibilityAPIKey
 	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &entries)
 	return entries
+}
+
+func openAICompatModelsJSONAttr(raw, name, baseURL string, models []config.OpenAICompatibilityModel) string {
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		decoded := decodeOpenAICompatModels(trimmed)
+		if len(decoded) > 0 {
+			return trimmed
+		}
+	}
+	effective := openAICompatModelsWithDefaults(name, baseURL, models)
+	if len(effective) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(effective)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func openAICompatModelsWithDefaults(name, baseURL string, models []config.OpenAICompatibilityModel) []config.OpenAICompatibilityModel {
+	if len(models) > 0 {
+		return models
+	}
+	providerName := strings.ToLower(strings.TrimSpace(name))
+	base := strings.ToLower(strings.TrimSpace(baseURL))
+	if providerName != "deepseek" && !strings.Contains(base, "api.deepseek.com") {
+		return nil
+	}
+	return []config.OpenAICompatibilityModel{
+		{Name: "deepseek-v4-flash"},
+		{Name: "deepseek-v4-pro"},
+	}
 }
 
 func decodeStringMap(raw string) map[string]string {

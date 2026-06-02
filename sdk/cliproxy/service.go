@@ -5,6 +5,7 @@ package cliproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1235,70 +1236,66 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	default:
-		// Handle OpenAI-compatibility providers by name using config
-		if s.cfg != nil {
-			providerKey := provider
-			compatName := strings.TrimSpace(a.Provider)
-			isCompatAuth := false
-			if compatDetected {
-				if compatProviderKey != "" {
-					providerKey = compatProviderKey
-				}
-				if compatDisplayName != "" {
-					compatName = compatDisplayName
-				}
-				isCompatAuth = true
+		providerKey := provider
+		compatName := strings.TrimSpace(a.Provider)
+		isCompatAuth := false
+		if compatDetected {
+			if compatProviderKey != "" {
+				providerKey = compatProviderKey
 			}
-			if strings.EqualFold(providerKey, "openai-compatibility") {
-				isCompatAuth = true
-				if a.Attributes != nil {
-					if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
-						compatName = v
-					}
-					if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
-						providerKey = strings.ToLower(v)
-						isCompatAuth = true
-					}
-				}
-				if providerKey == "openai-compatibility" && compatName != "" {
-					providerKey = strings.ToLower(compatName)
-				}
-			} else if a.Attributes != nil {
+			if compatDisplayName != "" {
+				compatName = compatDisplayName
+			}
+			isCompatAuth = true
+		}
+		if strings.EqualFold(providerKey, "openai-compatibility") {
+			isCompatAuth = true
+			if a.Attributes != nil {
 				if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
 					compatName = v
-					isCompatAuth = true
 				}
 				if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
 					providerKey = strings.ToLower(v)
-					isCompatAuth = true
 				}
 			}
-			for i := range s.cfg.OpenAICompatibility {
-				compat := &s.cfg.OpenAICompatibility[i]
-				if compat.Disabled {
-					continue
-				}
-				if strings.EqualFold(compat.Name, compatName) {
-					isCompatAuth = true
-					ms := buildOpenAICompatibilityConfigModels(compat)
-					// Register and return
-					if len(ms) > 0 {
-						if providerKey == "" {
-							providerKey = "openai-compatibility"
-						}
-						s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
-					} else {
-						// Ensure stale registrations are cleared when model list becomes empty.
-						GlobalModelRegistry().UnregisterClient(a.ID)
-					}
-					return
-				}
+			if strings.EqualFold(providerKey, "openai-compatibility") && compatName != "" {
+				providerKey = strings.ToLower(compatName)
 			}
-			if isCompatAuth {
-				// No matching provider found or models removed entirely; drop any prior registration.
+		} else if a.Attributes != nil {
+			if v := strings.TrimSpace(a.Attributes["compat_name"]); v != "" {
+				compatName = v
+				isCompatAuth = true
+			}
+			if v := strings.TrimSpace(a.Attributes["provider_key"]); v != "" {
+				providerKey = strings.ToLower(v)
+				isCompatAuth = true
+			}
+		}
+		if isCompatAuth {
+			authModels := decodeOpenAICompatModelsJSON(strings.TrimSpace(a.Attributes["openai_compat_models"]))
+			if len(authModels) == 0 {
 				GlobalModelRegistry().UnregisterClient(a.ID)
 				return
 			}
+			authCompat := &config.OpenAICompatibility{
+				Name:    compatName,
+				BaseURL: strings.TrimSpace(a.Attributes["base_url"]),
+				Models:  authModels,
+			}
+			ms := buildOpenAICompatibilityConfigModels(authCompat)
+			if len(ms) > 0 {
+				if providerKey == "" {
+					providerKey = "openai-compatibility"
+				}
+				forcePrefix := false
+				if s.cfg != nil {
+					forcePrefix = s.cfg.ForceModelPrefix
+				}
+				s.registerResolvedModelsForAuth(a, providerKey, applyModelPrefixes(ms, a.Prefix, forcePrefix))
+			} else {
+				GlobalModelRegistry().UnregisterClient(a.ID)
+			}
+			return
 		}
 	}
 	models = applyOAuthModelAlias(s.cfg, provider, authKind, models)
@@ -1633,9 +1630,6 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 	}
 	configModels := compat.Models
 	if len(configModels) == 0 {
-		configModels = defaultOpenAICompatibilityModels(compat)
-	}
-	if len(configModels) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
@@ -1671,19 +1665,16 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 	return models
 }
 
-func defaultOpenAICompatibilityModels(compat *config.OpenAICompatibility) []config.OpenAICompatibilityModel {
-	if compat == nil {
+func decodeOpenAICompatModelsJSON(raw string) []config.OpenAICompatibilityModel {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return nil
 	}
-	name := strings.ToLower(strings.TrimSpace(compat.Name))
-	baseURL := strings.ToLower(strings.TrimSpace(compat.BaseURL))
-	if name != "deepseek" && !strings.Contains(baseURL, "api.deepseek.com") {
+	var models []config.OpenAICompatibilityModel
+	if err := json.Unmarshal([]byte(raw), &models); err != nil {
 		return nil
 	}
-	return []config.OpenAICompatibilityModel{
-		{Name: "deepseek-v4-flash"},
-		{Name: "deepseek-v4-pro"},
-	}
+	return models
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
