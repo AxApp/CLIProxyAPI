@@ -20,6 +20,9 @@ type SynthesisContext struct {
 	// AccountStoreLoaded records whether AccountStoreAccounts has been resolved
 	// for this synthesis pass.
 	AccountStoreLoaded bool
+	// AccountStoreActive records whether the sidecar account store exists and
+	// was readable for this synthesis pass, even when it has zero active rows.
+	AccountStoreActive bool
 	// AccountStoreAccounts caches sidecar-owned accounts for one synthesis pass.
 	AccountStoreAccounts []accountstore.AccountRecord
 }

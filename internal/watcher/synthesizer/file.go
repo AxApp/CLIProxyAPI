@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -84,7 +83,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte, sk
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
-	if skipAccountStoreOwnedCodex && provider == "codex" && accountStoreHasKind(ctx, accountstore.KindAuthFile) {
+	if skipAccountStoreOwnedCodex && provider == "codex" && accountStoreConfigured(ctx) {
 		return nil
 	}
 	label := provider

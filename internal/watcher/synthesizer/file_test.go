@@ -534,6 +534,139 @@ func TestFileSynthesizer_SkipsCodexAuthFilesWhenAccountStoreOwnsAccounts(t *test
 	}
 }
 
+func TestFileSynthesizer_SkipsCodexAuthFilesWhenAccountStoreExistsWithoutAuthFileAccounts(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "deleted-codex.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","access_token":"legacy"}`), 0600); err != nil {
+		t.Fatalf("WriteFile authFile: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "DB Codex Key",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-db",
+			BaseURL: "https://api.example.com/v1",
+			Prefix:  "codex",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("file synthesizer returned %d auths, want 0 when account store is active without auth-file accounts", len(auths))
+	}
+}
+
+func TestFileSynthesizer_SkipsCodexAuthFilesWhenAccountStoreExistsWithNoActiveAccounts(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "deleted-codex.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","access_token":"legacy"}`), 0600); err != nil {
+		t.Fatalf("WriteFile authFile: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("file synthesizer returned %d auths, want 0 when account store exists with no active accounts", len(auths))
+	}
+}
+
+func TestFileSynthesizer_SkipsMultipleCodexAuthFilesWhenAccountStoreExistsWithNoActiveAccounts(t *testing.T) {
+	authDir := t.TempDir()
+	for _, name := range []string{"deleted-codex-a.json", "deleted-codex-b.json"} {
+		authFile := filepath.Join(authDir, name)
+		if err := os.WriteFile(authFile, []byte(`{"type":"codex","access_token":"legacy"}`), 0600); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("file synthesizer returned %d auths, want 0 for all legacy codex files when account store is active and empty", len(auths))
+	}
+}
+
+func TestFileSynthesizer_SkipsCodexAuthFilesWhenAccountStoreConfiguredButMissing(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "deleted-codex.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","access_token":"legacy"}`), 0600); err != nil {
+		t.Fatalf("WriteFile authFile: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: filepath.Join(t.TempDir(), "missing", "accounts-v1.sqlite")},
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("file synthesizer returned %d auths, want 0 when account store db is configured but unavailable", len(auths))
+	}
+}
+
 func TestSynthesizeGeminiVirtualAuths_NilInputs(t *testing.T) {
 	now := time.Now()
 

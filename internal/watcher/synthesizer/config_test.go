@@ -95,7 +95,7 @@ func TestConfigSynthesizer_SynthesizesAccountStoreAuthFilesWhenStoreOwnsCodex(t 
 	}
 }
 
-func TestAccountStoreAccountsCachesWithinSynthesisPass(t *testing.T) {
+func TestAccountStoreAccountsCachesRowsWithinSynthesisPass(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := accountstore.Open(dbPath)
 	if err != nil {
@@ -125,8 +125,32 @@ func TestAccountStoreAccountsCachesWithinSynthesisPass(t *testing.T) {
 		t.Fatalf("accountStoreAccounts active=%t len=%d, want one active account", active, len(accounts))
 	}
 	ctx.Config.AccountStoreDB = filepath.Join(t.TempDir(), "missing.sqlite")
-	if !accountStoreHasKind(ctx, accountstore.KindAuthFile) {
-		t.Fatal("accountStoreHasKind should use the synthesis-pass account store cache")
+	cached, cachedActive := accountStoreAccounts(ctx)
+	if !cachedActive || len(cached) != 1 {
+		t.Fatalf("accountStoreAccounts should use the synthesis-pass cache, active=%t len=%d", cachedActive, len(cached))
+	}
+}
+
+func TestAccountStoreAccountsCachesEmptyStoreWithinSynthesisPass(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	ctx := &SynthesisContext{Config: &config.Config{AccountStoreDB: dbPath}}
+	accounts, active := accountStoreAccounts(ctx)
+	if !active || len(accounts) != 0 {
+		t.Fatalf("accountStoreAccounts active=%t len=%d, want active empty store", active, len(accounts))
+	}
+	ctx.Config.AccountStoreDB = filepath.Join(t.TempDir(), "missing.sqlite")
+	cached, cachedActive := accountStoreAccounts(ctx)
+	if !cachedActive || len(cached) != 0 {
+		t.Fatalf("accountStoreAccounts should preserve empty-store availability in the synthesis-pass cache, active=%t len=%d", cachedActive, len(cached))
 	}
 }
 
@@ -560,6 +584,74 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	}
 	if auths[1].Provider != "deepseek" || auths[1].Attributes["api_key"] != "sk-db-ds" {
 		t.Fatalf("compat auth not synthesized from db: provider=%s attrs=%+v", auths[1].Provider, auths[1].Attributes)
+	}
+}
+
+func TestConfigSynthesizer_AccountStoreExistsWithNoActiveAccountsSuppressesLegacyCodexSources(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{
+			AccountStoreDB: dbPath,
+			CodexKey: []config.CodexKey{{
+				LocalID: "codex-api-key:legacy",
+				APIKey:  "sk-legacy",
+				BaseURL: "https://legacy.example.com",
+			}},
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "legacy",
+				BaseURL: "https://legacy.example.com",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey: "sk-legacy-openai-compatible",
+				}},
+			}},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("auths len = %d, want 0 when account store exists with no active accounts", len(auths))
+	}
+}
+
+func TestConfigSynthesizer_AccountStoreConfiguredButMissingSuppressesLegacyCodexSources(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{
+			AccountStoreDB: filepath.Join(t.TempDir(), "missing", "accounts-v1.sqlite"),
+			CodexKey: []config.CodexKey{{
+				LocalID: "codex-api-key:legacy",
+				APIKey:  "sk-legacy",
+				BaseURL: "https://legacy.example.com",
+			}},
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "legacy",
+				BaseURL: "https://legacy.example.com",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey: "sk-legacy-openai-compatible",
+				}},
+			}},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("auths len = %d, want 0 when account store db is configured but unavailable", len(auths))
 	}
 }
 

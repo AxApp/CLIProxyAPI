@@ -29,13 +29,13 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	if ctx == nil || ctx.Config == nil {
 		return out, nil
 	}
-	accountStoreAuths, accountStoreActive := s.synthesizeAccountStore(ctx)
+	accountStoreAuths, accountStoreConfigured := s.synthesizeAccountStore(ctx)
 
 	// Gemini API Keys
 	out = append(out, s.synthesizeGeminiKeys(ctx)...)
 	// Claude API Keys
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
-	if accountStoreActive {
+	if accountStoreConfigured {
 		out = append(out, accountStoreAuths...)
 	} else {
 		// Codex API Keys
@@ -50,9 +50,12 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 }
 
 func (s *ConfigSynthesizer) synthesizeAccountStore(ctx *SynthesisContext) ([]*coreauth.Auth, bool) {
+	if !accountStoreConfigured(ctx) {
+		return nil, false
+	}
 	accounts, active := accountStoreAccounts(ctx)
 	if !active {
-		return nil, false
+		return nil, true
 	}
 	out := make([]*coreauth.Auth, 0, len(accounts))
 	for _, account := range accounts {
@@ -67,20 +70,11 @@ func (s *ConfigSynthesizer) synthesizeAccountStore(ctx *SynthesisContext) ([]*co
 			out = append(out, s.synthesizeAccountStoreOpenAICompat(ctx, account)...)
 		}
 	}
-	return out, len(accounts) > 0
+	return out, true
 }
 
-func accountStoreHasKind(ctx *SynthesisContext, kind accountstore.AccountKind) bool {
-	accounts, active := accountStoreAccounts(ctx)
-	if !active {
-		return false
-	}
-	for _, account := range accounts {
-		if account.Kind == kind {
-			return true
-		}
-	}
-	return false
+func accountStoreConfigured(ctx *SynthesisContext) bool {
+	return ctx != nil && ctx.Config != nil && strings.TrimSpace(ctx.Config.AccountStoreDB) != ""
 }
 
 func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, bool) {
@@ -88,9 +82,10 @@ func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, 
 		return nil, false
 	}
 	if ctx.AccountStoreLoaded {
-		return ctx.AccountStoreAccounts, len(ctx.AccountStoreAccounts) > 0
+		return ctx.AccountStoreAccounts, ctx.AccountStoreActive
 	}
 	ctx.AccountStoreLoaded = true
+	ctx.AccountStoreActive = false
 	path := strings.TrimSpace(ctx.Config.AccountStoreDB)
 	if path == "" {
 		return nil, false
@@ -109,7 +104,8 @@ func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, 
 		return nil, false
 	}
 	ctx.AccountStoreAccounts = accounts
-	return accounts, len(accounts) > 0
+	ctx.AccountStoreActive = true
+	return accounts, true
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.
