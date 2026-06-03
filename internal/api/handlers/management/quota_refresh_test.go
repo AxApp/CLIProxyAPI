@@ -170,3 +170,34 @@ func jsonInt(value int64) string {
 	encoded, _ := json.Marshal(value)
 	return string(encoded)
 }
+
+func TestQuotaDraftReplacesArbitraryCurlVariables(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var gotOrg string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotOrg = r.Header.Get("X-Organization-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"billing","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":3600,"reset_at":` + jsonInt(time.Now().Add(time.Hour).Unix()) + `}}}`))
+	}))
+	defer upstream.Close()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	router := gin.New()
+	router.POST("/v0/management/gettokens/quota-test", h.TestQuotaCurl)
+
+	body := []byte(`{
+		"api_key":"sk-test",
+		"base_url":"` + upstream.URL + `",
+		"quota_curl":"curl -sS \"{{baseUrl}}/usage\" -H \"Authorization: Bearer {{apiKey}}\" -H \"X-Organization-Id: {{organizationId}}\"",
+		"curl_variables":{"organizationId":"org_123"}
+	}`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-test", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("quota-test status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if gotOrg != "org_123" {
+		t.Fatalf("X-Organization-Id = %q, want org_123", gotOrg)
+	}
+}

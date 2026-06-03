@@ -293,7 +293,14 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		Tried:    tried,
 		Now:      time.Now(),
 	}
-	if picked, active := shard.pickRoutingPolicyLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity.routingPolicy()); active {
+	if picked, active := shard.pickSessionAffinityLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity); active {
+		if picked != nil {
+			s.sessionAffinity.bindRouteResult(req, picked)
+			return picked, nil
+		}
+		return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	}
+	if picked, active := shard.pickRoutingPolicyLocked(ctx, req, preferWebsocket, predicate); active {
 		if picked != nil {
 			s.sessionAffinity.bindRouteResult(req, picked)
 			return picked, nil
@@ -845,6 +852,61 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	if changed {
 		m.rebuildIndexesLocked()
 	}
+}
+
+func (m *modelScheduler) pickSessionAffinityLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, selector *SessionAffinitySelector) (*Auth, bool) {
+	if m == nil || selector == nil || selector.cache == nil {
+		return nil, false
+	}
+	entries := m.sessionAffinityCandidatesLocked(preferWebsocket, predicate)
+	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{selector.routingPolicy()})
+	if !active {
+		return nil, false
+	}
+	if len(rewritten) == 0 || rewritten[0] == nil {
+		return nil, true
+	}
+	return rewritten[0].auth, true
+}
+
+func (m *modelScheduler) sessionAffinityCandidatesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []*scheduledAuth {
+	if m == nil {
+		return nil
+	}
+	m.promoteExpiredLocked(time.Now())
+	out := make([]*scheduledAuth, 0, len(m.entries))
+	seen := make(map[string]struct{}, len(m.entries))
+	appendEntry := func(entry *scheduledAuth) {
+		if entry == nil || entry.auth == nil || !predicate(entry) {
+			return
+		}
+		if entry.auth.Disabled || entry.auth.Status == StatusDisabled {
+			return
+		}
+		if preferWebsocket && !entry.meta.websocketEnabled {
+			return
+		}
+		id := strings.TrimSpace(entry.auth.ID)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, entry)
+	}
+	for _, priority := range m.priorityOrder {
+		if bucket := m.readyByPriority[priority]; bucket != nil {
+			for _, entry := range bucket.all.flat {
+				appendEntry(entry)
+			}
+		}
+	}
+	for _, entry := range m.entries {
+		appendEntry(entry)
+	}
+	return out
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.

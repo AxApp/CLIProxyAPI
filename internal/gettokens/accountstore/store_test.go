@@ -838,3 +838,38 @@ func mustWriteJSON(t *testing.T, path string, value any) {
 		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
 }
+
+func TestCodexAPIKeyCurlVariablesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	created, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Variable Key",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:            "sk-variable",
+			BaseURL:           "https://api.example.com/v1",
+			CurlVariablesJSON: `{"organizationId":"org_123","billingToken":"bt_456"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	loaded, err := store.GetAccount(ctx, created.AccountKey)
+	if err != nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if loaded.CodexAPIKey == nil || loaded.CodexAPIKey.CurlVariablesJSON != `{"organizationId":"org_123","billingToken":"bt_456"}` {
+		t.Fatalf("curl variables not round-tripped: %+v", loaded.CodexAPIKey)
+	}
+}

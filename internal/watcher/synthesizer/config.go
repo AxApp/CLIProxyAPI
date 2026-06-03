@@ -501,6 +501,9 @@ func synthesizeAccountStoreAuthFile(ctx *SynthesisContext, account accountstore.
 		return nil
 	}
 	fullPath := account.AuthFile.SourceFileName
+	if isMigrationBackupAuthFileName(fullPath) {
+		return nil
+	}
 	if fullPath == "" {
 		fullPath = account.AccountKey + ".json"
 	}
@@ -519,6 +522,19 @@ func synthesizeAccountStoreAuthFile(ctx *SynthesisContext, account accountstore.
 		}
 	}
 	return auths
+}
+
+func isMigrationBackupAuthFileName(name string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+	if normalized == "" {
+		return false
+	}
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == "migration-backups" {
+			return true
+		}
+	}
+	return false
 }
 
 // synthesizeOpenAICompat creates Auth entries for OpenAI-compatible providers.

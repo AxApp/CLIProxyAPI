@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -403,14 +404,17 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback      Selector
+	cache         *SessionCache
+	failureBudget int
+	poolEpoch     int64
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback      Selector
+	TTL           time.Duration
+	FailureBudget int
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -429,9 +433,13 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	if cfg.FailureBudget <= 0 {
+		cfg.FailureBudget = 2
+	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:      cfg.Fallback,
+		cache:         NewSessionCache(cfg.TTL),
+		failureBudget: cfg.FailureBudget,
 	}
 }
 
@@ -502,6 +510,46 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) RecordRouteFailure(opts cliproxyexecutor.Options, provider, model, authID string, err error) {
+	if s == nil || s.cache == nil || err == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	primaryID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if strings.TrimSpace(primaryID) == "" {
+		return
+	}
+	cacheKey := sessionAffinityCacheKey(sessionAffinityProviderKey(provider), primaryID, model)
+	failures := s.cache.IncrementFailure(cacheKey, strings.TrimSpace(authID))
+	if failures >= s.failureBudget {
+		s.cache.Invalidate(cacheKey)
+	}
+}
+
+func (s *SessionAffinitySelector) BumpPoolEpoch() {
+	if s == nil {
+		return
+	}
+	atomic.AddInt64(&s.poolEpoch, 1)
+}
+
+func (s *SessionAffinitySelector) CurrentPoolEpoch() int64 {
+	if s == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&s.poolEpoch)
+}
+
+func (s *SessionAffinitySelector) RecordRouteSuccess(opts cliproxyexecutor.Options, provider, model, authID string) {
+	if s == nil || s.cache == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	primaryID, _ := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if strings.TrimSpace(primaryID) == "" {
+		return
+	}
+	s.cache.ResetFailure(sessionAffinityCacheKey(sessionAffinityProviderKey(provider), primaryID, model), strings.TrimSpace(authID))
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {

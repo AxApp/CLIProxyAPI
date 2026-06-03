@@ -395,6 +395,7 @@ func (s *Service) applyAccountStoreStatusChange(_ context.Context, account accou
 	if s == nil || s.coreManager == nil || strings.TrimSpace(account.AccountKey) == "" {
 		return nil
 	}
+	s.coreManager.BumpSessionAffinityPoolEpoch()
 	for _, auth := range s.coreManager.List() {
 		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.AccountKey), strings.TrimSpace(account.AccountKey)) {
 			continue

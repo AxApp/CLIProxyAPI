@@ -162,6 +162,7 @@ type authFallbackExecutor struct {
 	streamCalls       []string
 	executeErrors     map[string]error
 	streamFirstErrors map[string]error
+	streamChunks      map[string][]cliproxyexecutor.StreamChunk
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -185,13 +186,18 @@ func (e *authFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cl
 	err := e.streamFirstErrors[auth.ID]
 	e.mu.Unlock()
 
-	ch := make(chan cliproxyexecutor.StreamChunk, 1)
-	if err != nil {
-		ch <- cliproxyexecutor.StreamChunk{Err: err}
-		close(ch)
-		return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
+	chunks := e.streamChunks[auth.ID]
+	if len(chunks) == 0 {
+		if err != nil {
+			chunks = []cliproxyexecutor.StreamChunk{{Err: err}}
+		} else {
+			chunks = []cliproxyexecutor.StreamChunk{{Payload: []byte(auth.ID)}}
+		}
 	}
-	ch <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	ch := make(chan cliproxyexecutor.StreamChunk, len(chunks))
+	for _, chunk := range chunks {
+		ch <- chunk
+	}
 	close(ch)
 	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
 }
@@ -849,5 +855,71 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 	}
 	if state := updatedBad.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+func TestManagerExecuteStream_PostCommitErrorDoesNotFallbackToNextAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamChunks: map[string][]cliproxyexecutor.StreamChunk{
+			"aa-committed-auth": {
+				{Payload: []byte("partial")},
+				{Err: &Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream closed before response.completed"}},
+			},
+			"bb-next-auth": {
+				{Payload: []byte("should-not-run")},
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	committedAuth := &Auth{ID: "aa-committed-auth", Provider: "claude"}
+	nextAuth := &Auth{ID: "bb-next-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(committedAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(nextAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(committedAuth.ID)
+		reg.UnregisterClient(nextAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), committedAuth); errRegister != nil {
+		t.Fatalf("register committed auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), nextAuth); errRegister != nil {
+		t.Fatalf("register next auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream error = %v, want stream result with post-commit error chunk", errExecute)
+	}
+	var payload []byte
+	var chunkErr error
+	for chunk := range streamResult.Chunks {
+		payload = append(payload, chunk.Payload...)
+		if chunk.Err != nil {
+			chunkErr = chunk.Err
+		}
+	}
+	if string(payload) != "partial" {
+		t.Fatalf("payload = %q, want first auth partial payload only", string(payload))
+	}
+	if chunkErr == nil {
+		t.Fatalf("expected terminal post-commit stream error")
+	}
+
+	got := executor.StreamCalls()
+	want := []string{committedAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
 	}
 }

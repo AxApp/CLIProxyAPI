@@ -827,7 +827,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, latency time.Duration) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel, routeModel string, opts cliproxyexecutor.Options, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, latency time.Duration) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -841,6 +841,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: latency})
+				m.recordSessionRouteFailure(opts, []string{provider}, provider, routeModel, auth.ID, chunk.Err)
 			}
 			if !forward {
 				return false
@@ -871,6 +872,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		if !failed {
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Latency: latency})
+			m.recordSessionRouteSuccess(opts, []string{provider}, provider, routeModel, auth.ID)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -964,7 +966,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, latency), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, routeModel, opts, streamResult.Headers, buffered, remaining, latency), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1225,9 +1227,20 @@ func (m *Manager) SetRouteDisabled(id string, disabled bool) (*Auth, bool) {
 		if strings.TrimSpace(next.StatusMessage) == "" {
 			next.StatusMessage = "account disabled"
 		}
-	} else if next.Status == StatusDisabled {
-		next.Status = StatusActive
+	} else {
+		if next.Status == StatusDisabled {
+			next.Status = StatusActive
+		}
 		next.StatusMessage = ""
+		// A user re-enabling an account is an explicit routing intent. Clear stale
+		// transient cooldown/unavailable state so the in-memory scheduler matches
+		// the account-store active set immediately instead of requiring a restart
+		// to rebuild runtime auths from SQLite.
+		next.Unavailable = false
+		next.NextRetryAfter = time.Time{}
+		next.LastError = nil
+		next.Quota = QuotaState{}
+		next.ModelStates = nil
 	}
 	next.UpdatedAt = time.Now().UTC()
 	m.auths[id] = next.Clone()
@@ -1267,6 +1280,34 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Unlock()
 	m.syncScheduler()
 	return nil
+}
+
+func sessionRouteProviderKey(providers []string, provider string) string {
+	if len(normalizeProviderKeys(providers)) > 1 {
+		return "mixed"
+	}
+	return provider
+}
+
+func (m *Manager) BumpSessionAffinityPoolEpoch() {
+	if m == nil || m.scheduler == nil || m.scheduler.sessionAffinity == nil {
+		return
+	}
+	m.scheduler.sessionAffinity.BumpPoolEpoch()
+}
+
+func (m *Manager) recordSessionRouteFailure(opts cliproxyexecutor.Options, providers []string, provider, model, authID string, err error) {
+	if m == nil || m.scheduler == nil || m.scheduler.sessionAffinity == nil || err == nil {
+		return
+	}
+	m.scheduler.sessionAffinity.RecordRouteFailure(opts, sessionRouteProviderKey(providers, provider), model, authID, err)
+}
+
+func (m *Manager) recordSessionRouteSuccess(opts cliproxyexecutor.Options, providers []string, provider, model, authID string) {
+	if m == nil || m.scheduler == nil || m.scheduler.sessionAffinity == nil {
+		return
+	}
+	m.scheduler.sessionAffinity.RecordRouteSuccess(opts, sessionRouteProviderKey(providers, provider), model, authID)
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.
@@ -1444,6 +1485,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1468,6 +1510,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errExec)
 				if isRequestInvalidError(errExec) {
 					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errExec
@@ -1476,6 +1519,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.recordSessionRouteSuccess(opts, providers, provider, routeModel, auth.ID)
 			admission.Lease.Commit(execCtx)
 			return resp, nil
 		}
@@ -1563,6 +1607,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1587,6 +1632,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errExec)
 				if isRequestInvalidError(errExec) {
 					admission.Lease.Release(execCtx)
 					return cliproxyexecutor.Response{}, errExec
@@ -1595,6 +1641,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.recordSessionRouteSuccess(opts, providers, provider, routeModel, auth.ID)
 			admission.Lease.Commit(execCtx)
 			return resp, nil
 		}
@@ -1680,6 +1727,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				result.Error.HTTPStatus = se.StatusCode()
 			}
 			m.MarkResult(execCtx, result)
+			m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errPrepare)
 			lastErr = errPrepare
 			continue
 		}
@@ -1690,6 +1738,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				admission.Lease.Release(execCtx)
 				return nil, errCtx
 			}
+			m.recordSessionRouteFailure(opts, providers, provider, routeModel, auth.ID, errStream)
 			if isRequestInvalidError(errStream) {
 				admission.Lease.Release(execCtx)
 				return nil, errStream

@@ -34,13 +34,14 @@ type quotaRefreshRequest struct {
 }
 
 type quotaCurlTestRequest struct {
-	APIKey         string `json:"api_key"`
-	BaseURL        string `json:"base_url"`
-	Prefix         string `json:"prefix,omitempty"`
-	QuotaCurl      string `json:"quota_curl,omitempty"`
-	BillingCurl    string `json:"billing_curl,omitempty"`
-	PlatformCookie string `json:"platform_cookie,omitempty"`
-	AccountKey     string `json:"account_key,omitempty"`
+	APIKey         string            `json:"api_key"`
+	BaseURL        string            `json:"base_url"`
+	Prefix         string            `json:"prefix,omitempty"`
+	QuotaCurl      string            `json:"quota_curl,omitempty"`
+	BillingCurl    string            `json:"billing_curl,omitempty"`
+	PlatformCookie string            `json:"platform_cookie,omitempty"`
+	CurlVariables  map[string]string `json:"curl_variables,omitempty"`
+	AccountKey     string            `json:"account_key,omitempty"`
 }
 
 type quotaCurlInput struct {
@@ -49,6 +50,7 @@ type quotaCurlInput struct {
 	BaseURL        string
 	Prefix         string
 	PlatformCookie string
+	CurlVariables  map[string]string
 }
 
 type quotaCurlRequest struct {
@@ -163,6 +165,7 @@ func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountst
 		BaseURL:        credential.BaseURL,
 		Prefix:         credential.Prefix,
 		PlatformCookie: credential.PlatformCookie,
+		CurlVariables:  decodeCurlVariablesJSON(credential.CurlVariablesJSON, credential.PlatformCookie),
 	}, authForCodexAPIKeyAccount(account))
 	if err != nil {
 		return gettokenshooks.QuotaRuntimeState{}, err
@@ -175,6 +178,7 @@ func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountst
 			BaseURL:        credential.BaseURL,
 			Prefix:         credential.Prefix,
 			PlatformCookie: credential.PlatformCookie,
+			CurlVariables:  decodeCurlVariablesJSON(credential.CurlVariablesJSON, credential.PlatformCookie),
 		}, authForCodexAPIKeyAccount(account)); errBilling == nil {
 			quota.Billing = billing
 		} else {
@@ -223,6 +227,7 @@ func quotaCurlInputFromTestRequest(req quotaCurlTestRequest, curl string) (quota
 		BaseURL:        strings.TrimSpace(req.BaseURL),
 		Prefix:         strings.TrimSpace(req.Prefix),
 		PlatformCookie: normalizePlatformCookie(req.PlatformCookie),
+		CurlVariables:  normalizeCurlVariables(req.CurlVariables),
 	}
 	if input.APIKey == "" {
 		return quotaCurlInput{}, errors.New("api key is empty")
@@ -608,13 +613,28 @@ func nextQuotaCurlValue(tokens []string, index int) (string, int, error) {
 }
 
 func applyQuotaCurlPlaceholders(value string, input quotaCurlInput) string {
-	replacer := strings.NewReplacer(
-		"{{apiKey}}", strings.TrimSpace(input.APIKey),
-		"{{baseUrl}}", normalizeQuotaBaseURL(input.BaseURL),
-		"{{prefix}}", normalizeQuotaPrefix(input.Prefix),
-		"{{platformCookie}}", strings.TrimSpace(input.PlatformCookie),
-	)
-	return replacer.Replace(value)
+	variables := map[string]string{
+		"apiKey":  strings.TrimSpace(input.APIKey),
+		"baseUrl": normalizeQuotaBaseURL(input.BaseURL),
+		"prefix":  normalizeQuotaPrefix(input.Prefix),
+	}
+	if cookie := strings.TrimSpace(input.PlatformCookie); cookie != "" {
+		variables["platformCookie"] = cookie
+	}
+	for key, variableValue := range input.CurlVariables {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		variables[trimmedKey] = strings.TrimSpace(variableValue)
+	}
+	if _, ok := variables["platformCookie"]; !ok {
+		variables["platformCookie"] = ""
+	}
+	for key, variableValue := range variables {
+		value = strings.ReplaceAll(value, "{{"+key+"}}", variableValue)
+	}
+	return value
 }
 
 func containsUnsupportedQuotaShellOperator(value string) bool {
@@ -1325,6 +1345,45 @@ func roundQuotaNumber(value float64) float64 {
 
 func quotaBoolPtrValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func decodeCurlVariablesJSON(value string, platformCookie string) map[string]string {
+	variables := map[string]string{}
+	if strings.TrimSpace(value) != "" {
+		var decoded map[string]string
+		if err := json.Unmarshal([]byte(value), &decoded); err == nil {
+			for key, variableValue := range normalizeCurlVariables(decoded) {
+				variables[key] = variableValue
+			}
+		}
+	}
+	if cookie := normalizePlatformCookie(platformCookie); cookie != "" {
+		if _, ok := variables["platformCookie"]; !ok {
+			variables["platformCookie"] = cookie
+		}
+	}
+	if len(variables) == 0 {
+		return nil
+	}
+	return variables
+}
+
+func normalizeCurlVariables(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		out[trimmedKey] = strings.TrimSpace(value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func normalizePlatformCookie(value string) string {

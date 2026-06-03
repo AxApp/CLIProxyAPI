@@ -7,8 +7,10 @@ import (
 
 // sessionEntry stores auth binding with expiration.
 type sessionEntry struct {
-	authID    string
-	expiresAt time.Time
+	authID       string
+	expiresAt    time.Time
+	failureCount int
+	poolEpoch    int64
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -86,9 +88,90 @@ func (c *SessionCache) Set(sessionID, authID string) {
 		return
 	}
 	c.mu.Lock()
-	c.entries[sessionID] = sessionEntry{
-		authID:    authID,
-		expiresAt: time.Now().Add(c.ttl),
+	entry := c.entries[sessionID]
+	if entry.authID != authID {
+		entry.failureCount = 0
+	}
+	entry.authID = authID
+	entry.expiresAt = time.Now().Add(c.ttl)
+	c.entries[sessionID] = entry
+	c.mu.Unlock()
+}
+
+func (c *SessionCache) SetWithEpoch(sessionID, authID string, epoch int64) {
+	if sessionID == "" || authID == "" {
+		return
+	}
+	c.mu.Lock()
+	entry := c.entries[sessionID]
+	if entry.authID != authID {
+		entry.failureCount = 0
+	}
+	entry.authID = authID
+	entry.poolEpoch = epoch
+	entry.expiresAt = time.Now().Add(c.ttl)
+	c.entries[sessionID] = entry
+	c.mu.Unlock()
+}
+
+func (c *SessionCache) GetEpoch(sessionID string) (string, int64, bool) {
+	if sessionID == "" {
+		return "", 0, false
+	}
+	c.mu.RLock()
+	entry, ok := c.entries[sessionID]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(entry.expiresAt) {
+		c.Invalidate(sessionID)
+		return "", 0, false
+	}
+	return entry.authID, entry.poolEpoch, true
+}
+
+func (c *SessionCache) FailureCount(sessionID, authID string) int {
+	if sessionID == "" || authID == "" {
+		return 0
+	}
+	c.mu.RLock()
+	entry, ok := c.entries[sessionID]
+	c.mu.RUnlock()
+	if !ok || entry.authID != authID {
+		return 0
+	}
+	if time.Now().After(entry.expiresAt) {
+		c.Invalidate(sessionID)
+		return 0
+	}
+	return entry.failureCount
+}
+
+func (c *SessionCache) IncrementFailure(sessionID, authID string) int {
+	if sessionID == "" || authID == "" {
+		return 0
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != authID || now.After(entry.expiresAt) {
+		return 0
+	}
+	entry.failureCount++
+	entry.expiresAt = now.Add(c.ttl)
+	c.entries[sessionID] = entry
+	return entry.failureCount
+}
+
+func (c *SessionCache) ResetFailure(sessionID, authID string) {
+	if sessionID == "" || authID == "" {
+		return
+	}
+	c.mu.Lock()
+	entry, ok := c.entries[sessionID]
+	if ok && entry.authID == authID {
+		entry.failureCount = 0
+		entry.expiresAt = time.Now().Add(c.ttl)
+		c.entries[sessionID] = entry
 	}
 	c.mu.Unlock()
 }

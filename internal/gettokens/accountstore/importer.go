@@ -87,6 +87,7 @@ type CodexAPIKeyCredential struct {
 	BillingCurl        string `json:"billing_curl,omitempty"`
 	BillingEnabled     bool   `json:"billing_enabled,omitempty"`
 	PlatformCookie     string `json:"platform_cookie,omitempty"`
+	CurlVariablesJSON  string `json:"curl_variables_json,omitempty"`
 	FormatBaseURLsJSON string `json:"format_base_urls_json,omitempty"`
 	HeadersJSON        string `json:"headers_json,omitempty"`
 	ModelsJSON         string `json:"models_json,omitempty"`
@@ -123,6 +124,7 @@ type codexAPIKeyJSON struct {
 	BillingCurl    string            `json:"billing-curl"`
 	BillingEnabled bool              `json:"billing-enabled"`
 	PlatformCookie string            `json:"platform-cookie"`
+	CurlVariables  map[string]string `json:"curl-variables"`
 }
 
 type codexModelJSON struct {
@@ -443,6 +445,7 @@ func (item *codexAPIKeyJSON) normalize() {
 	item.BillingCurl = strings.TrimSpace(item.BillingCurl)
 	item.BillingEnabled = item.BillingEnabled && item.BillingCurl != ""
 	item.PlatformCookie = normalizePlatformCookie(item.PlatformCookie)
+	item.CurlVariables = normalizeCurlVariables(item.CurlVariables)
 	for i := range item.Models {
 		item.Models[i].Name = strings.TrimSpace(item.Models[i].Name)
 		item.Models[i].Alias = strings.TrimSpace(item.Models[i].Alias)
@@ -636,4 +639,22 @@ func normalizeStringSlice(values []string) []string {
 
 func normalizePlatformCookie(value string) string {
 	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "Cookie:"))
+}
+
+func normalizeCurlVariables(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		out[trimmedKey] = strings.TrimSpace(value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

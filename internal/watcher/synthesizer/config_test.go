@@ -95,6 +95,66 @@ func TestConfigSynthesizer_SynthesizesAccountStoreAuthFilesWhenStoreOwnsCodex(t 
 	}
 }
 
+func TestConfigSynthesizer_SkipsMigrationBackupAuthFilesFromAccountStoreRuntime(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "Backup OAuth",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceLegacyAuthFile,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "migration-backups/accounts-v1-20260530T022221Z/codex-stale.json",
+			AuthJSON:       `{"type":"codex","access_token":"stale","account_id":"acct_stale","plan_type":"plus","email":"stale@example.com"}`,
+			AuthType:       "codex",
+			Email:          "stale@example.com",
+			PlanType:       "plus",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount backup auth: %v", err)
+	}
+	if _, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            "Active OAuth",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: "codex-active.json",
+			AuthJSON:       `{"type":"codex","access_token":"active","account_id":"acct_active","plan_type":"plus","email":"active@example.com"}`,
+			AuthType:       "codex",
+			Email:          "active@example.com",
+			PlanType:       "plus",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount active auth: %v", err)
+	}
+
+	auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want only active auth; auths=%#v", len(auths), auths)
+	}
+	if got := auths[0].ID; got != "codex-active.json" {
+		t.Fatalf("auth ID = %q, want active auth only", got)
+	}
+	if got := auths[0].Metadata["access_token"]; got != "active" {
+		t.Fatalf("access token metadata = %#v, want active", got)
+	}
+}
+
 func TestAccountStoreAccountsCachesRowsWithinSynthesisPass(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := accountstore.Open(dbPath)

@@ -203,6 +203,7 @@ CREATE TABLE IF NOT EXISTS codex_api_key_accounts (
   billing_curl TEXT NOT NULL DEFAULT '',
   billing_enabled INTEGER NOT NULL DEFAULT 0,
   platform_cookie TEXT NOT NULL DEFAULT '', 
+  curl_variables_json TEXT NOT NULL DEFAULT '{}',
   format_base_urls_json TEXT NOT NULL DEFAULT '{}',
   headers_json TEXT NOT NULL DEFAULT '{}',
   models_json TEXT NOT NULL DEFAULT '[]',

@@ -464,3 +464,194 @@ func (e *admissionCaptureExecutor) CountTokens(ctx context.Context, auth *Auth, 
 func (e *admissionCaptureExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
 }
+
+func TestSessionAffinityKeepsSoftBlockedLeaseBeforeFailureBudget(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &FillFirstSelector{},
+		TTL:           time.Hour,
+		FailureBudget: 2,
+	})
+	defer selector.Stop()
+	manager := NewManager(nil, selector, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-soft-blocked-lease"}}}
+	first, _, errFirst := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errFirst != nil {
+		t.Fatalf("first pickNext() error = %v", errFirst)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first auth = %#v, want auth-a", first)
+	}
+
+	updated := first.Clone()
+	updated.Unavailable = true
+	updated.NextRetryAfter = time.Now().Add(time.Hour)
+	updated.Quota = QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)}
+	if _, err := manager.Update(context.Background(), updated); err != nil {
+		t.Fatalf("Update(auth-a soft blocked): %v", err)
+	}
+	selector.RecordRouteFailure(opts, "codex", "", first.ID, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit"})
+
+	second, _, errSecond := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errSecond != nil {
+		t.Fatalf("second pickNext() error = %v", errSecond)
+	}
+	if second == nil || second.ID != "auth-a" {
+		t.Fatalf("second auth = %#v, want sticky auth-a before failure budget", second)
+	}
+}
+
+func TestSessionAffinityReleasesSoftBlockedLeaseAfterFailureBudget(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &FillFirstSelector{},
+		TTL:           time.Hour,
+		FailureBudget: 2,
+	})
+	defer selector.Stop()
+	manager := NewManager(nil, selector, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-failure-budget-release"}}}
+	first, _, errFirst := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errFirst != nil {
+		t.Fatalf("first pickNext() error = %v", errFirst)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first auth = %#v, want auth-a", first)
+	}
+	updated := first.Clone()
+	updated.Unavailable = true
+	updated.NextRetryAfter = time.Now().Add(time.Hour)
+	updated.Quota = QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)}
+	if _, err := manager.Update(context.Background(), updated); err != nil {
+		t.Fatalf("Update(auth-a soft blocked): %v", err)
+	}
+	selector.RecordRouteFailure(opts, "codex", "", first.ID, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit #1"})
+	selector.RecordRouteFailure(opts, "codex", "", first.ID, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit #2"})
+
+	second, _, errSecond := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errSecond != nil {
+		t.Fatalf("second pickNext() error = %v", errSecond)
+	}
+	if second == nil || second.ID != "auth-b" {
+		t.Fatalf("second auth = %#v, want auth-b after failure budget", second)
+	}
+}
+
+func TestSessionAffinityPoolEpochBumpInvalidatesStaleBinding(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &FillFirstSelector{},
+		TTL:           time.Hour,
+		FailureBudget: 2,
+	})
+	defer selector.Stop()
+	manager := NewManager(nil, selector, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-epoch-rebind"}}}
+
+	// Establish binding to auth-a
+	first, _, errFirst := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errFirst != nil {
+		t.Fatalf("first pickNext() error = %v", errFirst)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first auth = %#v, want auth-a", first)
+	}
+	// Exhaust auth-a failure budget
+	updated := first.Clone()
+	updated.Unavailable = true
+	updated.NextRetryAfter = time.Now().Add(time.Hour)
+	updated.Quota = QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)}
+	if _, err := manager.Update(context.Background(), updated); err != nil {
+		t.Fatalf("Update(auth-a soft blocked): %v", err)
+	}
+	selector.RecordRouteFailure(opts, "codex", "", first.ID, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit #1"})
+	selector.RecordRouteFailure(opts, "codex", "", first.ID, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "usage limit #2"})
+
+	// But now simulate account pool change: auth-b becomes active (bump epoch manually)
+	selector.BumpPoolEpoch()
+
+	// Session should now rebind to auth-b even though auth-a is soft-blocked with budget exceeded
+	second, _, errSecond := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errSecond != nil {
+		t.Fatalf("second pickNext() error = %v", errSecond)
+	}
+	if second == nil || second.ID != "auth-b" {
+		t.Fatalf("second auth = %#v, want auth-b after pool epoch bump", second)
+	}
+}
+
+func TestSessionAffinityDisabledAccountMustNotStick(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:      &FillFirstSelector{},
+		TTL:           time.Hour,
+		FailureBudget: 2,
+	})
+	defer selector.Stop()
+	manager := NewManager(nil, selector, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-a): %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("Register(auth-b): %v", err)
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"X-Session-Id": []string{"session-disable-must-not-stick"}}}
+
+	// Bind session to auth-a
+	first, _, errFirst := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errFirst != nil {
+		t.Fatalf("first pickNext() error = %v", errFirst)
+	}
+	if first == nil || first.ID != "auth-a" {
+		t.Fatalf("first auth = %#v, want auth-a", first)
+	}
+
+	// Disable auth-a
+	updated, ok := manager.SetRouteDisabled("auth-a", true)
+	if !ok || updated == nil || !updated.Disabled {
+		t.Fatalf("SetRouteDisabled disable failed: ok=%v auth=%+v", ok, updated)
+	}
+	selector.InvalidateAuth("auth-a")
+	selector.BumpPoolEpoch()
+
+	// Next pick must NOT return the disabled auth-a
+	second, _, errSecond := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errSecond != nil {
+		t.Fatalf("second pickNext() error = %v", errSecond)
+	}
+	if second == nil || second.ID == "auth-a" {
+		t.Fatalf("second auth = %#v, must not be disabled auth-a", second)
+	}
+	if second.ID != "auth-b" {
+		t.Fatalf("second auth = %s, want auth-b", second.ID)
+	}
+
+	// Re-enable auth-a
+	_, _ = manager.SetRouteDisabled("auth-a", false)
+	// But session already bound to auth-b; should stick to auth-b
+	third, _, errThird := manager.pickNext(context.Background(), "codex", "", opts, nil)
+	if errThird != nil {
+		t.Fatalf("third pickNext() error = %v", errThird)
+	}
+	if third == nil || third.ID != "auth-b" {
+		t.Fatalf("third auth = %#v, want sticky auth-b", third)
+	}
+}

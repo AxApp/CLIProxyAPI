@@ -740,7 +740,7 @@ FROM auth_file_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 		var credential CodexAPIKeyCredential
 		var websockets, quotaEnabled, billingEnabled int
 		err := queryer.QueryRowContext(ctx, `
-SELECT api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, format_base_urls_json, headers_json, models_json, excluded_models_json
+SELECT api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, format_base_urls_json, headers_json, models_json, excluded_models_json
 FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.APIKey,
 			&credential.APIKeyFingerprint,
@@ -753,6 +753,7 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.BillingCurl,
 			&billingEnabled,
 			&credential.PlatformCookie,
+			&credential.CurlVariablesJSON,
 			&credential.FormatBaseURLsJSON,
 			&credential.HeadersJSON,
 			&credential.ModelsJSON,
@@ -909,8 +910,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	case KindCodexAPIKey:
 		key := candidate.CodexAPIKey
 		_, err = tx.ExecContext(ctx, `
-INSERT INTO codex_api_key_accounts(account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO codex_api_key_accounts(account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.AccountKey,
 			key.APIKey,
 			defaultString(key.APIKeyFingerprint, apiKeyFingerprint(key.APIKey)),
@@ -923,6 +924,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			key.BillingCurl,
 			boolInt(key.BillingEnabled),
 			normalizePlatformCookie(key.PlatformCookie),
+			defaultJSON(key.CurlVariablesJSON, "{}"),
 			defaultJSON(key.FormatBaseURLsJSON, "{}"),
 			defaultJSON(key.HeadersJSON, "{}"),
 			defaultJSON(key.ModelsJSON, "[]"),

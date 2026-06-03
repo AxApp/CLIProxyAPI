@@ -3,6 +3,10 @@ package auth
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestManager_Update_PreservesModelStates(t *testing.T) {
@@ -200,5 +204,46 @@ func TestManager_Update_ActiveInheritsModelStates(t *testing.T) {
 	}
 	if state.Quota.BackoffLevel != backoffLevel {
 		t.Fatalf("expected BackoffLevel to be %d, got %d", backoffLevel, state.Quota.BackoffLevel)
+	}
+}
+
+func TestManager_SetRouteDisabled_EnableClearsStaleModelBlocksAndSchedulerPicks(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	model := "gpt-5.5"
+	blockedAuth := &Auth{
+		ID:             "auth-enable-stale-block",
+		Provider:       "codex",
+		Disabled:       true,
+		Status:         StatusDisabled,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(time.Hour),
+		ModelStates: map[string]*ModelState{
+			model: {
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(time.Hour),
+				Quota:          QuotaState{Exceeded: true, NextRecoverAt: time.Now().Add(time.Hour)},
+			},
+		},
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(blockedAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(blockedAuth.ID) })
+	if _, err := m.Register(context.Background(), blockedAuth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	updated, ok := m.SetRouteDisabled(blockedAuth.ID, false)
+	if !ok || updated == nil {
+		t.Fatalf("SetRouteDisabled enable returned ok=%v auth=%+v", ok, updated)
+	}
+	if updated.Disabled || updated.Status == StatusDisabled || updated.Unavailable || !updated.NextRetryAfter.IsZero() || len(updated.ModelStates) != 0 {
+		t.Fatalf("enabled auth kept stale route block: %+v", updated)
+	}
+	picked, err := m.scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pick after enable: %v", err)
+	}
+	if picked == nil || picked.ID != blockedAuth.ID {
+		t.Fatalf("picked = %+v, want enabled auth", picked)
 	}
 }
