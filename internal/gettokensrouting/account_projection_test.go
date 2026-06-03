@@ -74,3 +74,17 @@ func containsRuntimeReason(reasons []string, target string) bool {
 	}
 	return false
 }
+
+func TestRuntimeAccountEvaluationUsesCoarseConstraintAndActiveSessionScoring(t *testing.T) {
+	available := RuntimeAccountProjection{AuthID: "auth-a", Present: true, Enabled: true, Requestable: true, CoarseAvailable: true, ActiveSessions: 3}
+	evaluation := EvaluateRuntimeAccountProjection(available, []RouteConstraint{CoarseAvailabilityConstraint()}, []RouteScoring{ActiveSessionScoring()}, []RouteSignal{{Key: "mode", Value: "balanced"}})
+	if !evaluation.Allowed || evaluation.Score != -3 || len(evaluation.Signals) != 1 {
+		t.Fatalf("available evaluation = %#v", evaluation)
+	}
+
+	blocked := RuntimeAccountProjection{AuthID: "auth-b", Present: true, Enabled: true, Requestable: true, CoarseAvailable: false, FilteredReasons: []string{"rate-limit"}}
+	evaluation = EvaluateRuntimeAccountProjection(blocked, []RouteConstraint{CoarseAvailabilityConstraint()}, nil, nil)
+	if evaluation.Allowed || !containsRuntimeReason(evaluation.ConstraintReasons, "rate-limit") {
+		t.Fatalf("blocked evaluation = %#v", evaluation)
+	}
+}

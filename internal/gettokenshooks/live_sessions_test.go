@@ -107,9 +107,25 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	}); err != nil {
 		t.Fatalf("seed disabled auth: %v", err)
 	}
+	if _, err := manager.Update(context.Background(), &coreauth.Auth{
+		ID:         "auth-rate",
+		AccountKey: "acct_rate",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+	}); err != nil {
+		t.Fatalf("seed rate-limited auth: %v", err)
+	}
+	DefaultAccountRouteGuardStore().MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceRateLimit,
+		AuthID:     "auth-rate",
+		AccountKey: "acct_rate",
+		Reason:     "test rate limit block",
+	})
+	t.Cleanup(func() { DefaultAccountRouteGuardStore().ClearSource(AccountRouteGuardSourceRateLimit) })
 
 	recordLiveSessionForAuth(t, "session-enabled", "req-enabled", "auth-enabled", "acct_enabled")
 	recordLiveSessionForAuth(t, "session-disabled", "req-disabled", "auth-disabled", "acct_disabled")
+	recordLiveSessionForAuth(t, "session-rate", "req-rate", "auth-rate", "acct_rate")
 	recordLiveSessionForAuth(t, "session-detached", "req-detached", "auth-detached", "acct_deleted")
 
 	router := gin.New()
@@ -147,8 +163,8 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	if err := json.Unmarshal(allRecorder.Body.Bytes(), &allSnapshot); err != nil {
 		t.Fatalf("unmarshal include_detached snapshot: %v", err)
 	}
-	if len(allSnapshot.Sessions) != 3 {
-		t.Fatalf("include_detached sessions = %d, want 3: %#v", len(allSnapshot.Sessions), allSnapshot.Sessions)
+	if len(allSnapshot.Sessions) != 4 {
+		t.Fatalf("include_detached sessions = %d, want 4: %#v", len(allSnapshot.Sessions), allSnapshot.Sessions)
 	}
 	byID := map[string]LiveSession{}
 	for _, session := range allSnapshot.Sessions {
@@ -156,6 +172,9 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	}
 	if byID["session-disabled"].AccountCoarseAvailable || !containsLiveSessionReason(byID["session-disabled"].AccountFilteredReasons, "account-disabled") {
 		t.Fatalf("disabled session state = %#v", byID["session-disabled"])
+	}
+	if byID["session-rate"].AccountCoarseAvailable || !byID["session-rate"].AccountPresent || !containsLiveSessionReason(byID["session-rate"].AccountFilteredReasons, "rate-limit") {
+		t.Fatalf("rate-limited session state = %#v", byID["session-rate"])
 	}
 	if byID["session-detached"].AccountPresent || !containsLiveSessionReason(byID["session-detached"].AccountFilteredReasons, "account-detached") {
 		t.Fatalf("detached session state = %#v", byID["session-detached"])
