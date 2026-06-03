@@ -98,6 +98,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "format_base_urls_json", "'{}'"); err != nil {
 		return fmt.Errorf("ensure openai-compatible format base URLs column: %w", err)
 	}
+	if err := ensureTextColumn(ctx, s.db, "codex_api_key_accounts", "curl_variables_json", "'{}'"); err != nil {
+		return fmt.Errorf("ensure codex api key curl variables column: %w", err)
+	}
 	if err := ensureTextColumn(ctx, s.db, "codex_api_key_accounts", "platform_cookie", "''"); err != nil {
 		return fmt.Errorf("ensure codex api key platform cookie column: %w", err)
 	}

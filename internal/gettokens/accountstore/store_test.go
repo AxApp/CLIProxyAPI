@@ -131,6 +131,29 @@ func tableColumns(t *testing.T, db *sql.DB, table string) map[string]bool {
 	return columns
 }
 
+func TestStoreEnsureSchemaAddsCodexAPIKeyCurlVariablesJSONColumn(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "ALTER TABLE codex_api_key_accounts DROP COLUMN curl_variables_json"); err != nil {
+		t.Fatalf("drop curl_variables_json: %v", err)
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema after old schema: %v", err)
+	}
+	columns := tableColumns(t, store.db, "codex_api_key_accounts")
+	if !columns["curl_variables_json"] {
+		t.Fatalf("curl_variables_json column was not restored: %#v", columns)
+	}
+}
+
 func TestStoreEnsureSchemaWaitsForConcurrentSQLiteWriter(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := Open(dbPath)
