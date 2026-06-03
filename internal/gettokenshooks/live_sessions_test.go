@@ -130,7 +130,7 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	if len(snapshot.Sessions) != 1 {
 		t.Fatalf("sessions = %d, want only enabled current account: %#v", len(snapshot.Sessions), snapshot.Sessions)
 	}
-	if got := snapshot.Sessions[0]; got.SessionID != "session-enabled" || got.AccountKey != "acct_enabled" || got.AuthDetached || got.AuthDisabled {
+	if got := snapshot.Sessions[0]; got.SessionID != "session-enabled" || got.AccountKey != "acct_enabled" || !got.AccountPresent || !got.AccountCoarseAvailable {
 		t.Fatalf("unexpected enabled session: %#v", got)
 	}
 	if snapshot.Summary.ActiveSessions != 1 || snapshot.Summary.ActiveRequests != 1 {
@@ -154,10 +154,10 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	for _, session := range allSnapshot.Sessions {
 		byID[session.SessionID] = session
 	}
-	if !byID["session-disabled"].AuthDisabled || byID["session-disabled"].AuthDetached {
+	if byID["session-disabled"].AccountCoarseAvailable || !containsLiveSessionReason(byID["session-disabled"].AccountFilteredReasons, "account-disabled") {
 		t.Fatalf("disabled session state = %#v", byID["session-disabled"])
 	}
-	if !byID["session-detached"].AuthDetached || byID["session-detached"].AuthDisabled {
+	if byID["session-detached"].AccountPresent || !containsLiveSessionReason(byID["session-detached"].AccountFilteredReasons, "account-detached") {
 		t.Fatalf("detached session state = %#v", byID["session-detached"])
 	}
 }
@@ -906,4 +906,13 @@ func liveTimingSummaryFloat64Value(t *testing.T, value *float64) float64 {
 		t.Fatal("expected float64 timing summary value")
 	}
 	return *value
+}
+
+func containsLiveSessionReason(reasons []string, target string) bool {
+	for _, reason := range reasons {
+		if reason == target {
+			return true
+		}
+	}
+	return false
 }

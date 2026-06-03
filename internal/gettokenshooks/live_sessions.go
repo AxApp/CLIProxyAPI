@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -53,59 +53,61 @@ type LiveSessionSummary struct {
 }
 
 type LiveSession struct {
-	SessionID           string              `json:"sessionID"`
-	ProjectName         string              `json:"projectName,omitempty"`
-	ExecutionSessionID  string              `json:"executionSessionID,omitempty"`
-	DownstreamSessionID string              `json:"downstreamSessionID,omitempty"`
-	CodexWindowID       string              `json:"codexWindowID,omitempty"`
-	Status              string              `json:"status"`
-	StartedAt           string              `json:"startedAt"`
-	LastEventAt         string              `json:"lastEventAt"`
-	DurationMs          int64               `json:"durationMs"`
-	RequestCount        int                 `json:"requestCount"`
-	ActiveRequestID     string              `json:"activeRequestID,omitempty"`
-	LastRequestID       string              `json:"lastRequestID,omitempty"`
-	Model               string              `json:"model"`
-	AuthID              string              `json:"authID,omitempty"`
-	AccountKey          string              `json:"accountKey,omitempty"`
-	AuthLabel           string              `json:"authLabel,omitempty"`
-	AuthDetached        bool                `json:"authDetached,omitempty"`
-	AuthDisabled        bool                `json:"authDisabled,omitempty"`
-	Provider            string              `json:"provider,omitempty"`
-	DownstreamTransport string              `json:"downstreamTransport"`
-	UpstreamTransport   string              `json:"upstreamTransport"`
-	FallbackInferred    bool                `json:"fallbackInferred,omitempty"`
-	FallbackConfidence  string              `json:"fallbackConfidence,omitempty"`
-	FallbackReason      string              `json:"fallbackReason,omitempty"`
-	TimingSummary       *LiveTimingSummary  `json:"timingSummary,omitempty"`
-	RecentEvents        []LiveTimelineEvent `json:"recentEvents,omitempty"`
-	Requests            []LiveRequest       `json:"requests,omitempty"`
+	SessionID              string              `json:"sessionID"`
+	ProjectName            string              `json:"projectName,omitempty"`
+	ExecutionSessionID     string              `json:"executionSessionID,omitempty"`
+	DownstreamSessionID    string              `json:"downstreamSessionID,omitempty"`
+	CodexWindowID          string              `json:"codexWindowID,omitempty"`
+	Status                 string              `json:"status"`
+	StartedAt              string              `json:"startedAt"`
+	LastEventAt            string              `json:"lastEventAt"`
+	DurationMs             int64               `json:"durationMs"`
+	RequestCount           int                 `json:"requestCount"`
+	ActiveRequestID        string              `json:"activeRequestID,omitempty"`
+	LastRequestID          string              `json:"lastRequestID,omitempty"`
+	Model                  string              `json:"model"`
+	AuthID                 string              `json:"authID,omitempty"`
+	AccountKey             string              `json:"accountKey,omitempty"`
+	AuthLabel              string              `json:"authLabel,omitempty"`
+	AccountPresent         bool                `json:"accountPresent"`
+	AccountCoarseAvailable bool                `json:"accountCoarseAvailable"`
+	AccountFilteredReasons []string            `json:"accountFilteredReasons,omitempty"`
+	Provider               string              `json:"provider,omitempty"`
+	DownstreamTransport    string              `json:"downstreamTransport"`
+	UpstreamTransport      string              `json:"upstreamTransport"`
+	FallbackInferred       bool                `json:"fallbackInferred,omitempty"`
+	FallbackConfidence     string              `json:"fallbackConfidence,omitempty"`
+	FallbackReason         string              `json:"fallbackReason,omitempty"`
+	TimingSummary          *LiveTimingSummary  `json:"timingSummary,omitempty"`
+	RecentEvents           []LiveTimelineEvent `json:"recentEvents,omitempty"`
+	Requests               []LiveRequest       `json:"requests,omitempty"`
 }
 
 type LiveRequest struct {
-	RequestID           string              `json:"requestID"`
-	ClientRequestID     string              `json:"clientRequestID,omitempty"`
-	UpstreamRequestID   string              `json:"upstreamRequestID,omitempty"`
-	SessionID           string              `json:"sessionID"`
-	Sequence            int                 `json:"sequence"`
-	Model               string              `json:"model"`
-	Status              string              `json:"status"`
-	StartedAt           string              `json:"startedAt"`
-	CompletedAt         string              `json:"completedAt,omitempty"`
-	DownstreamTransport string              `json:"downstreamTransport"`
-	UpstreamTransport   string              `json:"upstreamTransport"`
-	ConnectionReused    bool                `json:"connectionReused,omitempty"`
-	AuthID              string              `json:"authID,omitempty"`
-	AccountKey          string              `json:"accountKey,omitempty"`
-	AuthLabel           string              `json:"authLabel,omitempty"`
-	AuthDetached        bool                `json:"authDetached,omitempty"`
-	AuthDisabled        bool                `json:"authDisabled,omitempty"`
-	Provider            string              `json:"provider,omitempty"`
-	ProxyRoute          string              `json:"proxyRoute,omitempty"`
-	Usage               *LiveTokenUsage     `json:"usage,omitempty"`
-	Timing              LiveTimingMetrics   `json:"timing,omitempty"`
-	Error               *LiveErrorSummary   `json:"error,omitempty"`
-	Timeline            []LiveTimelineEvent `json:"timeline"`
+	RequestID              string              `json:"requestID"`
+	ClientRequestID        string              `json:"clientRequestID,omitempty"`
+	UpstreamRequestID      string              `json:"upstreamRequestID,omitempty"`
+	SessionID              string              `json:"sessionID"`
+	Sequence               int                 `json:"sequence"`
+	Model                  string              `json:"model"`
+	Status                 string              `json:"status"`
+	StartedAt              string              `json:"startedAt"`
+	CompletedAt            string              `json:"completedAt,omitempty"`
+	DownstreamTransport    string              `json:"downstreamTransport"`
+	UpstreamTransport      string              `json:"upstreamTransport"`
+	ConnectionReused       bool                `json:"connectionReused,omitempty"`
+	AuthID                 string              `json:"authID,omitempty"`
+	AccountKey             string              `json:"accountKey,omitempty"`
+	AuthLabel              string              `json:"authLabel,omitempty"`
+	AccountPresent         bool                `json:"accountPresent"`
+	AccountCoarseAvailable bool                `json:"accountCoarseAvailable"`
+	AccountFilteredReasons []string            `json:"accountFilteredReasons,omitempty"`
+	Provider               string              `json:"provider,omitempty"`
+	ProxyRoute             string              `json:"proxyRoute,omitempty"`
+	Usage                  *LiveTokenUsage     `json:"usage,omitempty"`
+	Timing                 LiveTimingMetrics   `json:"timing,omitempty"`
+	Error                  *LiveErrorSummary   `json:"error,omitempty"`
+	Timeline               []LiveTimelineEvent `json:"timeline"`
 }
 
 type LiveTokenUsage struct {
@@ -327,11 +329,11 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, handler *handlers.BaseAP
 	group.GET("/gettokens/live-sessions", func(c *gin.Context) {
 		startedAt := time.Now()
 		snapshot := CurrentLiveSessionsSnapshot()
-		inventory := liveSessionCurrentAuthInventory(handler)
+		projections := liveSessionRuntimeAccountProjections(handler)
 		if parseLiveSessionIncludeDetached(c.Query("include_detached")) {
-			snapshot = annotateLiveSessionsSnapshotByCurrentAuths(snapshot, inventory)
+			snapshot = annotateLiveSessionsSnapshotByRuntimeProjection(snapshot, projections)
 		} else {
-			snapshot = filterLiveSessionsSnapshotByCurrentAuths(snapshot, inventory)
+			snapshot = filterLiveSessionsSnapshotByRuntimeProjection(snapshot, projections)
 		}
 		c.JSON(http.StatusOK, snapshot)
 		maybeSkipLiveSessionPollingLog(c, startedAt)
@@ -358,43 +360,51 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, handler *handlers.BaseAP
 	})
 }
 
-type liveSessionAuthInventoryEntry struct {
-	AccountKey string
-	Disabled   bool
-}
-
-func liveSessionCurrentAuthInventory(handler *handlers.BaseAPIHandler) map[string]liveSessionAuthInventoryEntry {
+func liveSessionRuntimeAccountProjections(handler *handlers.BaseAPIHandler) *gettokensrouting.RuntimeAccountProjectionSnapshot {
 	if handler == nil || handler.AuthManager == nil {
 		return nil
 	}
 	auths := handler.AuthManager.List()
-	inventory := make(map[string]liveSessionAuthInventoryEntry, len(auths)*2)
+	guardReasons := make(map[string][]gettokensrouting.RuntimeAccountGuardBlock, len(auths))
+	inputs := make([]gettokensrouting.RuntimeAccountInput, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		disabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
-		entry := liveSessionAuthInventoryEntry{
-			AccountKey: strings.TrimSpace(auth.AccountKey),
-			Disabled:   disabled,
+		authID := strings.TrimSpace(auth.ID)
+		for _, block := range ActiveAccountRouteGuardBlocksForAuth(auth) {
+			if authID == "" {
+				continue
+			}
+			guardReasons[authID] = append(guardReasons[authID], gettokensrouting.RuntimeAccountGuardBlock{
+				Source: block.Source,
+				Reason: block.Reason,
+			})
 		}
-		if id := strings.TrimSpace(auth.ID); id != "" {
-			inventory[id] = entry
-		}
-		if entry.AccountKey != "" {
-			inventory["account:"+entry.AccountKey] = entry
-		}
+		inputs = append(inputs, gettokensrouting.RuntimeAccountInput{
+			AuthID:      auth.ID,
+			AccountKey:  auth.AccountKey,
+			Provider:    auth.Provider,
+			Status:      string(auth.Status),
+			Disabled:    auth.Disabled,
+			Unavailable: auth.Unavailable,
+			Attributes:  auth.Attributes,
+		})
 	}
-	return inventory
+	snapshot := gettokensrouting.BuildRuntimeAccountProjectionSnapshot(inputs, gettokensrouting.RuntimeAccountProjectionOptions{
+		GuardBlocksByAuthID: guardReasons,
+		ActiveSessionsByID:  currentLiveSessionActiveAuthCounts(),
+	})
+	return &snapshot
 }
 
-func filterLiveSessionsSnapshotByCurrentAuths(snapshot LiveSessionsSnapshot, inventory map[string]liveSessionAuthInventoryEntry) LiveSessionsSnapshot {
-	if inventory == nil {
+func filterLiveSessionsSnapshotByRuntimeProjection(snapshot LiveSessionsSnapshot, projections *gettokensrouting.RuntimeAccountProjectionSnapshot) LiveSessionsSnapshot {
+	if projections == nil {
 		return snapshot
 	}
 	filtered := make([]LiveSession, 0, len(snapshot.Sessions))
 	for _, session := range snapshot.Sessions {
-		enriched, keep := applyLiveSessionAuthInventory(session, inventory)
+		enriched, keep := applyLiveSessionRuntimeAccountProjection(session, projections)
 		if keep {
 			filtered = append(filtered, enriched)
 		}
@@ -404,38 +414,43 @@ func filterLiveSessionsSnapshotByCurrentAuths(snapshot LiveSessionsSnapshot, inv
 	return snapshot
 }
 
-func annotateLiveSessionsSnapshotByCurrentAuths(snapshot LiveSessionsSnapshot, inventory map[string]liveSessionAuthInventoryEntry) LiveSessionsSnapshot {
-	if inventory == nil {
+func annotateLiveSessionsSnapshotByRuntimeProjection(snapshot LiveSessionsSnapshot, projections *gettokensrouting.RuntimeAccountProjectionSnapshot) LiveSessionsSnapshot {
+	if projections == nil {
 		return snapshot
 	}
 	for index := range snapshot.Sessions {
-		enriched, _ := applyLiveSessionAuthInventory(snapshot.Sessions[index], inventory)
+		enriched, _ := applyLiveSessionRuntimeAccountProjection(snapshot.Sessions[index], projections)
 		snapshot.Sessions[index] = enriched
 	}
 	return snapshot
 }
 
-func applyLiveSessionAuthInventory(session LiveSession, inventory map[string]liveSessionAuthInventoryEntry) (LiveSession, bool) {
+func applyLiveSessionRuntimeAccountProjection(session LiveSession, projections *gettokensrouting.RuntimeAccountProjectionSnapshot) (LiveSession, bool) {
 	authID := strings.TrimSpace(session.AuthID)
 	accountKey := strings.TrimSpace(session.AccountKey)
-	entry, found := inventory[authID]
-	if !found && accountKey != "" {
-		entry, found = inventory["account:"+accountKey]
+	if authID == "" && accountKey == "" {
+		session.AccountPresent = true
+		session.AccountCoarseAvailable = true
+		session.AccountFilteredReasons = nil
+		return session, true
 	}
-	if found {
-		session.AuthDetached = false
-		session.AuthDisabled = entry.Disabled
+	projection, found := projections.Find(authID, accountKey)
+	if !found {
+		projection = gettokensrouting.DetachedRuntimeAccountProjection(authID, accountKey)
+	}
+	session.AccountPresent = projection.Present
+	session.AccountCoarseAvailable = projection.CoarseAvailable
+	session.AccountFilteredReasons = append([]string(nil), projection.FilteredReasons...)
+	if session.AccountKey == "" {
+		session.AccountKey = projection.AccountKey
+	}
+	if projection.CoarseAvailable {
 		if session.AccountKey == "" {
-			session.AccountKey = entry.AccountKey
+			session.AccountKey = projection.AccountKey
 		}
-		return session, !entry.Disabled
+		return session, true
 	}
-	if authID != "" || accountKey != "" {
-		session.AuthDetached = true
-		session.AuthDisabled = false
-		return session, false
-	}
-	return session, true
+	return session, false
 }
 
 func buildLiveSessionSummary(items []LiveSession) LiveSessionSummary {
