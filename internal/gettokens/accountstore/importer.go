@@ -103,6 +103,8 @@ type OpenAICompatibleCredential struct {
 	HeadersJSON        string `json:"headers_json"`
 	FormatBaseURLsJSON string `json:"format_base_urls_json,omitempty"`
 	ModelsJSON         string `json:"models_json"`
+	ModelFetchAPIKey   string `json:"model_fetch_api_key,omitempty"`
+	ModelFetchBaseURL  string `json:"model_fetch_base_url,omitempty"`
 }
 
 type codexAPIKeyJSON struct {

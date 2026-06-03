@@ -248,6 +248,8 @@ CREATE TABLE IF NOT EXISTS openai_compatible_accounts (
   headers_json TEXT NOT NULL DEFAULT '{}',
   format_base_urls_json TEXT NOT NULL DEFAULT '{}',
   models_json TEXT NOT NULL DEFAULT '[]',
+  model_fetch_api_key TEXT NOT NULL DEFAULT '',
+  model_fetch_base_url TEXT NOT NULL DEFAULT '',
   updated_at_unix_ms INTEGER NOT NULL
 );
 

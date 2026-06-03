@@ -873,3 +873,47 @@ func TestCodexAPIKeyCurlVariablesRoundTrip(t *testing.T) {
 		t.Fatalf("curl variables not round-tripped: %+v", loaded.CodexAPIKey)
 	}
 }
+
+func TestOpenAICompatibleModelFetchFieldsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	created, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindOpenAICompatible,
+		Title:            "Xiaomi Token Plan",
+		Provider:         "xiaomimimo",
+		CredentialSource: SourceSidecarManagementAPI,
+		OpenAICompatible: &OpenAICompatibleCredential{
+			ProviderName:      "Xiaomi MiMo Token Plan",
+			BaseURL:           "https://token-plan-cn.xiaomimimo.com/v1",
+			APIKeyEntriesJSON: `[{"api-key":"tp-test"}]`,
+			ModelsJSON:        `[]`,
+			ModelFetchAPIKey:  "sk-fetch",
+			ModelFetchBaseURL: "https://api.xiaomimimo.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	loaded, err := store.GetAccount(ctx, created.AccountKey)
+	if err != nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if loaded.OpenAICompatible == nil {
+		t.Fatal("OpenAICompatible credential is nil")
+	}
+	if loaded.OpenAICompatible.ModelFetchAPIKey != "sk-fetch" {
+		t.Fatalf("ModelFetchAPIKey = %q, want sk-fetch", loaded.OpenAICompatible.ModelFetchAPIKey)
+	}
+	if loaded.OpenAICompatible.ModelFetchBaseURL != "https://api.xiaomimimo.com/v1" {
+		t.Fatalf("ModelFetchBaseURL = %q, want https://api.xiaomimimo.com/v1", loaded.OpenAICompatible.ModelFetchBaseURL)
+	}
+}

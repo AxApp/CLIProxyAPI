@@ -769,7 +769,7 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 	case KindOpenAICompatible:
 		var credential OpenAICompatibleCredential
 		err := queryer.QueryRowContext(ctx, `
-SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json
+SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url
 FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.ProviderName,
 			&credential.RuntimeProviderKey,
@@ -779,6 +779,8 @@ FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan
 			&credential.HeadersJSON,
 			&credential.FormatBaseURLsJSON,
 			&credential.ModelsJSON,
+			&credential.ModelFetchAPIKey,
+			&credential.ModelFetchBaseURL,
 		)
 		if err != nil {
 			return fmt.Errorf("query openai-compatible credential for %s: %w", account.AccountKey, err)
@@ -938,8 +940,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			runtimeProviderKey = "openai-compatible:" + candidate.AccountKey
 		}
 		_, err = tx.ExecContext(ctx, `
-INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, updated_at_unix_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url, updated_at_unix_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.AccountKey,
 			compat.ProviderName,
 			runtimeProviderKey,
@@ -949,6 +951,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			defaultJSON(compat.HeadersJSON, "{}"),
 			defaultJSON(compat.FormatBaseURLsJSON, "{}"),
 			defaultJSON(compat.ModelsJSON, "[]"),
+			strings.TrimSpace(compat.ModelFetchAPIKey),
+			strings.TrimSpace(compat.ModelFetchBaseURL),
 			now,
 		)
 	}
