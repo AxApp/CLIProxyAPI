@@ -86,6 +86,7 @@ type CodexAPIKeyCredential struct {
 	QuotaEnabled       bool   `json:"quota_enabled,omitempty"`
 	BillingCurl        string `json:"billing_curl,omitempty"`
 	BillingEnabled     bool   `json:"billing_enabled,omitempty"`
+	PlatformCookie     string `json:"platform_cookie,omitempty"`
 	FormatBaseURLsJSON string `json:"format_base_urls_json,omitempty"`
 	HeadersJSON        string `json:"headers_json,omitempty"`
 	ModelsJSON         string `json:"models_json,omitempty"`
@@ -121,6 +122,7 @@ type codexAPIKeyJSON struct {
 	QuotaEnabled   bool              `json:"quota-enabled"`
 	BillingCurl    string            `json:"billing-curl"`
 	BillingEnabled bool              `json:"billing-enabled"`
+	PlatformCookie string            `json:"platform-cookie"`
 }
 
 type codexModelJSON struct {
@@ -440,6 +442,7 @@ func (item *codexAPIKeyJSON) normalize() {
 	item.QuotaEnabled = item.QuotaEnabled && item.QuotaCurl != ""
 	item.BillingCurl = strings.TrimSpace(item.BillingCurl)
 	item.BillingEnabled = item.BillingEnabled && item.BillingCurl != ""
+	item.PlatformCookie = normalizePlatformCookie(item.PlatformCookie)
 	for i := range item.Models {
 		item.Models[i].Name = strings.TrimSpace(item.Models[i].Name)
 		item.Models[i].Alias = strings.TrimSpace(item.Models[i].Alias)
@@ -629,4 +632,8 @@ func normalizeStringSlice(values []string) []string {
 		out = append(out, trimmed)
 	}
 	return out
+}
+
+func normalizePlatformCookie(value string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "Cookie:"))
 }

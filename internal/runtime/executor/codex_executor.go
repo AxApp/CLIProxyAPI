@@ -30,12 +30,17 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
 	codexUserAgent             = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
 	codexOriginator            = "codex_cli_rs"
 	codexDefaultImageToolModel = "gpt-image-2"
+	// ChatGPT Codex Responses rejects HTTP request bodies above 10 MiB.
+	// Compressing large JSON requests keeps relay-expanded Codex turns below the
+	// transport byte limit without changing the logical Responses payload.
+	codexZstdRequestBodyThresholdBytes = 9 * 1024 * 1024
 )
 
 var dataTag = []byte("data:")
@@ -907,14 +912,46 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
+	body := rawJSON
+	contentEncoding := ""
+	if len(rawJSON) >= codexZstdRequestBodyThresholdBytes {
+		compressed, errCompress := compressCodexRequestBodyZstd(rawJSON)
+		if errCompress != nil {
+			return nil, errCompress
+		}
+		if len(compressed) < len(rawJSON) {
+			body = compressed
+			contentEncoding = "zstd"
+		}
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	if contentEncoding != "" {
+		httpReq.Header.Set("Content-Encoding", contentEncoding)
 	}
 	if cache.ID != "" {
 		httpReq.Header.Set("Session_id", cache.ID)
 	}
 	return httpReq, nil
+}
+
+func compressCodexRequestBodyZstd(rawJSON []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder, err := zstd.NewWriter(&buf)
+	if err != nil {
+		return nil, fmt.Errorf("codex executor: create zstd request encoder: %w", err)
+	}
+	if _, errWrite := encoder.Write(rawJSON); errWrite != nil {
+		_ = encoder.Close()
+		return nil, fmt.Errorf("codex executor: compress request body: %w", errWrite)
+	}
+	if errClose := encoder.Close(); errClose != nil {
+		return nil, fmt.Errorf("codex executor: finish request body compression: %w", errClose)
+	}
+	return buf.Bytes(), nil
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {

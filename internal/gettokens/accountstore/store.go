@@ -98,6 +98,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "format_base_urls_json", "'{}'"); err != nil {
 		return fmt.Errorf("ensure openai-compatible format base URLs column: %w", err)
 	}
+	if err := ensureTextColumn(ctx, s.db, "codex_api_key_accounts", "platform_cookie", "''"); err != nil {
+		return fmt.Errorf("ensure codex api key platform cookie column: %w", err)
+	}
 	now := fmt.Sprintf("%d", time.Now().UnixMilli())
 	_, err := s.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO account_store_meta(key, value) VALUES
@@ -199,6 +202,7 @@ CREATE TABLE IF NOT EXISTS codex_api_key_accounts (
   quota_enabled INTEGER NOT NULL DEFAULT 0,
   billing_curl TEXT NOT NULL DEFAULT '',
   billing_enabled INTEGER NOT NULL DEFAULT 0,
+  platform_cookie TEXT NOT NULL DEFAULT '', 
   format_base_urls_json TEXT NOT NULL DEFAULT '{}',
   headers_json TEXT NOT NULL DEFAULT '{}',
   models_json TEXT NOT NULL DEFAULT '[]',

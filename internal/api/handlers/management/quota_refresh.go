@@ -34,19 +34,21 @@ type quotaRefreshRequest struct {
 }
 
 type quotaCurlTestRequest struct {
-	APIKey      string `json:"api_key"`
-	BaseURL     string `json:"base_url"`
-	Prefix      string `json:"prefix,omitempty"`
-	QuotaCurl   string `json:"quota_curl,omitempty"`
-	BillingCurl string `json:"billing_curl,omitempty"`
-	AccountKey  string `json:"account_key,omitempty"`
+	APIKey         string `json:"api_key"`
+	BaseURL        string `json:"base_url"`
+	Prefix         string `json:"prefix,omitempty"`
+	QuotaCurl      string `json:"quota_curl,omitempty"`
+	BillingCurl    string `json:"billing_curl,omitempty"`
+	PlatformCookie string `json:"platform_cookie,omitempty"`
+	AccountKey     string `json:"account_key,omitempty"`
 }
 
 type quotaCurlInput struct {
-	Curl    string
-	APIKey  string
-	BaseURL string
-	Prefix  string
+	Curl           string
+	APIKey         string
+	BaseURL        string
+	Prefix         string
+	PlatformCookie string
 }
 
 type quotaCurlRequest struct {
@@ -156,10 +158,11 @@ func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountst
 	}
 
 	quota, err := h.fetchQuotaFromCurl(ctx, quotaCurlInput{
-		Curl:    credential.QuotaCurl,
-		APIKey:  credential.APIKey,
-		BaseURL: credential.BaseURL,
-		Prefix:  credential.Prefix,
+		Curl:           credential.QuotaCurl,
+		APIKey:         credential.APIKey,
+		BaseURL:        credential.BaseURL,
+		Prefix:         credential.Prefix,
+		PlatformCookie: credential.PlatformCookie,
 	}, authForCodexAPIKeyAccount(account))
 	if err != nil {
 		return gettokenshooks.QuotaRuntimeState{}, err
@@ -167,10 +170,11 @@ func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountst
 
 	if includeBilling && credential.BillingEnabled && strings.TrimSpace(credential.BillingCurl) != "" {
 		if billing, errBilling := h.fetchBillingFromCurl(ctx, quotaCurlInput{
-			Curl:    credential.BillingCurl,
-			APIKey:  credential.APIKey,
-			BaseURL: credential.BaseURL,
-			Prefix:  credential.Prefix,
+			Curl:           credential.BillingCurl,
+			APIKey:         credential.APIKey,
+			BaseURL:        credential.BaseURL,
+			Prefix:         credential.Prefix,
+			PlatformCookie: credential.PlatformCookie,
 		}, authForCodexAPIKeyAccount(account)); errBilling == nil {
 			quota.Billing = billing
 		} else {
@@ -214,10 +218,11 @@ func (h *Handler) testBillingCurl(ctx context.Context, req quotaCurlTestRequest)
 
 func quotaCurlInputFromTestRequest(req quotaCurlTestRequest, curl string) (quotaCurlInput, error) {
 	input := quotaCurlInput{
-		Curl:    strings.TrimSpace(curl),
-		APIKey:  strings.TrimSpace(req.APIKey),
-		BaseURL: strings.TrimSpace(req.BaseURL),
-		Prefix:  strings.TrimSpace(req.Prefix),
+		Curl:           strings.TrimSpace(curl),
+		APIKey:         strings.TrimSpace(req.APIKey),
+		BaseURL:        strings.TrimSpace(req.BaseURL),
+		Prefix:         strings.TrimSpace(req.Prefix),
+		PlatformCookie: normalizePlatformCookie(req.PlatformCookie),
 	}
 	if input.APIKey == "" {
 		return quotaCurlInput{}, errors.New("api key is empty")
@@ -607,6 +612,7 @@ func applyQuotaCurlPlaceholders(value string, input quotaCurlInput) string {
 		"{{apiKey}}", strings.TrimSpace(input.APIKey),
 		"{{baseUrl}}", normalizeQuotaBaseURL(input.BaseURL),
 		"{{prefix}}", normalizeQuotaPrefix(input.Prefix),
+		"{{platformCookie}}", strings.TrimSpace(input.PlatformCookie),
 	)
 	return replacer.Replace(value)
 }
@@ -1319,4 +1325,8 @@ func roundQuotaNumber(value float64) float64 {
 
 func quotaBoolPtrValue(value *bool) bool {
 	return value != nil && *value
+}
+
+func normalizePlatformCookie(value string) string {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "Cookie:"))
 }
