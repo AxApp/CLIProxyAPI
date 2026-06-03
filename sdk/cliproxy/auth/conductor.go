@@ -532,6 +532,13 @@ func (m *Manager) resolveOpenAICompatUpstreamModelPool(auth *Auth, requestedMode
 	if requestedModel == "" {
 		return nil
 	}
+	if auth != nil && auth.Attributes != nil {
+		if models := decodeModelAliasEntriesFromJSON(auth.Attributes["openai_compat_models"]); len(models) > 0 {
+			if resolved := resolveModelAliasPoolFromConfigModels(requestedModel, models); len(resolved) > 0 {
+				return resolved
+			}
+		}
+	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
@@ -4431,9 +4438,6 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
 	if entry == nil || auth == nil {
 		return
 	}
@@ -4445,11 +4449,20 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	}
 	switch accountType {
 	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+		entry.Infof("route auth selected: provider=%s model=%s auth_id=%s account_key=%s kind=%s api_key=%s base_url=%s compat=%s websockets=%t%s", provider, model, auth.ID, auth.AccountKey, accountType, util.HideAPIKey(accountInfo), authAttr(auth, "base_url"), authAttr(auth, "compat_name"), AuthAllowsWebsockets(auth), suffix)
 	case "oauth":
 		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+		entry.Infof("route auth selected: provider=%s model=%s auth_id=%s account_key=%s kind=%s identity=%s websockets=%t%s", provider, model, auth.ID, auth.AccountKey, accountType, ident, AuthAllowsWebsockets(auth), suffix)
+	default:
+		entry.Infof("route auth selected: provider=%s model=%s auth_id=%s account_key=%s kind=%s base_url=%s compat=%s websockets=%t%s", provider, model, auth.ID, auth.AccountKey, accountType, authAttr(auth, "base_url"), authAttr(auth, "compat_name"), AuthAllowsWebsockets(auth), suffix)
 	}
+}
+
+func authAttr(auth *Auth, key string) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes[key])
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {

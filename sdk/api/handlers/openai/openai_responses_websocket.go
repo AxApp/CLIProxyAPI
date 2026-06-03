@@ -412,6 +412,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
+		if h.responsesWebsocketRequiresHTTPFallbackForModel(modelName) {
+			message := fmt.Sprintf("websocket transport is not supported for model %s; retry over HTTP", modelName)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseUnsupportedData, message), time.Now().Add(time.Second))
+			log.Infof("responses websocket: closing downstream to force HTTP fallback id=%s model=%s", passthroughSessionID, modelName)
+			return
+		}
 		liveRequestID := requestlogging.GenerateRequestID()
 		liveIdentity := gettokenshooks.ExtractCodexLiveSessionIdentity(c.Request.Header, requestJSON)
 		gettokenshooks.RecordDownstreamWebsocketRequest(passthroughSessionID, liveRequestID, modelName, liveIdentity)
@@ -1028,6 +1034,36 @@ func responsesWebsocketAuthSupportsCompactionReplay(auth *coreauth.Auth) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+}
+
+func (h *OpenAIResponsesAPIHandler) responsesWebsocketRequiresHTTPFallbackForModel(modelName string) bool {
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return false
+	}
+	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
+	for _, auth := range auths {
+		if responsesWebsocketAuthRequiresHTTPFallback(auth) {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesWebsocketAuthRequiresHTTPFallback(auth *coreauth.Auth) bool {
+	if auth == nil || coreauth.AuthAllowsWebsockets(auth) {
+		return false
+	}
+	provider := strings.TrimSpace(strings.ToLower(auth.Provider))
+	if provider == "openai-compatibility" {
+		return true
+	}
+	if auth.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(auth.Attributes["compat_name"]) != "" ||
+		strings.TrimSpace(auth.Attributes["provider_key"]) != "" ||
+		strings.TrimSpace(auth.Attributes["openai_compat_models"]) != ""
 }
 
 func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {

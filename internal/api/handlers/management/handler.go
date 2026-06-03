@@ -36,24 +36,29 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
-	accountStorePath    string
-	accountStoreMu      sync.Mutex
-	accountStore        *accountstore.Store
-	accountStoreDBPath  string
-	accountStoreApply   func(context.Context) error
-	accountStoreStatus  func(context.Context, accountstore.AccountRecord) error
+	cfg                             *config.Config
+	configFilePath                  string
+	mu                              sync.Mutex
+	attemptsMu                      sync.Mutex
+	failedAttempts                  map[string]*attemptInfo // keyed by client IP
+	authManager                     *coreauth.Manager
+	tokenStore                      coreauth.Store
+	localPassword                   string
+	allowRemoteOverride             bool
+	envSecret                       string
+	logDir                          string
+	postAuthHook                    coreauth.PostAuthHook
+	accountStorePath                string
+	accountStoreMu                  sync.Mutex
+	accountStore                    *accountstore.Store
+	accountStoreDBPath              string
+	accountStoreApply               func(context.Context) error
+	accountStoreStatus              func(context.Context, accountstore.AccountRecord) error
+	accountStoreReadRecoveryCount   int
+	accountStoreLastReadEndpoint    string
+	accountStoreLastReadError       string
+	accountStoreLastReadRecovered   bool
+	accountStoreLastReadRecoveredAt int64
 }
 
 // NewHandler creates a new management handler instance.

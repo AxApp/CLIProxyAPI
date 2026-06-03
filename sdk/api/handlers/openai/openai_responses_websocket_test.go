@@ -2260,3 +2260,57 @@ func TestNormalizeSubsequentRequestAssistantInputTriggersTranscriptReplacement(t
 		t.Fatalf("input[0].id = %q, want %q", input[0].Get("id").String(), "msg-3")
 	}
 }
+
+func TestResponsesWebsocketClosesForOpenAICompatibleHTTPFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "auth-deepseek-compat",
+		Provider: "deepseek",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":              "sk-ds",
+			"base_url":             "https://api.deepseek.com/v1",
+			"compat_name":          "deepseek",
+			"provider_key":         "deepseek",
+			"openai_compat_models": `[{"name":"deepseek-v4-flash","alias":"deepseek-v4-flash"}]`,
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register compat auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "deepseek-v4-flash"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"deepseek-v4-flash","input":"hi"}`)); err != nil {
+		t.Fatalf("write websocket message: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected websocket close to force HTTP fallback")
+	}
+	closeErr, ok := err.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("read error = %T %v, want websocket close error", err, err)
+	}
+	if closeErr.Code != websocket.CloseUnsupportedData {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseUnsupportedData)
+	}
+}

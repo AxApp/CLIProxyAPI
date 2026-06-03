@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,13 +40,23 @@ type deleteLegacySourcesRequest struct {
 	BackupDir string `json:"backup_dir,omitempty"`
 }
 
+type accountStoreDiagnosticsResponse struct {
+	PathBasename string                              `json:"path_basename"`
+	Configured   bool                                `json:"configured"`
+	Open         bool                                `json:"open"`
+	ReadRecovery accountStoreReadRecoveryDiagnostics `json:"read_recovery"`
+}
+
+type accountStoreReadRecoveryDiagnostics struct {
+	Count             int    `json:"count"`
+	LastEndpoint      string `json:"last_endpoint"`
+	LastRecovered     bool   `json:"last_recovered"`
+	LastError         string `json:"last_error"`
+	LastRecoveredUnix int64  `json:"last_recovered_at_unix_ms"`
+}
+
 func (h *Handler) GetAccount(c *gin.Context) {
-	store, err := h.openAccountStore(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	account, err := store.GetAccount(c.Request.Context(), c.Param("account_key"))
+	store, account, err := h.getAccountWithReadRecovery(c.Request.Context(), c.Param("account_key"))
 	if err != nil {
 		writeAccountStoreError(c, err)
 		return
@@ -153,25 +164,149 @@ func (h *Handler) PatchAccountPriority(c *gin.Context) {
 }
 
 func (h *Handler) ListAccounts(c *gin.Context) {
-	store, err := h.openAccountStore(c.Request.Context())
+	store, accounts, err := h.listAccountsWithReadRecovery(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	accounts, err := store.ListAccounts(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		writeAccountStoreError(c, err)
 		return
 	}
 	if hasPendingAccountStoreRuntime(accounts) {
 		_ = h.applyPendingAccountStoreRuntime(c.Request.Context(), store)
-		accounts, err = store.ListAccounts(c.Request.Context())
+		_, accounts, err = h.listAccountsWithReadRecovery(c.Request.Context())
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			writeAccountStoreError(c, err)
 			return
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
+}
+
+func (h *Handler) getAccountWithReadRecovery(ctx context.Context, accountKey string) (*accountstore.Store, accountstore.AccountRecord, error) {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return nil, accountstore.AccountRecord{}, err
+	}
+	account, err := store.GetAccount(ctx, accountKey)
+	if err == nil || !isRecoverableAccountStoreReadError(err) {
+		return store, account, err
+	}
+	h.resetAccountStore(store)
+	store, retryErr := h.openAccountStore(ctx)
+	if retryErr != nil {
+		h.recordAccountStoreReadRecovery("accounts/:account_key", err, false)
+		return nil, accountstore.AccountRecord{}, retryErr
+	}
+	account, retryErr = store.GetAccount(ctx, accountKey)
+	h.recordAccountStoreReadRecovery("accounts/:account_key", err, retryErr == nil)
+	return store, account, retryErr
+}
+
+func (h *Handler) listAccountsWithReadRecovery(ctx context.Context) (*accountstore.Store, []accountstore.AccountRecord, error) {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	accounts, err := store.ListAccounts(ctx)
+	if err == nil || !isRecoverableAccountStoreReadError(err) {
+		return store, accounts, err
+	}
+	h.resetAccountStore(store)
+	store, retryErr := h.openAccountStore(ctx)
+	if retryErr != nil {
+		h.recordAccountStoreReadRecovery("accounts", err, false)
+		return nil, nil, retryErr
+	}
+	accounts, retryErr = store.ListAccounts(ctx)
+	h.recordAccountStoreReadRecovery("accounts", err, retryErr == nil)
+	return store, accounts, retryErr
+}
+
+func (h *Handler) resetAccountStore(store *accountstore.Store) {
+	if h == nil || store == nil {
+		return
+	}
+	shouldClose := false
+	h.accountStoreMu.Lock()
+	if h.accountStore == store {
+		h.accountStore = nil
+		h.accountStoreDBPath = ""
+		shouldClose = true
+	}
+	h.accountStoreMu.Unlock()
+	if shouldClose {
+		_ = store.Close()
+	}
+}
+
+func isRecoverableAccountStoreReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sqliteErr interface{ Code() int }
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code()
+		if code == 10 || code&0xff == 10 {
+			return true
+		}
+	}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		message := current.Error()
+		if strings.Contains(message, "SQLITE_IOERR") ||
+			strings.Contains(message, "disk I/O error") ||
+			strings.Contains(message, "(522)") ||
+			strings.Contains(message, "sql: database is closed") {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) GetAccountStoreDiagnostics(c *gin.Context) {
+	diagnostics, err := h.accountStoreDiagnostics()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, diagnostics)
+}
+
+func (h *Handler) accountStoreDiagnostics() (accountStoreDiagnosticsResponse, error) {
+	if h == nil {
+		return accountStoreDiagnosticsResponse{}, fmt.Errorf("management handler is nil")
+	}
+	path, err := h.resolveAccountStorePath()
+	if err != nil {
+		return accountStoreDiagnosticsResponse{}, err
+	}
+
+	h.accountStoreMu.Lock()
+	defer h.accountStoreMu.Unlock()
+	return accountStoreDiagnosticsResponse{
+		PathBasename: filepath.Base(path),
+		Configured:   strings.TrimSpace(path) != "",
+		Open:         h.accountStore != nil,
+		ReadRecovery: accountStoreReadRecoveryDiagnostics{
+			Count:             h.accountStoreReadRecoveryCount,
+			LastEndpoint:      h.accountStoreLastReadEndpoint,
+			LastRecovered:     h.accountStoreLastReadRecovered,
+			LastError:         h.accountStoreLastReadError,
+			LastRecoveredUnix: h.accountStoreLastReadRecoveredAt,
+		},
+	}, nil
+}
+
+func (h *Handler) recordAccountStoreReadRecovery(endpoint string, err error, recovered bool) {
+	if h == nil || err == nil {
+		return
+	}
+	h.accountStoreMu.Lock()
+	defer h.accountStoreMu.Unlock()
+	h.accountStoreReadRecoveryCount++
+	h.accountStoreLastReadEndpoint = strings.TrimSpace(endpoint)
+	h.accountStoreLastReadError = err.Error()
+	h.accountStoreLastReadRecovered = recovered
+	if recovered {
+		h.accountStoreLastReadRecoveredAt = time.Now().UnixMilli()
+	}
 }
 
 func decodeAccountWriteRequest(c *gin.Context) (accountstore.AccountWrite, error) {
@@ -225,7 +360,12 @@ func writeAccountStoreError(c *gin.Context, err error) {
 	} else if strings.Contains(message, "invalid") || strings.Contains(message, "missing") || strings.Contains(message, "unsupported") || strings.Contains(message, "cannot change") {
 		status = http.StatusBadRequest
 	}
-	c.JSON(status, gin.H{"error": message})
+	body := gin.H{"error": message}
+	if isRecoverableAccountStoreReadError(err) {
+		body["code"] = "account_store_io_error"
+		body["recoverable"] = true
+	}
+	c.JSON(status, body)
 }
 
 func (h *Handler) DryRunAccountMigration(c *gin.Context) {

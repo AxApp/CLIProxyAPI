@@ -754,3 +754,40 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolStopsOnInvalidBootstrap(t *te
 		t.Fatalf("stream calls = %v, want only first upstream model", got)
 	}
 }
+
+func TestManagerExecute_OpenAICompatAccountStoreAliasResolvesUpstreamModel(t *testing.T) {
+	executor := &openAICompatPoolExecutor{id: "deepseek"}
+	m := NewManager(nil, nil, nil)
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{
+		ID:       "account-store-openai-compat-alias",
+		Provider: "deepseek",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"api_key":              "sk-db-ds",
+			"base_url":             "https://api.deepseek.com/v1",
+			"compat_name":          "deepseek",
+			"provider_key":         "deepseek",
+			"openai_compat_models": `[{"name":"deepseek-v4-flash","alias":"ds-test-flash"}]`,
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "deepseek", []*registry.ModelInfo{{ID: "ds-test-flash"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	resp, err := m.Execute(context.Background(), []string{"deepseek"}, cliproxyexecutor.Request{Model: "ds-test-flash"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if string(resp.Payload) != "deepseek-v4-flash" {
+		t.Fatalf("payload = %q, want upstream model", string(resp.Payload))
+	}
+	got := executor.ExecuteModels()
+	if len(got) != 1 || got[0] != "deepseek-v4-flash" {
+		t.Fatalf("execute models = %v, want [deepseek-v4-flash]", got)
+	}
+}

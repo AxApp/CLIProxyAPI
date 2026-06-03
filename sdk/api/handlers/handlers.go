@@ -24,6 +24,7 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
@@ -991,8 +992,10 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	}
 
 	if len(providers) == 0 {
+		log.Warnf("route resolve failed: unknown provider model=%q resolved=%q base=%q allow_image=%t", modelName, resolvedModelName, baseModel, allowImageModel)
 		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
+	log.Infof("route resolve: model=%q resolved=%q base=%q providers=%s allow_image=%t", modelName, resolvedModelName, baseModel, strings.Join(providers, ","), allowImageModel)
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.

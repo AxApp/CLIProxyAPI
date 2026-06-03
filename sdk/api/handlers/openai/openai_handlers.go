@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -61,12 +62,19 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		c.JSON(http.StatusOK, h.codexClientModelsResponse())
+		payload := h.codexClientModelsResponse()
+		count := 0
+		if models, ok := payload["models"].([]map[string]any); ok {
+			count = len(models)
+		}
+		log.Infof("models response: mode=codex-client client_version=%q count=%d", c.Query("client_version"), count)
+		c.JSON(http.StatusOK, payload)
 		return
 	}
 
 	// Get all available models
 	allModels := h.Models()
+	log.Infof("models response: mode=openai query=%q count=%d", c.Request.URL.RawQuery, len(allModels))
 
 	if shouldReturnCodexModels(c) {
 		c.JSON(http.StatusOK, gin.H{
@@ -149,34 +157,34 @@ func buildCodexModelsPayload(allModels []map[string]any) []map[string]any {
 		}
 
 		modelPayload := map[string]any{
-			"slug":                        id,
-			"display_name":                displayName,
-			"description":                 description,
-			"default_reasoning_level":     "medium",
-			"supported_reasoning_levels":  defaultCodexReasoningLevels(),
-			"shell_type":                  "shell_command",
-			"visibility":                  visibility,
-			"supported_in_api":            true,
-			"priority":                    priority,
-			"additional_speed_tiers":      []string{},
-			"availability_nux":            nil,
-			"upgrade":                     nil,
-			"base_instructions":           defaultCodexBaseInstructions(),
-			"model_messages":              nil,
+			"slug":                         id,
+			"display_name":                 displayName,
+			"description":                  description,
+			"default_reasoning_level":      "medium",
+			"supported_reasoning_levels":   defaultCodexReasoningLevels(),
+			"shell_type":                   "shell_command",
+			"visibility":                   visibility,
+			"supported_in_api":             true,
+			"priority":                     priority,
+			"additional_speed_tiers":       []string{},
+			"availability_nux":             nil,
+			"upgrade":                      nil,
+			"base_instructions":            defaultCodexBaseInstructions(),
+			"model_messages":               nil,
 			"supports_reasoning_summaries": true,
-			"default_reasoning_summary":   "none",
-			"support_verbosity":           true,
-			"default_verbosity":           "medium",
-			"apply_patch_tool_type":       "freeform",
-			"web_search_tool_type":        "text_and_image",
+			"default_reasoning_summary":    "none",
+			"support_verbosity":            true,
+			"default_verbosity":            "medium",
+			"apply_patch_tool_type":        "freeform",
+			"web_search_tool_type":         "text_and_image",
 			"truncation_policy": map[string]any{
 				"mode":  "tokens",
 				"limit": 10000,
 			},
-			"supports_parallel_tool_calls":  true,
-			"supports_image_detail_original": true,
-			"max_context_window":             nil,
-			"auto_compact_token_limit":       nil,
+			"supports_parallel_tool_calls":     true,
+			"supports_image_detail_original":   true,
+			"max_context_window":               nil,
+			"auto_compact_token_limit":         nil,
 			"effective_context_window_percent": 95,
 			"experimental_supported_tools":     []string{},
 			"input_modalities":                 []string{"text", "image"},

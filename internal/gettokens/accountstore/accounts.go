@@ -176,19 +176,73 @@ WHERE account_key = ? AND deleted_at_unix_ms IS NULL`,
 }
 
 func (s *Store) GetAccount(ctx context.Context, accountKey string) (AccountRecord, error) {
+	if s == nil || s.db == nil {
+		return AccountRecord{}, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !IsAccountKey(accountKey) {
 		return AccountRecord{}, fmt.Errorf("invalid account key %q", accountKey)
 	}
-	accounts, err := s.ListAccounts(ctx)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
+		return AccountRecord{}, fmt.Errorf("begin get account transaction %s: %w", accountKey, err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	var account AccountRecord
+	var disabled int
+	err = tx.QueryRowContext(ctx, `
+SELECT
+  c.account_key,
+  c.kind,
+  c.title,
+  c.provider,
+  c.credential_source,
+  c.priority,
+  c.disabled,
+  c.revision,
+  c.metadata_json,
+  c.created_at_unix_ms,
+  c.updated_at_unix_ms,
+  COALESCE(c.deleted_at_unix_ms, 0),
+  COALESCE(a.status, ''),
+  COALESCE(a.last_error, '')
+FROM account_cards c
+LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
+WHERE c.account_key = ? AND c.deleted_at_unix_ms IS NULL`, accountKey).Scan(
+		&account.AccountKey,
+		&account.Kind,
+		&account.Title,
+		&account.Provider,
+		&account.CredentialSource,
+		&account.Priority,
+		&disabled,
+		&account.Revision,
+		&account.MetadataJSON,
+		&account.CreatedAtUnixMs,
+		&account.UpdatedAtUnixMs,
+		&account.DeletedAtUnixMs,
+		&account.RuntimeApplyStatus,
+		&account.RuntimeApplyError,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AccountRecord{}, fmt.Errorf("account %s not found", accountKey)
+	}
+	if err != nil {
+		return AccountRecord{}, fmt.Errorf("query account %s: %w", accountKey, err)
+	}
+	account.Disabled = disabled != 0
+	if err := attachCredential(ctx, tx, &account); err != nil {
 		return AccountRecord{}, err
 	}
-	for _, account := range accounts {
-		if account.AccountKey == accountKey {
-			return account, nil
-		}
+	if err := tx.Commit(); err != nil {
+		return AccountRecord{}, fmt.Errorf("commit get account transaction %s: %w", accountKey, err)
 	}
-	return AccountRecord{}, fmt.Errorf("account %s not found", accountKey)
+	return account, nil
 }
 
 func (s *Store) SetAccountStatus(ctx context.Context, accountKey string, disabled bool) (AccountRecord, error) {

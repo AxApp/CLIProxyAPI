@@ -522,6 +522,57 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 }
 
+func TestGetAccountUsesSingleAccountQueryInsteadOfFullList(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	target, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Target",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-target",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount target: %v", err)
+	}
+	broken, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Broken sibling",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-broken",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount broken sibling: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "DELETE FROM codex_api_key_accounts WHERE account_key = ?", broken.AccountKey); err != nil {
+		t.Fatalf("delete sibling credential: %v", err)
+	}
+
+	account, err := store.GetAccount(ctx, target.AccountKey)
+	if err != nil {
+		t.Fatalf("GetAccount target should not scan broken sibling: %v", err)
+	}
+	if account.AccountKey != target.AccountKey || account.CodexAPIKey == nil || account.CodexAPIKey.APIKey != "sk-target" {
+		t.Fatalf("GetAccount target = %+v", account)
+	}
+}
+
 func TestSetAccountStatusOnlyUpdatesDisabledWithoutRuntimeApply(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

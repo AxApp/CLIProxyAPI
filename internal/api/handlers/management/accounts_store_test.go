@@ -5,10 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +49,155 @@ func TestOpenAccountStoreReusesInitializedStoreWhenExternalWriterHoldsLock(t *te
 	}
 	if reused != store {
 		t.Fatal("openAccountStore should reuse the initialized store instead of opening and ensuring schema again")
+	}
+}
+
+func TestListAccountsReopensCachedStoreAfterRecoverableReadFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("openAccountStore: %v", err)
+	}
+	created, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Primary",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-primary",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	// Simulate a cached account-store connection that entered an unrecoverable
+	// driver state. Read endpoints should invalidate it and reopen the store
+	// instead of requiring a full sidecar restart.
+	if err := h.accountStore.Close(); err != nil {
+		t.Fatalf("close cached account store: %v", err)
+	}
+
+	router := gin.New()
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("accounts status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal accounts: %v", err)
+	}
+	if len(body.Accounts) != 1 || body.Accounts[0].AccountKey != created.AccountKey {
+		t.Fatalf("accounts after reopen = %+v, want only %s", body.Accounts, created.AccountKey)
+	}
+}
+
+func TestWriteAccountStoreErrorClassifiesRecoverableIOError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/error", func(c *gin.Context) {
+		writeAccountStoreError(c, fmt.Errorf("query accounts: disk I/O error (522)"))
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/error", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Error       string `json:"error"`
+		Code        string `json:"code"`
+		Recoverable bool   `json:"recoverable"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if body.Code != "account_store_io_error" || !body.Recoverable {
+		t.Fatalf("body = %+v, want recoverable account_store_io_error", body)
+	}
+	if !strings.Contains(body.Error, "disk I/O error (522)") {
+		t.Fatalf("error = %q", body.Error)
+	}
+}
+
+func TestAccountStoreDiagnosticsReportsReadRecovery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("openAccountStore: %v", err)
+	}
+	if _, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Primary",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-primary",
+			BaseURL: "https://api.example.com/v1",
+		},
+	}); err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	if err := h.accountStore.Close(); err != nil {
+		t.Fatalf("close cached account store: %v", err)
+	}
+
+	router := gin.New()
+	router.GET("/v0/management/accounts", h.ListAccounts)
+	router.GET("/v0/management/gettokens/account-store-diagnostics", h.GetAccountStoreDiagnostics)
+
+	accountsRecorder := httptest.NewRecorder()
+	router.ServeHTTP(accountsRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if accountsRecorder.Code != http.StatusOK {
+		t.Fatalf("accounts status = %d body=%s", accountsRecorder.Code, accountsRecorder.Body.String())
+	}
+
+	diagRecorder := httptest.NewRecorder()
+	router.ServeHTTP(diagRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/account-store-diagnostics", nil))
+	if diagRecorder.Code != http.StatusOK {
+		t.Fatalf("diagnostics status = %d body=%s", diagRecorder.Code, diagRecorder.Body.String())
+	}
+	var diag struct {
+		PathBasename string `json:"path_basename"`
+		Open         bool   `json:"open"`
+		Recovery     struct {
+			Count       int    `json:"count"`
+			Endpoint    string `json:"last_endpoint"`
+			Recovered   bool   `json:"last_recovered"`
+			Error       string `json:"last_error"`
+			RecoveredAt int64  `json:"last_recovered_at_unix_ms"`
+		} `json:"read_recovery"`
+	}
+	if err := json.Unmarshal(diagRecorder.Body.Bytes(), &diag); err != nil {
+		t.Fatalf("unmarshal diagnostics: %v", err)
+	}
+	if diag.PathBasename != "accounts-v1.sqlite" || !diag.Open {
+		t.Fatalf("diagnostics path/open = %q/%v", diag.PathBasename, diag.Open)
+	}
+	if diag.Recovery.Count != 1 || diag.Recovery.Endpoint != "accounts" || !diag.Recovery.Recovered {
+		t.Fatalf("diagnostics recovery = %+v", diag.Recovery)
+	}
+	if !strings.Contains(diag.Recovery.Error, "database is closed") {
+		t.Fatalf("diagnostics recovery error = %q", diag.Recovery.Error)
+	}
+	if diag.Recovery.RecoveredAt <= 0 {
+		t.Fatalf("diagnostics recovered_at missing: %+v", diag.Recovery)
 	}
 }
 

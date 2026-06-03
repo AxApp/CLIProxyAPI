@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -10,6 +11,33 @@ import (
 type modelAliasEntry interface {
 	GetName() string
 	GetAlias() string
+}
+
+type modelAliasJSONEntry struct {
+	Name  string `json:"name"`
+	Alias string `json:"alias"`
+}
+
+func (m modelAliasJSONEntry) GetName() string  { return m.Name }
+func (m modelAliasJSONEntry) GetAlias() string { return m.Alias }
+
+func decodeModelAliasEntriesFromJSON(raw string) []modelAliasEntry {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var parsed []modelAliasJSONEntry
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil
+	}
+	entries := make([]modelAliasEntry, 0, len(parsed))
+	for _, item := range parsed {
+		if strings.TrimSpace(item.Name) == "" && strings.TrimSpace(item.Alias) == "" {
+			continue
+		}
+		entries = append(entries, item)
+	}
+	return entries
 }
 
 type oauthModelAliasTable struct {

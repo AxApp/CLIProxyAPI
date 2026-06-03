@@ -744,6 +744,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
 
+		mgmt.GET("/gettokens/account-store-diagnostics", s.mgmt.GetAccountStoreDiagnostics)
 		mgmt.GET("/accounts", s.mgmt.ListAccounts)
 		mgmt.GET("/accounts/:account_key", s.mgmt.GetAccount)
 		mgmt.POST("/accounts", s.mgmt.CreateAccount)
