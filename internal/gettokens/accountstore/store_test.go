@@ -83,6 +83,54 @@ func TestStoreEnsureSchemaCreatesTablesAndRestrictivePermissions(t *testing.T) {
 	}
 }
 
+func TestStoreEnsureSchemaAddsOpenAICompatibleFormatBaseURLsColumn(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "ALTER TABLE openai_compatible_accounts DROP COLUMN format_base_urls_json"); err != nil {
+		t.Fatalf("drop format_base_urls_json: %v", err)
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema after old schema: %v", err)
+	}
+	columns := tableColumns(t, store.db, "openai_compatible_accounts")
+	if !columns["format_base_urls_json"] {
+		t.Fatalf("format_base_urls_json column was not restored: %#v", columns)
+	}
+}
+
+func tableColumns(t *testing.T, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		t.Fatalf("table_info %s: %v", table, err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info %s: %v", table, err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows %s: %v", table, err)
+	}
+	return columns
+}
+
 func TestStoreEnsureSchemaWaitsForConcurrentSQLiteWriter(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := Open(dbPath)
@@ -391,6 +439,7 @@ func TestCommitImportWritesAccountsAndIsIdempotentByMigrationSource(t *testing.T
 					Prefix:             "ds/",
 					APIKeyEntriesJSON:  `[{"api-key":"sk-ds"}]`,
 					HeadersJSON:        `{"X-Provider":"DeepSeek"}`,
+					FormatBaseURLsJSON: `{"anthropic":"https://api.deepseek.com/anthropic","openai_chat":"https://api.deepseek.com/v1"}`,
 					ModelsJSON:         `[{"name":"deepseek-chat","alias":"deepseek-chat"}]`,
 				},
 			},
@@ -450,6 +499,9 @@ func TestCommitImportWritesAccountsAndIsIdempotentByMigrationSource(t *testing.T
 	compat := accountByKey(t, accounts, "acct_00000000-0000-4000-8000-000000000004")
 	if compat.OpenAICompatible == nil || compat.OpenAICompatible.RuntimeProviderKey != "openai-compatible:acct_00000000-0000-4000-8000-000000000004" {
 		t.Fatalf("openai-compatible account did not round-trip: %+v", compat.OpenAICompatible)
+	}
+	if got := compat.OpenAICompatible.FormatBaseURLsJSON; !strings.Contains(got, "api.deepseek.com/anthropic") || !strings.Contains(got, "openai_chat") {
+		t.Fatalf("openai-compatible format base URLs = %q, want anthropic/openai_chat round-trip", got)
 	}
 }
 

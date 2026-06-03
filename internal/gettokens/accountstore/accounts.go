@@ -767,7 +767,7 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 	case KindOpenAICompatible:
 		var credential OpenAICompatibleCredential
 		err := queryer.QueryRowContext(ctx, `
-SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, models_json
+SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json
 FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.ProviderName,
 			&credential.RuntimeProviderKey,
@@ -775,6 +775,7 @@ FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan
 			&credential.Prefix,
 			&credential.APIKeyEntriesJSON,
 			&credential.HeadersJSON,
+			&credential.FormatBaseURLsJSON,
 			&credential.ModelsJSON,
 		)
 		if err != nil {
@@ -933,8 +934,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			runtimeProviderKey = "openai-compatible:" + candidate.AccountKey
 		}
 		_, err = tx.ExecContext(ctx, `
-INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, models_json, updated_at_unix_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, updated_at_unix_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.AccountKey,
 			compat.ProviderName,
 			runtimeProviderKey,
@@ -942,6 +943,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			compat.Prefix,
 			defaultJSON(compat.APIKeyEntriesJSON, "[]"),
 			defaultJSON(compat.HeadersJSON, "{}"),
+			defaultJSON(compat.FormatBaseURLsJSON, "{}"),
 			defaultJSON(compat.ModelsJSON, "[]"),
 			now,
 		)

@@ -99,6 +99,7 @@ type OpenAICompatibleCredential struct {
 	Prefix             string `json:"prefix,omitempty"`
 	APIKeyEntriesJSON  string `json:"api_key_entries_json"`
 	HeadersJSON        string `json:"headers_json"`
+	FormatBaseURLsJSON string `json:"format_base_urls_json,omitempty"`
 	ModelsJSON         string `json:"models_json"`
 }
 

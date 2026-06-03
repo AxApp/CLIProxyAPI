@@ -95,6 +95,9 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, accountStoreSchema); err != nil {
 		return fmt.Errorf("ensure account store schema: %w", err)
 	}
+	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "format_base_urls_json", "'{}'"); err != nil {
+		return fmt.Errorf("ensure openai-compatible format base URLs column: %w", err)
+	}
 	now := fmt.Sprintf("%d", time.Now().UnixMilli())
 	_, err := s.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO account_store_meta(key, value) VALUES
@@ -105,6 +108,32 @@ INSERT OR IGNORE INTO account_store_meta(key, value) VALUES
 		return fmt.Errorf("ensure account store metadata: %w", err)
 	}
 	return nil
+}
+
+func ensureTextColumn(ctx context.Context, db *sql.DB, table string, column string, defaultValue string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT %s", table, column, defaultValue))
+	return err
 }
 
 func IsAccountKey(value string) bool {
@@ -212,6 +241,7 @@ CREATE TABLE IF NOT EXISTS openai_compatible_accounts (
   prefix TEXT NOT NULL DEFAULT '',
   api_key_entries_json TEXT NOT NULL DEFAULT '[]',
   headers_json TEXT NOT NULL DEFAULT '{}',
+  format_base_urls_json TEXT NOT NULL DEFAULT '{}',
   models_json TEXT NOT NULL DEFAULT '[]',
   updated_at_unix_ms INTEGER NOT NULL
 );
