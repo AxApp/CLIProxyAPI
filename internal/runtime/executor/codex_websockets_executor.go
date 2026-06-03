@@ -225,9 +225,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
-	var authID, authLabel, authType, authValue string
+	var authID, accountKey, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
+		accountKey = auth.AccountKey
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
@@ -244,6 +245,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		ProjectName:         liveIdentity.ProjectName,
 		Model:               baseModel,
 		AuthID:              authID,
+		AccountKey:          accountKey,
 		AuthLabel:           authLabel,
 		Provider:            e.Identifier(),
 		DownstreamTransport: downstreamTransportName(ctx),
@@ -459,8 +461,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
-	var authID, authLabel, authType, authValue string
+	var authID, accountKey, authLabel, authType, authValue string
 	authID = auth.ID
+	accountKey = auth.AccountKey
 	authLabel = auth.Label
 	authType, authValue = auth.AccountInfo()
 
@@ -476,6 +479,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		ProjectName:         liveIdentity.ProjectName,
 		Model:               baseModel,
 		AuthID:              authID,
+		AccountKey:          accountKey,
 		AuthLabel:           authLabel,
 		Provider:            e.Identifier(),
 		DownstreamTransport: downstreamTransportName(ctx),

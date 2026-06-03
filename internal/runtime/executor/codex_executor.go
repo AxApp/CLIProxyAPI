@@ -210,7 +210,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
-func recordCodexHTTPLiveRequestStarted(ctx context.Context, headers http.Header, body []byte, model string, authID string, authLabel string, provider string, errp *error) func() {
+func recordCodexHTTPLiveRequestStarted(ctx context.Context, headers http.Header, body []byte, model string, authID string, accountKey string, authLabel string, provider string, errp *error) func() {
 	identity := gettokenshooks.ExtractCodexLiveSessionIdentity(headers, body)
 	gettokenshooks.RecordCodexLiveRequestStarted(ctx, gettokenshooks.CodexLiveRequestStart{
 		ConversationID:      identity.ConversationID,
@@ -220,6 +220,7 @@ func recordCodexHTTPLiveRequestStarted(ctx context.Context, headers http.Header,
 		ProjectName:         identity.ProjectName,
 		Model:               model,
 		AuthID:              authID,
+		AccountKey:          accountKey,
 		AuthLabel:           authLabel,
 		Provider:            provider,
 		DownstreamTransport: downstreamTransportName(ctx),
@@ -316,13 +317,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	var authID, authLabel, authType, authValue string
+	var authID, accountKey, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
+		accountKey = auth.AccountKey
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, accountKey, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
@@ -475,13 +477,14 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
-	var authID, authLabel, authType, authValue string
+	var authID, accountKey, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
+		accountKey = auth.AccountKey
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, accountKey, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
@@ -575,13 +578,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	var authID, authLabel, authType, authValue string
+	var authID, accountKey, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
+		accountKey = auth.AccountKey
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, authLabel, e.Identifier(), &err)()
+	defer recordCodexHTTPLiveRequestStarted(ctx, httpReq.Header, body, baseModel, authID, accountKey, authLabel, e.Identifier(), &err)()
 	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,

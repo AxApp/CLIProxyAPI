@@ -590,6 +590,57 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	}
 }
 
+func TestConfigSynthesizer_AccountStoreOpenAICompatNormalizesDisplayProviderName(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	_, err = store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindOpenAICompatible,
+		Title:            "Xiaomi MiMo",
+		Provider:         "Xiaomi MiMo",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		OpenAICompatible: &accountstore.OpenAICompatibleCredential{
+			ProviderName:       "Xiaomi MiMo",
+			RuntimeProviderKey: "openai-compatible:acct_xiaomi_mimo",
+			BaseURL:            "https://api.xiaomimimo.com/v1",
+			APIKeyEntriesJSON:  `[{"api-key":"sk-mimo"}]`,
+			ModelsJSON:         `[{"name":"mimo-v2-pro","alias":"mimo-v2-pro"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount compat: %v", err)
+	}
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auths len = %d, want 1", len(auths))
+	}
+	if got := auths[0].Provider; got != "xiaomimimo" {
+		t.Fatalf("auth provider = %q, want xiaomimimo", got)
+	}
+	if got := auths[0].Attributes["provider_key"]; got != "xiaomimimo" {
+		t.Fatalf("provider_key = %q, want xiaomimimo", got)
+	}
+	if got := auths[0].Attributes["compat_name"]; got != "Xiaomi MiMo" {
+		t.Fatalf("compat_name = %q, want display name", got)
+	}
+}
+
 func TestConfigSynthesizer_AccountStoreExistsWithNoActiveAccountsSuppressesLegacyCodexSources(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := accountstore.Open(dbPath)

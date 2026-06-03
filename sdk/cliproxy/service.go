@@ -1220,9 +1220,15 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		default:
 			models = registry.GetCodexProModels()
 		}
+		if !isCodexAPIKeyAuthKind(authKind) {
+			models = filterOpenAICompatibilityModels(models)
+		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildCodexConfigModels(entry)
+				if !isCodexAPIKeyAuthKind(authKind) {
+					models = filterOpenAICompatibilityModels(models)
+				}
 			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
@@ -1748,6 +1754,28 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 		return nil
 	}
 	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
+}
+
+func isCodexAPIKeyAuthKind(authKind string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(authKind))
+	return normalized == "apikey" || normalized == "api_key"
+}
+
+func filterOpenAICompatibilityModels(models []*ModelInfo) []*ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(model.Type), "openai-compatibility") {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

@@ -165,6 +165,45 @@ func TestRegisterModelsForAuth_OpenAICompatibilityUsesAuthModelAttributes(t *tes
 	}
 }
 
+func TestRegisterModelsForAuth_CodexNonAPIKeyDoesNotRegisterOpenAICompatibleBuiltins(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
+	testCases := []struct {
+		name       string
+		attributes map[string]string
+	}{
+		{name: "oauth", attributes: map[string]string{"auth_kind": "oauth", "plan_type": "pro"}},
+		{name: "auth-file-without-kind", attributes: map[string]string{"plan_type": "pro"}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			auth := &coreauth.Auth{
+				ID:         "auth-codex-no-openai-compat-builtins-" + testCase.name,
+				Provider:   "codex",
+				Status:     coreauth.StatusActive,
+				Attributes: testCase.attributes,
+			}
+
+			modelRegistry := internalregistry.GetGlobalRegistry()
+			modelRegistry.UnregisterClient(auth.ID)
+			t.Cleanup(func() {
+				modelRegistry.UnregisterClient(auth.ID)
+			})
+
+			service.registerModelsForAuth(auth)
+
+			for _, modelID := range []string{"deepseek-v4-flash", "deepseek-v4-pro"} {
+				if modelRegistry.ClientSupportsModel(auth.ID, modelID) {
+					t.Fatalf("Codex non-API-key auth should not register OpenAI-compatible builtin %s", modelID)
+				}
+			}
+			if !modelRegistry.ClientSupportsModel(auth.ID, "gpt-5.5") {
+				t.Fatal("Codex non-API-key auth should still register native Codex models")
+			}
+		})
+	}
+}
+
 func TestRegisterModelsForAuth_OpenAICompatibilityDoesNotFallbackToConfig(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{

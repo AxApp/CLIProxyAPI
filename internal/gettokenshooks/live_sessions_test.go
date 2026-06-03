@@ -15,6 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
@@ -80,6 +82,83 @@ func TestLiveSessionsRouteReturnsWebsocketRequestSnapshot(t *testing.T) {
 	}
 	if len(session.Requests) != 0 {
 		t.Fatalf("requests = %d, want 0 for row feed", len(session.Requests))
+	}
+}
+
+func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetLiveSessionTrackerForTest(t)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Update(context.Background(), &coreauth.Auth{
+		ID:         "auth-enabled",
+		AccountKey: "acct_enabled",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+	}); err != nil {
+		t.Fatalf("seed enabled auth: %v", err)
+	}
+	if _, err := manager.Update(context.Background(), &coreauth.Auth{
+		ID:         "auth-disabled",
+		AccountKey: "acct_disabled",
+		Provider:   "codex",
+		Status:     coreauth.StatusDisabled,
+		Disabled:   true,
+	}); err != nil {
+		t.Fatalf("seed disabled auth: %v", err)
+	}
+
+	recordLiveSessionForAuth(t, "session-enabled", "req-enabled", "auth-enabled", "acct_enabled")
+	recordLiveSessionForAuth(t, "session-disabled", "req-disabled", "auth-disabled", "acct_disabled")
+	recordLiveSessionForAuth(t, "session-detached", "req-detached", "auth-detached", "acct_deleted")
+
+	router := gin.New()
+	group := router.Group("/v0/management")
+	ConfigureLiveSessionRoutes(group, &handlers.BaseAPIHandler{AuthManager: manager}, nil)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/live-sessions", nil)
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var snapshot LiveSessionsSnapshot
+	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want only enabled current account: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if got := snapshot.Sessions[0]; got.SessionID != "session-enabled" || got.AccountKey != "acct_enabled" || got.AuthDetached || got.AuthDisabled {
+		t.Fatalf("unexpected enabled session: %#v", got)
+	}
+	if snapshot.Summary.ActiveSessions != 1 || snapshot.Summary.ActiveRequests != 1 {
+		t.Fatalf("summary = %#v, want filtered active counts", snapshot.Summary)
+	}
+
+	allRecorder := httptest.NewRecorder()
+	allReq := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/live-sessions?include_detached=true", nil)
+	router.ServeHTTP(allRecorder, allReq)
+	if allRecorder.Code != http.StatusOK {
+		t.Fatalf("include_detached status = %d body=%s", allRecorder.Code, allRecorder.Body.String())
+	}
+	var allSnapshot LiveSessionsSnapshot
+	if err := json.Unmarshal(allRecorder.Body.Bytes(), &allSnapshot); err != nil {
+		t.Fatalf("unmarshal include_detached snapshot: %v", err)
+	}
+	if len(allSnapshot.Sessions) != 3 {
+		t.Fatalf("include_detached sessions = %d, want 3: %#v", len(allSnapshot.Sessions), allSnapshot.Sessions)
+	}
+	byID := map[string]LiveSession{}
+	for _, session := range allSnapshot.Sessions {
+		byID[session.SessionID] = session
+	}
+	if !byID["session-disabled"].AuthDisabled || byID["session-disabled"].AuthDetached {
+		t.Fatalf("disabled session state = %#v", byID["session-disabled"])
+	}
+	if !byID["session-detached"].AuthDetached || byID["session-detached"].AuthDisabled {
+		t.Fatalf("detached session state = %#v", byID["session-detached"])
 	}
 }
 
@@ -794,6 +873,23 @@ func liveTimingSummaryInt64Value(t *testing.T, value *int64) int64 {
 		t.Fatal("expected int64 timing summary value")
 	}
 	return *value
+}
+
+func recordLiveSessionForAuth(t *testing.T, sessionID string, requestID string, authID string, accountKey string) {
+	t.Helper()
+	RecordDownstreamWebsocketConnected(sessionID, "127.0.0.1")
+	RecordDownstreamWebsocketRequest(sessionID, requestID, "gpt-5.5")
+	requestCtx := internallogging.WithRequestID(context.Background(), requestID)
+	RecordCodexLiveRequestStarted(requestCtx, CodexLiveRequestStart{
+		ExecutionSessionID:  sessionID,
+		Model:               "gpt-5.5",
+		AuthID:              authID,
+		AccountKey:          accountKey,
+		AuthLabel:           authID,
+		Provider:            "codex",
+		DownstreamTransport: "websocket",
+		UpstreamTransport:   "websocket",
+	})
 }
 
 func liveTimingSummaryIntValue(t *testing.T, value *int) int {

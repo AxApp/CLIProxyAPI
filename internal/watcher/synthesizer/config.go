@@ -338,12 +338,10 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 		return nil
 	}
 	compat := account.OpenAICompatible
-	providerName := strings.ToLower(strings.TrimSpace(compat.ProviderName))
-	if providerName == "" {
-		providerName = strings.ToLower(strings.TrimSpace(account.Provider))
-	}
-	if providerName == "" {
-		providerName = "openai-compatibility"
+	providerName := normalizeAccountStoreOpenAICompatProviderKey(account, *compat)
+	displayName := defaultLabel(compat.ProviderName, account.Provider)
+	if displayName == "" {
+		displayName = providerName
 	}
 	base := strings.TrimSpace(compat.BaseURL)
 	prefix := strings.TrimSpace(compat.Prefix)
@@ -364,7 +362,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 		attrs := map[string]string{
 			"source":       fmt.Sprintf("account-store:%s[%s]", providerName, token),
 			"base_url":     base,
-			"compat_name":  defaultLabel(compat.ProviderName, account.Provider),
+			"compat_name":  displayName,
 			"provider_key": providerName,
 			"account_key":  account.AccountKey,
 		}
@@ -387,7 +385,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 			ID:         id,
 			AccountKey: account.AccountKey,
 			Provider:   providerName,
-			Label:      defaultLabel(account.Title, compat.ProviderName),
+			Label:      defaultLabel(account.Title, displayName),
 			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
 			Disabled:   account.Disabled,
@@ -402,6 +400,100 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 		out = append(out, auth)
 	}
 	return out
+}
+
+func normalizeAccountStoreOpenAICompatProviderKey(account accountstore.AccountRecord, compat accountstore.OpenAICompatibleCredential) string {
+	candidates := []string{
+		account.Provider,
+		compat.ProviderName,
+		compat.RuntimeProviderKey,
+	}
+	for _, candidate := range candidates {
+		normalized := normalizeOpenAICompatProviderKeyCandidate(candidate)
+		if normalized != "" {
+			return normalized
+		}
+	}
+	if normalized := normalizeOpenAICompatProviderKeyFromBaseURL(compat.BaseURL); normalized != "" {
+		return normalized
+	}
+	return "openai-compatibility"
+}
+
+func normalizeOpenAICompatProviderKeyCandidate(value string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "openai-compatible:") || strings.HasPrefix(trimmed, "openai-compatibility:") {
+		return ""
+	}
+	if normalized := normalizeKnownOpenAICompatProviderKey(trimmed); normalized != "" {
+		return normalized
+	}
+	return compactProviderKey(trimmed)
+}
+
+func normalizeOpenAICompatProviderKeyFromBaseURL(baseURL string) string {
+	lower := strings.ToLower(strings.TrimSpace(baseURL))
+	switch {
+	case strings.Contains(lower, "xiaomimimo.com"):
+		return "xiaomimimo"
+	case strings.Contains(lower, "api.deepseek.com"):
+		return "deepseek"
+	case strings.Contains(lower, "openrouter.ai"):
+		return "openrouter"
+	case strings.Contains(lower, "siliconflow"):
+		return "siliconflow"
+	case strings.Contains(lower, "bigmodel.cn"):
+		return "zhipu"
+	case strings.Contains(lower, "moonshot.cn"):
+		return "moonshot"
+	case strings.Contains(lower, "dashscope.aliyuncs.com"):
+		return "dashscope"
+	case strings.Contains(lower, "groq.com"):
+		return "groq"
+	case strings.Contains(lower, "together.xyz"):
+		return "together"
+	case strings.Contains(lower, "volces.com"):
+		return "doubao"
+	default:
+		return ""
+	}
+}
+
+func normalizeKnownOpenAICompatProviderKey(value string) string {
+	compact := compactProviderKey(value)
+	switch compact {
+	case "xiaomimimo", "xiaomimimoai", "xiaomimo", "mimo":
+		return "xiaomimimo"
+	case "deepseek":
+		return "deepseek"
+	case "openrouter":
+		return "openrouter"
+	case "siliconflow":
+		return "siliconflow"
+	case "zhipu", "zhipuai", "bigmodel", "bigmodelcn":
+		return "zhipu"
+	case "moonshot", "moonshotai", "kimi":
+		return "moonshot"
+	case "dashscope", "aliyundashscope":
+		return "dashscope"
+	case "doubao", "volcengine", "ark":
+		return "doubao"
+	default:
+		return ""
+	}
+}
+
+func compactProviderKey(value string) string {
+	var builder strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
 }
 
 func synthesizeAccountStoreAuthFile(ctx *SynthesisContext, account accountstore.AccountRecord) []*coreauth.Auth {

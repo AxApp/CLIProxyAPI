@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
@@ -66,7 +67,10 @@ type LiveSession struct {
 	LastRequestID       string              `json:"lastRequestID,omitempty"`
 	Model               string              `json:"model"`
 	AuthID              string              `json:"authID,omitempty"`
+	AccountKey          string              `json:"accountKey,omitempty"`
 	AuthLabel           string              `json:"authLabel,omitempty"`
+	AuthDetached        bool                `json:"authDetached,omitempty"`
+	AuthDisabled        bool                `json:"authDisabled,omitempty"`
 	Provider            string              `json:"provider,omitempty"`
 	DownstreamTransport string              `json:"downstreamTransport"`
 	UpstreamTransport   string              `json:"upstreamTransport"`
@@ -92,7 +96,10 @@ type LiveRequest struct {
 	UpstreamTransport   string              `json:"upstreamTransport"`
 	ConnectionReused    bool                `json:"connectionReused,omitempty"`
 	AuthID              string              `json:"authID,omitempty"`
+	AccountKey          string              `json:"accountKey,omitempty"`
 	AuthLabel           string              `json:"authLabel,omitempty"`
+	AuthDetached        bool                `json:"authDetached,omitempty"`
+	AuthDisabled        bool                `json:"authDisabled,omitempty"`
 	Provider            string              `json:"provider,omitempty"`
 	ProxyRoute          string              `json:"proxyRoute,omitempty"`
 	Usage               *LiveTokenUsage     `json:"usage,omitempty"`
@@ -182,6 +189,7 @@ type CodexLiveRequestStart struct {
 	ProjectName         string
 	Model               string
 	AuthID              string
+	AccountKey          string
 	AuthLabel           string
 	Provider            string
 	DownstreamTransport string
@@ -312,13 +320,20 @@ func ObserveCodexLiveUsage(ctx context.Context, record coreusage.Record) {
 	currentLiveSessionTracker().observeUsage(ctx, record, time.Now())
 }
 
-func ConfigureLiveSessionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandler, _ *config.Config) {
+func ConfigureLiveSessionRoutes(group *gin.RouterGroup, handler *handlers.BaseAPIHandler, _ *config.Config) {
 	if group == nil {
 		return
 	}
 	group.GET("/gettokens/live-sessions", func(c *gin.Context) {
 		startedAt := time.Now()
-		c.JSON(http.StatusOK, CurrentLiveSessionsSnapshot())
+		snapshot := CurrentLiveSessionsSnapshot()
+		inventory := liveSessionCurrentAuthInventory(handler)
+		if parseLiveSessionIncludeDetached(c.Query("include_detached")) {
+			snapshot = annotateLiveSessionsSnapshotByCurrentAuths(snapshot, inventory)
+		} else {
+			snapshot = filterLiveSessionsSnapshotByCurrentAuths(snapshot, inventory)
+		}
+		c.JSON(http.StatusOK, snapshot)
 		maybeSkipLiveSessionPollingLog(c, startedAt)
 	})
 	group.GET("/gettokens/live-sessions/history", func(c *gin.Context) {
@@ -341,6 +356,120 @@ func ConfigureLiveSessionRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandl
 		currentLiveSessionTracker().clear()
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
+}
+
+type liveSessionAuthInventoryEntry struct {
+	AccountKey string
+	Disabled   bool
+}
+
+func liveSessionCurrentAuthInventory(handler *handlers.BaseAPIHandler) map[string]liveSessionAuthInventoryEntry {
+	if handler == nil || handler.AuthManager == nil {
+		return nil
+	}
+	auths := handler.AuthManager.List()
+	inventory := make(map[string]liveSessionAuthInventoryEntry, len(auths)*2)
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		disabled := auth.Disabled || auth.Status == coreauth.StatusDisabled
+		entry := liveSessionAuthInventoryEntry{
+			AccountKey: strings.TrimSpace(auth.AccountKey),
+			Disabled:   disabled,
+		}
+		if id := strings.TrimSpace(auth.ID); id != "" {
+			inventory[id] = entry
+		}
+		if entry.AccountKey != "" {
+			inventory["account:"+entry.AccountKey] = entry
+		}
+	}
+	return inventory
+}
+
+func filterLiveSessionsSnapshotByCurrentAuths(snapshot LiveSessionsSnapshot, inventory map[string]liveSessionAuthInventoryEntry) LiveSessionsSnapshot {
+	if inventory == nil {
+		return snapshot
+	}
+	filtered := make([]LiveSession, 0, len(snapshot.Sessions))
+	for _, session := range snapshot.Sessions {
+		enriched, keep := applyLiveSessionAuthInventory(session, inventory)
+		if keep {
+			filtered = append(filtered, enriched)
+		}
+	}
+	snapshot.Sessions = filtered
+	snapshot.Summary = buildLiveSessionSummary(filtered)
+	return snapshot
+}
+
+func annotateLiveSessionsSnapshotByCurrentAuths(snapshot LiveSessionsSnapshot, inventory map[string]liveSessionAuthInventoryEntry) LiveSessionsSnapshot {
+	if inventory == nil {
+		return snapshot
+	}
+	for index := range snapshot.Sessions {
+		enriched, _ := applyLiveSessionAuthInventory(snapshot.Sessions[index], inventory)
+		snapshot.Sessions[index] = enriched
+	}
+	return snapshot
+}
+
+func applyLiveSessionAuthInventory(session LiveSession, inventory map[string]liveSessionAuthInventoryEntry) (LiveSession, bool) {
+	authID := strings.TrimSpace(session.AuthID)
+	accountKey := strings.TrimSpace(session.AccountKey)
+	entry, found := inventory[authID]
+	if !found && accountKey != "" {
+		entry, found = inventory["account:"+accountKey]
+	}
+	if found {
+		session.AuthDetached = false
+		session.AuthDisabled = entry.Disabled
+		if session.AccountKey == "" {
+			session.AccountKey = entry.AccountKey
+		}
+		return session, !entry.Disabled
+	}
+	if authID != "" || accountKey != "" {
+		session.AuthDetached = true
+		session.AuthDisabled = false
+		return session, false
+	}
+	return session, true
+}
+
+func buildLiveSessionSummary(items []LiveSession) LiveSessionSummary {
+	summary := LiveSessionSummary{}
+	for _, session := range items {
+		if session.Status == "active" || session.Status == "streaming" {
+			summary.ActiveSessions++
+		}
+		if session.ActiveRequestID != "" {
+			summary.ActiveRequests++
+		}
+		if session.DownstreamTransport == "websocket" || session.UpstreamTransport == "websocket" {
+			summary.WebsocketSessions++
+		}
+		if session.DownstreamTransport == "http" || session.UpstreamTransport == "http" {
+			summary.HTTPSessions++
+		}
+		if session.Status == "degraded_http" || session.FallbackInferred {
+			summary.DegradedSessions++
+		}
+		if session.Status == "failed" || session.Status == "cancelled" {
+			summary.ErrorSessions++
+		}
+	}
+	return summary
+}
+
+func parseLiveSessionIncludeDetached(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "all":
+		return true
+	default:
+		return false
+	}
 }
 
 func ExtractCodexLiveSessionIdentity(headers http.Header, payload []byte) CodexLiveSessionIdentity {
@@ -500,6 +629,7 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 	session.session.ExecutionSessionID = firstNonEmptyString(strings.TrimSpace(input.ExecutionSessionID), session.session.ExecutionSessionID)
 	session.session.Model = firstNonEmptyString(strings.TrimSpace(input.Model), session.session.Model)
 	session.session.AuthID = firstNonEmptyString(strings.TrimSpace(input.AuthID), session.session.AuthID)
+	session.session.AccountKey = firstNonEmptyString(strings.TrimSpace(input.AccountKey), session.session.AccountKey)
 	session.session.AuthLabel = firstNonEmptyString(strings.TrimSpace(input.AuthLabel), session.session.AuthLabel)
 	session.session.Provider = firstNonEmptyString(strings.TrimSpace(input.Provider), session.session.Provider)
 	session.session.DownstreamTransport = mergeTransport(session.session.DownstreamTransport, downstream)
@@ -512,6 +642,7 @@ func (t *liveSessionTracker) recordCodexRequestStarted(ctx context.Context, inpu
 	reqState := t.ensureRequestLocked(session, requestID, input.Model, now, downstream, upstream)
 	reqState.request.ClientRequestID = strings.TrimSpace(identity.ClientRequestID)
 	reqState.request.AuthID = strings.TrimSpace(input.AuthID)
+	reqState.request.AccountKey = strings.TrimSpace(input.AccountKey)
 	reqState.request.AuthLabel = strings.TrimSpace(input.AuthLabel)
 	reqState.request.Provider = strings.TrimSpace(input.Provider)
 	reqState.request.Status = "streaming"
@@ -618,6 +749,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 	}
 	session.session.Model = firstNonEmptyString(record.Alias, record.Model)
 	session.session.AuthID = strings.TrimSpace(record.AuthID)
+	session.session.AccountKey = strings.TrimSpace(record.AccountKey)
 	session.session.Provider = strings.TrimSpace(record.Provider)
 	session.session.DownstreamTransport = "http"
 	session.session.UpstreamTransport = "http"
@@ -625,6 +757,7 @@ func (t *liveSessionTracker) observeUsage(ctx context.Context, record coreusage.
 	session.session.LastRequestID = requestID
 	req := t.ensureRequestLocked(session, requestID, session.session.Model, parseLiveTime(session.session.StartedAt), "http", "http")
 	req.request.AuthID = record.AuthID
+	req.request.AccountKey = record.AccountKey
 	req.request.Provider = record.Provider
 	req.request.Status = "completed"
 	req.request.CompletedAt = formatLiveTime(now)
@@ -676,33 +809,12 @@ func (t *liveSessionTracker) snapshot(now time.Time) LiveSessionsSnapshot {
 		return items[i].LastEventAt > items[j].LastEventAt
 	})
 	t.enrichSnapshotProjectNames(items, now)
-	summary := LiveSessionSummary{}
-	for _, session := range items {
-		if session.Status == "active" || session.Status == "streaming" {
-			summary.ActiveSessions++
-		}
-		if session.ActiveRequestID != "" {
-			summary.ActiveRequests++
-		}
-		if session.DownstreamTransport == "websocket" || session.UpstreamTransport == "websocket" {
-			summary.WebsocketSessions++
-		}
-		if session.DownstreamTransport == "http" || session.UpstreamTransport == "http" {
-			summary.HTTPSessions++
-		}
-		if session.Status == "degraded_http" || session.FallbackInferred {
-			summary.DegradedSessions++
-		}
-		if session.Status == "failed" || session.Status == "cancelled" {
-			summary.ErrorSessions++
-		}
-	}
 	return LiveSessionsSnapshot{
 		GeneratedAt:  formatLiveTime(now),
 		SidecarReady: true,
 		Source:       "live",
 		Retention:    liveSessionsRetentionLabel,
-		Summary:      summary,
+		Summary:      buildLiveSessionSummary(items),
 		Sessions:     items,
 	}
 }
