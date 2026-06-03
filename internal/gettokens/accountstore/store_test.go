@@ -154,6 +154,33 @@ func TestStoreEnsureSchemaAddsCodexAPIKeyCurlVariablesJSONColumn(t *testing.T) {
 	}
 }
 
+func TestStoreEnsureSchemaAddsOpenAICompatibleModelFetchColumns(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, column := range []string{"model_fetch_api_key", "model_fetch_base_url"} {
+		if _, err := store.db.ExecContext(ctx, "ALTER TABLE openai_compatible_accounts DROP COLUMN "+column); err != nil {
+			t.Fatalf("drop %s: %v", column, err)
+		}
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema after old schema: %v", err)
+	}
+	columns := tableColumns(t, store.db, "openai_compatible_accounts")
+	for _, column := range []string{"model_fetch_api_key", "model_fetch_base_url"} {
+		if !columns[column] {
+			t.Fatalf("%s column was not restored: %#v", column, columns)
+		}
+	}
+}
+
 func TestStoreEnsureSchemaWaitsForConcurrentSQLiteWriter(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
 	store, err := Open(dbPath)
