@@ -257,6 +257,10 @@ func CurrentLiveSessionsSnapshot() LiveSessionsSnapshot {
 	return tracker.snapshot(time.Now())
 }
 
+func PruneCodexLiveSessionsForAccount(authID string, accountKey string, reason string) int {
+	return currentLiveSessionTracker().pruneAccount(authID, accountKey, reason, time.Now())
+}
+
 func currentLiveSessionActiveAuthCounts() map[string]int {
 	tracker := currentLiveSessionTracker()
 	now := time.Now()
@@ -1314,6 +1318,98 @@ func (t *liveSessionTracker) pruneLocked(now time.Time) {
 			t.requestMap[requestID] = sessionID
 		}
 	}
+}
+
+func (t *liveSessionTracker) pruneAccount(authID string, accountKey string, reason string, now time.Time) int {
+	if t == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	accountKey = strings.TrimSpace(accountKey)
+	if authID == "" && accountKey == "" {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "account_detached"
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	removed := 0
+	for sessionID, session := range t.sessions {
+		if session == nil {
+			continue
+		}
+		if liveSessionIdentityMatchesAccount(session.session.AuthID, session.session.AccountKey, authID, accountKey) {
+			for requestID := range session.requests {
+				delete(t.requestMap, requestID)
+			}
+			delete(t.sessions, sessionID)
+			removed++
+			continue
+		}
+		matchedRequest := false
+		for requestID, req := range session.requests {
+			if req == nil || !liveSessionIdentityMatchesAccount(req.request.AuthID, req.request.AccountKey, authID, accountKey) {
+				continue
+			}
+			delete(session.requests, requestID)
+			delete(t.requestMap, requestID)
+			matchedRequest = true
+		}
+		if !matchedRequest {
+			continue
+		}
+		if len(session.requests) == 0 {
+			delete(t.sessions, sessionID)
+			removed++
+			continue
+		}
+		reconcileLiveSessionAfterAccountPruneLocked(session, now, reason)
+		removed++
+	}
+	return removed
+}
+
+func liveSessionIdentityMatchesAccount(rowAuthID string, rowAccountKey string, authID string, accountKey string) bool {
+	rowAuthID = strings.TrimSpace(rowAuthID)
+	rowAccountKey = strings.TrimSpace(rowAccountKey)
+	if authID != "" && rowAuthID == authID {
+		return true
+	}
+	return accountKey != "" && rowAccountKey == accountKey
+}
+
+func reconcileLiveSessionAfterAccountPruneLocked(session *liveSessionState, now time.Time, reason string) {
+	if session == nil {
+		return
+	}
+	requests := liveRequestsFromState(session.requests)
+	if len(requests) == 0 {
+		return
+	}
+	latest := requests[len(requests)-1]
+	session.session.RequestCount = len(requests)
+	session.session.LastRequestID = latest.RequestID
+	session.session.AuthID = latest.AuthID
+	session.session.AccountKey = latest.AccountKey
+	session.session.AuthLabel = latest.AuthLabel
+	session.session.Provider = latest.Provider
+	session.session.Model = firstNonEmptyString(latest.Model, session.session.Model)
+	activeRequestID := ""
+	for _, req := range requests {
+		if req.Status == "active" || req.Status == "streaming" || req.Status == "reconnecting" || req.Status == "upstream_disconnected" {
+			activeRequestID = req.RequestID
+		}
+	}
+	session.session.ActiveRequestID = activeRequestID
+	if activeRequestID == "" && (session.session.Status == "active" || session.session.Status == "streaming" || session.session.Status == "reconnecting" || session.session.Status == "upstream_disconnected") {
+		session.session.Status = latest.Status
+	}
+	session.addEvent("account-pruned-"+strconvFormatInt(now.UnixNano()), now, "sidecar", "account_pruned", "Detached account removed from live session", "warning", reason)
 }
 
 func (t *liveSessionTracker) clear() {

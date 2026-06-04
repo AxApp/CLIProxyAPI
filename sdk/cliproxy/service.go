@@ -370,6 +370,7 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 			log.Errorf("failed to disable auth %s: %v", id, err)
 		}
 		if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
+			gettokenshooks.PruneCodexLiveSessionsForAccount(existing.ID, existing.AccountKey, "auth_removed")
 			closeCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
 			s.ensureExecutorsForAuth(existing)
 		}
@@ -407,8 +408,11 @@ func (s *Service) applyAccountStoreStatusChange(_ context.Context, account accou
 		}
 		if account.Disabled {
 			gettokenshooks.MarkManualDisabledAuth(auth, "account disabled")
-			if wasRouteable && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
-				closeCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
+			if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+				gettokenshooks.PruneCodexLiveSessionsForAccount(auth.ID, auth.AccountKey, "account_disabled")
+				if wasRouteable {
+					closeCodexWebsocketSessionsForAuthID(auth.ID, "auth_disabled")
+				}
 			}
 			continue
 		}

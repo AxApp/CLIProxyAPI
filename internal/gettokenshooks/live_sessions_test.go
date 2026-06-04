@@ -181,6 +181,46 @@ func TestLiveSessionsRouteFiltersDetachedAndDisabledRuntimeAccounts(t *testing.T
 	}
 }
 
+func TestPruneCodexLiveSessionsForAccountRemovesDeletedAccountRows(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	recordLiveSessionForAuth(t, "session-target", "req-target", "auth-target", "acct_target")
+	recordLiveSessionForAuth(t, "session-other", "req-other", "auth-other", "acct_other")
+
+	removed := PruneCodexLiveSessionsForAccount("auth-target", "acct_target", "auth_removed")
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want only unrelated session: %#v", len(snapshot.Sessions), snapshot.Sessions)
+	}
+	if got := snapshot.Sessions[0]; got.SessionID != "session-other" || got.AuthID != "auth-other" || got.AccountKey != "acct_other" {
+		t.Fatalf("remaining session = %#v", got)
+	}
+	if counts := currentLiveSessionActiveAuthCounts(); counts["auth-target"] != 0 || counts["auth-other"] != 1 {
+		t.Fatalf("active auth counts = %#v, want only other auth", counts)
+	}
+}
+
+func TestPruneCodexLiveSessionsForAccountMatchesAccountKeyWhenAuthIDChanged(t *testing.T) {
+	resetLiveSessionTrackerForTest(t)
+
+	recordLiveSessionForAuth(t, "session-target", "req-target", "old-runtime-auth", "acct_same")
+	recordLiveSessionForAuth(t, "session-other", "req-other", "auth-other", "acct_other")
+
+	removed := PruneCodexLiveSessionsForAccount("", "acct_same", "account_deleted")
+	if removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+
+	snapshot := CurrentLiveSessionsSnapshot()
+	if len(snapshot.Sessions) != 1 || snapshot.Sessions[0].SessionID != "session-other" {
+		t.Fatalf("sessions after account-key prune = %#v", snapshot.Sessions)
+	}
+}
+
 func TestLiveSessionsObserveUsageRecordCreatesHTTPCompletedSession(t *testing.T) {
 	resetLiveSessionTrackerForTest(t)
 
