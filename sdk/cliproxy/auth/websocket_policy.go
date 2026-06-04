@@ -4,9 +4,12 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+const websocketCircuitOpenUntilMetadataKey = "websocket_circuit_open_until"
 
 // WebsocketsAllowedForRequest reports whether the current request may use an upstream websocket.
 func WebsocketsAllowedForRequest(ctx context.Context, auth *Auth) bool {
@@ -18,7 +21,43 @@ func AuthAllowsWebsockets(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
+	if AuthWebsocketCircuitOpen(auth, time.Now()) {
+		return false
+	}
 	return AuthDataAllowsWebsockets(auth.Provider, auth.FileName, auth.Attributes, auth.Metadata)
+}
+
+// MarkAuthWebsocketCircuitOpen temporarily disables websocket transport for an auth in memory.
+func MarkAuthWebsocketCircuitOpen(auth *Auth, until time.Time) {
+	if auth == nil || until.IsZero() {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = map[string]any{}
+	}
+	auth.Metadata[websocketCircuitOpenUntilMetadataKey] = until.UTC().Format(time.RFC3339Nano)
+}
+
+// AuthWebsocketCircuitOpen reports whether an auth is temporarily barred from websocket transport.
+func AuthWebsocketCircuitOpen(auth *Auth, now time.Time) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	raw, ok := auth.Metadata[websocketCircuitOpenUntilMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	var until time.Time
+	switch value := raw.(type) {
+	case time.Time:
+		until = value
+	case string:
+		parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+		if err == nil {
+			until = parsed
+		}
+	}
+	return !until.IsZero() && until.After(now)
 }
 
 // AuthDataAllowsWebsockets evaluates websocket capability for auth data without mutating it.

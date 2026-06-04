@@ -116,6 +116,8 @@ type Result struct {
 	Latency time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
+	// TransportFailureKind marks transport-scoped failures that must not update auth availability.
+	TransportFailureKind string
 }
 
 // Selector chooses an auth candidate for execution.
@@ -795,6 +797,17 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func isWebsocketTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var transportErr cliproxyexecutor.TransportFailure
+	if !errors.As(err, &transportErr) {
+		return false
+	}
+	return transportErr.TransportFailureKind() == cliproxyexecutor.TransportFailureKindWebsocket
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
@@ -836,6 +849,27 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
+				if isWebsocketTransportFailure(chunk.Err) {
+					rerr := &Error{Message: chunk.Err.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
+						rerr.HTTPStatus = se.StatusCode()
+					}
+					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, TransportFailureKind: cliproxyexecutor.TransportFailureKindWebsocket, Latency: latency})
+					if !forward {
+						return false
+					}
+					if ctx == nil {
+						out <- chunk
+						return true
+					}
+					select {
+					case <-ctx.Done():
+						forward = false
+						return false
+					case out <- chunk:
+						return true
+					}
+				}
 				rerr := &Error{Message: chunk.Err.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -899,6 +933,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				rerr.HTTPStatus = se.StatusCode()
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Latency: time.Since(startedAt)}
+			if isWebsocketTransportFailure(errStream) {
+				result.TransportFailureKind = cliproxyexecutor.TransportFailureKindWebsocket
+			}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -914,6 +951,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
+			}
+			if isWebsocketTransportFailure(bootstrapErr) {
+				rerr := &Error{Message: bootstrapErr.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, TransportFailureKind: cliproxyexecutor.TransportFailureKindWebsocket, Latency: latency}
+				m.MarkResult(ctx, result)
+				discardStreamChunks(streamResult.Chunks)
+				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
@@ -2447,6 +2494,24 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
+		return
+	}
+
+	if !result.Success && result.TransportFailureKind == cliproxyexecutor.TransportFailureKindWebsocket {
+		m.mu.Lock()
+		var authSnapshot *Auth
+		if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+			now := time.Now()
+			auth.recordRecentRequest(now, false)
+			auth.Failed++
+			MarkAuthWebsocketCircuitOpen(auth, now.Add(30*time.Second))
+			auth.UpdatedAt = now
+			authSnapshot = auth.Clone()
+		}
+		m.mu.Unlock()
+		if m.scheduler != nil && authSnapshot != nil {
+			m.scheduler.upsertAuth(authSnapshot)
+		}
 		return
 	}
 

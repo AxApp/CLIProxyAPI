@@ -70,6 +70,42 @@ func (e *websocketHTTPFallbackCaptureExecutor) Payloads(authID string) [][]byte 
 	return out
 }
 
+type websocketTransportStatusTestError struct{}
+
+func (websocketTransportStatusTestError) Error() string {
+	return "stream closed before response.completed"
+}
+
+func (websocketTransportStatusTestError) StatusCode() int { return http.StatusRequestTimeout }
+
+func (websocketTransportStatusTestError) TransportFailureKind() string {
+	return cliproxyexecutor.TransportFailureKindWebsocket
+}
+
+type websocketTransportFailureExecutor struct{}
+
+func (websocketTransportFailureExecutor) Identifier() string { return "codex" }
+
+func (websocketTransportFailureExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not implemented")
+}
+
+func (websocketTransportFailureExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, websocketTransportStatusTestError{}
+}
+
+func (websocketTransportFailureExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (websocketTransportFailureExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not implemented")
+}
+
+func (websocketTransportFailureExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
 func TestManagerExecuteStreamWebsocketHTTPFallbackStripsGenerateOnlyForHTTPAuth(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	executor := &websocketHTTPFallbackCaptureExecutor{}
@@ -129,5 +165,55 @@ func TestManagerExecuteStreamWebsocketHTTPFallbackStripsGenerateOnlyForHTTPAuth(
 	}
 	if !gjson.GetBytes(httpPayloads[0], "metadata.keep").Bool() {
 		t.Fatalf("http fallback payload must preserve unrelated fields: %s", httpPayloads[0])
+	}
+}
+
+func TestManagerExecuteStreamWebsocketTransportFailureOnlyOpensWebsocketCircuit(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(websocketTransportFailureExecutor{})
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("ws-auth", "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("ws-auth")
+	})
+
+	if _, err := manager.Register(context.Background(), &Auth{
+		ID:         "ws-auth",
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+		Status:     StatusActive,
+	}); err != nil {
+		t.Fatalf("register websocket auth: %v", err)
+	}
+
+	_, err := manager.ExecuteStream(
+		cliproxyexecutor.WithDownstreamWebsocket(context.Background()),
+		[]string{"codex"},
+		cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","stream":true}`)},
+		cliproxyexecutor.Options{},
+	)
+	if err == nil {
+		t.Fatal("expected websocket transport failure")
+	}
+
+	updated, ok := manager.GetByID("ws-auth")
+	if !ok || updated == nil {
+		t.Fatal("expected websocket auth to remain registered")
+	}
+	if updated.Failed != 1 {
+		t.Fatalf("failed count = %d, want 1", updated.Failed)
+	}
+	if updated.Unavailable {
+		t.Fatal("websocket transport failure must not mark auth unavailable")
+	}
+	if updated.Status == StatusError {
+		t.Fatalf("status = %q, want non-error auth status", updated.Status)
+	}
+	if len(updated.ModelStates) != 0 {
+		t.Fatalf("model states = %#v, want no auth/model cooldown from websocket transport failure", updated.ModelStates)
+	}
+	if AuthAllowsWebsockets(updated) {
+		t.Fatal("expected temporary websocket circuit to disable websocket transport")
 	}
 }

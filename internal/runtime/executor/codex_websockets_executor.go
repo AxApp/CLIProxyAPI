@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -526,13 +527,20 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			errStatus := statusErrWithHeaders{
+				statusErr: statusErr{code: respHS.StatusCode, msg: string(bodyErr)},
+				headers:   respHS.Header.Clone(),
+			}
+			if isCodexWebsocketHandshakeTransportFailure(respHS.StatusCode, bodyErr) {
+				return nil, websocketTransportErr{cause: errStatus}
+			}
+			return nil, errStatus
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
 			sess.reqMu.Unlock()
 		}
-		return nil, errDial
+		return nil, websocketTransportErr{cause: errDial}
 	}
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	if liveRequestID != "" {
@@ -562,7 +570,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
-				return nil, errDialRetry
+				if errDialRetry != nil {
+					return nil, websocketTransportErr{cause: errDialRetry}
+				}
+				return nil, websocketTransportErr{cause: errors.New("codex websockets executor: retry dial returned nil connection")}
 			}
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
 			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -583,7 +594,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
-				return nil, errSendRetry
+				return nil, websocketTransportErr{cause: errSendRetry}
 			}
 			conn = connRetry
 			wsReqBody = wsReqBodyRetry
@@ -592,7 +603,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if errClose := conn.Close(); errClose != nil {
 				log.Errorf("codex websockets executor: close websocket error: %v", errClose)
 			}
-			return nil, errSend
+			return nil, websocketTransportErr{cause: errSend}
 		}
 	}
 
@@ -877,6 +888,7 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 		parsed.Scheme = "ws"
 	case "https":
 		parsed.Scheme = "wss"
+	case "ws", "wss":
 	default:
 		return "", fmt.Errorf("codex websockets executor: unsupported responses websocket URL scheme %q", parsed.Scheme)
 	}
@@ -1134,6 +1146,33 @@ func (e statusErrWithHeaders) Headers() http.Header {
 	return e.headers.Clone()
 }
 
+type websocketTransportStatusErr struct {
+	statusErrWithHeaders
+}
+
+func (e websocketTransportStatusErr) TransportFailureKind() string {
+	return cliproxyexecutor.TransportFailureKindWebsocket
+}
+
+type websocketTransportErr struct {
+	cause error
+}
+
+func (e websocketTransportErr) Error() string {
+	if e.cause == nil {
+		return ""
+	}
+	return e.cause.Error()
+}
+
+func (e websocketTransportErr) Unwrap() error {
+	return e.cause
+}
+
+func (e websocketTransportErr) TransportFailureKind() string {
+	return cliproxyexecutor.TransportFailureKindWebsocket
+}
+
 func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if len(payload) == 0 {
 		return nil, false
@@ -1158,10 +1197,37 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		retryAfter := time.Duration(0)
 		statusError.retryAfter = &retryAfter
 	}
-	return statusErrWithHeaders{
+	errWithHeaders := statusErrWithHeaders{
 		statusErr: statusError,
 		headers:   headers,
-	}, true
+	}
+	if isCodexWebsocketTransportFailure(status, payload, out) {
+		return websocketTransportStatusErr{statusErrWithHeaders: errWithHeaders}, true
+	}
+	return errWithHeaders, true
+}
+
+func isCodexWebsocketTransportFailure(status int, payload []byte, normalized []byte) bool {
+	if status != http.StatusRequestTimeout {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(string(payload) + " " + string(normalized)))
+	return strings.Contains(text, "stream closed before response.completed") ||
+		strings.Contains(text, "session_closed") ||
+		strings.Contains(text, "abnormal closure") ||
+		strings.Contains(text, "unexpected eof") ||
+		strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "websocket")
+}
+
+func isCodexWebsocketHandshakeTransportFailure(status int, body []byte) bool {
+	if status == http.StatusRequestTimeout {
+		return true
+	}
+	if status >= http.StatusInternalServerError && status <= 599 {
+		return true
+	}
+	return isCodexWebsocketTransportFailure(status, body, body)
 }
 
 func buildCodexWebsocketErrorPayload(payload []byte, status int) []byte {

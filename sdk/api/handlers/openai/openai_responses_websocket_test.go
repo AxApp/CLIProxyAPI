@@ -15,10 +15,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokenshooks"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -1168,6 +1170,149 @@ func TestResponsesWebsocketClosesOnCodexUpstreamDisconnect(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketMockUpstream408ThenRouteGuardUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamTransientErr)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamTransientErr)
+	})
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstreamRequests := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("upstream path = %s, want /responses", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade upstream websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, payload, errRead := conn.ReadMessage()
+		if errRead != nil {
+			t.Errorf("read upstream request: %v", errRead)
+			return
+		}
+		upstreamRequests <- bytes.Clone(payload)
+
+		errPayload := []byte(`{"type":"error","status":408,"error":{"message":"stream closed before response.completed","type":"invalid_request_error"}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, errPayload); errWrite != nil {
+			t.Errorf("write upstream 408 error: %v", errWrite)
+			return
+		}
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, gettokenshooks.AccountRouteGuardResultHook{})
+	manager.RegisterExecutor(runtimeexecutor.NewCodexWebsocketsExecutor(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{DisableImageGeneration: internalconfig.DisableImageGenerationAll},
+	}))
+
+	auth := &coreauth.Auth{
+		ID:         "codex:apikey:mock-ws-408",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		AccountKey: "acct_mock_ws_408",
+		Attributes: map[string]string{
+			"api_key":    "sk-mock",
+			"base_url":   upstream.URL,
+			"websockets": "true",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5.5"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses", h.ResponsesWebsocket)
+	relay := httptest.NewServer(router)
+	defer relay.Close()
+
+	downstreamURL := "ws" + strings.TrimPrefix(relay.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(downstreamURL, nil)
+	if err != nil {
+		t.Fatalf("dial downstream websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	firstRequest := []byte(`{"type":"response.create","model":"gpt-5.5","input":[{"type":"message","id":"msg-1","role":"user","content":[{"type":"input_text","text":"trigger upstream 408"}]}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, firstRequest); errWrite != nil {
+		t.Fatalf("write first downstream request: %v", errWrite)
+	}
+	_, firstPayload, errRead := conn.ReadMessage()
+	if errRead == nil {
+		if got := gjson.GetBytes(firstPayload, "type").String(); got != wsEventTypeError {
+			t.Fatalf("first downstream type = %s, want error: %s", got, firstPayload)
+		}
+		if got := int(gjson.GetBytes(firstPayload, "status").Int()); got != http.StatusRequestTimeout {
+			t.Fatalf("first downstream status = %d, want 408: %s", got, firstPayload)
+		}
+		if !strings.Contains(gjson.GetBytes(firstPayload, "error.message").String(), "stream closed before response.completed") {
+			t.Fatalf("first downstream error missing stream-closed message: %s", firstPayload)
+		}
+	}
+
+	select {
+	case payload := <-upstreamRequests:
+		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+			t.Fatalf("upstream request type = %s, want response.create: %s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fake upstream request")
+	}
+
+	var updatedAuth *coreauth.Auth
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		current, ok := manager.GetByID(auth.ID)
+		if !ok {
+			t.Fatal("registered auth disappeared")
+		}
+		updatedAuth = current
+		if coreauth.AuthWebsocketCircuitOpen(current, time.Now()) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if updatedAuth == nil || !coreauth.AuthWebsocketCircuitOpen(updatedAuth, time.Now()) {
+		t.Fatal("expected websocket transport failure to open websocket circuit")
+	}
+	if blocks := gettokenshooks.ActiveAccountRouteGuardBlocksForAuth(updatedAuth); len(blocks) > 0 {
+		t.Fatalf("websocket transport failure must not create route guard block: %+v", blocks)
+	}
+
+	conn2, _, err := websocket.DefaultDialer.Dial(downstreamURL, nil)
+	if err != nil {
+		t.Fatalf("dial second downstream websocket: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	secondRequest := []byte(`{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp-missing-completed","input":[{"type":"message","id":"msg-2","role":"user","content":[{"type":"input_text","text":"retry while auth guarded"}]}]}`)
+	if errWrite := conn2.WriteMessage(websocket.TextMessage, secondRequest); errWrite != nil {
+		t.Fatalf("write second downstream request: %v", errWrite)
+	}
+	_, secondPayload, errRead := conn2.ReadMessage()
+	if errRead == nil && strings.Contains(gjson.GetBytes(secondPayload, "error.message").String(), "auth_unavailable") {
+		t.Fatalf("second downstream must not return auth_unavailable after websocket transport failure: %s", secondPayload)
+	}
+	updatedAuth, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("registered auth disappeared after second request")
+	}
+	if coreauth.AuthAllowsWebsockets(updatedAuth) {
+		t.Fatal("expected websocket circuit breaker to disable websocket transport for auth")
+	}
+}
+
 func TestWebsocketUpstreamSupportsIncrementalInputForModel(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := &coreauth.Auth{
@@ -1822,7 +1967,12 @@ func TestResponsesWebsocketCompactionResetsTurnStateOnCustomToolTranscriptReplac
 	executor := &websocketCompactionCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{
+		ID:         "auth-sse",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -1926,7 +2076,12 @@ func TestResponsesWebsocketCompactionResetsTurnStateOnTranscriptReplacement(t *t
 	executor := &websocketCompactionCaptureExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
-	auth := &coreauth.Auth{ID: "auth-sse", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	auth := &coreauth.Auth{
+		ID:         "auth-sse",
+		Provider:   executor.Identifier(),
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatalf("Register auth: %v", err)
 	}
@@ -2312,5 +2467,60 @@ func TestResponsesWebsocketClosesForOpenAICompatibleHTTPFallback(t *testing.T) {
 	}
 	if closeErr.Code != websocket.CloseUnsupportedData {
 		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseUnsupportedData)
+	}
+}
+
+func TestResponsesWebsocketClosesForCodexAuthWithWebsocketsDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "auth-codex-http",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"api_key":    "sk-codex",
+			"base_url":   "https://api.example.test/v1",
+			"websockets": "false",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register codex auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5.5"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"hi"}`)); err != nil {
+		t.Fatalf("write websocket message: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected websocket close to force HTTP fallback")
+	}
+	closeErr, ok := err.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("read error = %T %v, want websocket close error", err, err)
+	}
+	if closeErr.Code != websocket.CloseUnsupportedData {
+		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseUnsupportedData)
+	}
+	if !strings.Contains(closeErr.Text, "retry over HTTP") {
+		t.Fatalf("close text = %q, want retry over HTTP hint", closeErr.Text)
 	}
 }

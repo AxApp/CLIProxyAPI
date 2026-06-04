@@ -442,11 +442,60 @@ func TestBuildCodexResponsesWebsocketURLRequiresHTTPURL(t *testing.T) {
 	if got, err := buildCodexResponsesWebsocketURL("https://example.com/backend/responses"); err != nil || got != "wss://example.com/backend/responses" {
 		t.Fatalf("https URL = %q, %v; want wss URL", got, err)
 	}
+	if got, err := buildCodexResponsesWebsocketURL("wss://example.com/backend/responses"); err != nil || got != "wss://example.com/backend/responses" {
+		t.Fatalf("wss URL = %q, %v; want wss URL passthrough", got, err)
+	}
+	if got, err := buildCodexResponsesWebsocketURL("ws://example.com/backend/responses"); err != nil || got != "ws://example.com/backend/responses" {
+		t.Fatalf("ws URL = %q, %v; want ws URL passthrough", got, err)
+	}
 	if _, err := buildCodexResponsesWebsocketURL("ftp://example.com/responses"); err == nil {
 		t.Fatalf("expected unsupported scheme error")
 	}
 	if _, err := buildCodexResponsesWebsocketURL("https:///responses"); err == nil {
 		t.Fatalf("expected empty host error")
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamHandshake408IsTransportFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "stream closed before response.completed", http.StatusRequestTimeout)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{
+		ID: "codex-ws-auth",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("codex"),
+		Stream:       true,
+	}
+
+	_, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err == nil {
+		t.Fatal("expected websocket handshake error")
+	}
+	var transportErr cliproxyexecutor.TransportFailure
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("expected websocket transport failure, got %T: %v", err, err)
+	}
+	if transportErr.TransportFailureKind() != cliproxyexecutor.TransportFailureKindWebsocket {
+		t.Fatalf("transport kind = %q, want websocket", transportErr.TransportFailureKind())
+	}
+	var statusErr cliproxyexecutor.StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("expected wrapped status error, got %T: %v", err, err)
+	}
+	if statusErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", statusErr.StatusCode(), http.StatusRequestTimeout)
 	}
 }
 

@@ -34,6 +34,11 @@ const (
 	ExecutionSessionMetadataKey = "execution_session_id"
 )
 
+const (
+	// TransportFailureKindWebsocket marks failures isolated to the upstream websocket transport.
+	TransportFailureKindWebsocket = "websocket"
+)
+
 // Request encapsulates the translated payload that will be sent to a provider executor.
 type Request struct {
 	// Model is the upstream model identifier after translation.
@@ -97,4 +102,10 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+// TransportFailure marks errors that are transport scoped rather than auth scoped.
+type TransportFailure interface {
+	error
+	TransportFailureKind() string
 }

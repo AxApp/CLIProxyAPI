@@ -289,6 +289,33 @@ func TestWebsocketsAllowedForRequestRequiresDownstreamWebsocket(t *testing.T) {
 	}
 }
 
+func TestAuthAllowsWebsocketsHonorsTemporaryCircuit(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		ID:       "codex-api-key",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"websockets": "true",
+		},
+	}
+	now := time.Now()
+	if !AuthAllowsWebsockets(auth) {
+		t.Fatalf("expected explicit websocket auth to allow websocket transport")
+	}
+
+	MarkAuthWebsocketCircuitOpen(auth, now.Add(time.Minute))
+	if !AuthWebsocketCircuitOpen(auth, now) {
+		t.Fatalf("expected websocket circuit to be open before expiry")
+	}
+	if AuthAllowsWebsockets(auth) {
+		t.Fatalf("expected websocket circuit to disable websocket transport")
+	}
+	if AuthWebsocketCircuitOpen(auth, now.Add(2*time.Minute)) {
+		t.Fatalf("expected websocket circuit to expire")
+	}
+}
+
 func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	t.Parallel()
 

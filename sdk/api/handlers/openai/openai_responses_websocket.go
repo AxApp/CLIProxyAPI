@@ -1042,19 +1042,25 @@ func (h *OpenAIResponsesAPIHandler) responsesWebsocketRequiresHTTPFallbackForMod
 		return false
 	}
 	auths, _ := h.responsesWebsocketAvailableAuthsForModel(modelName)
+	if len(auths) == 0 {
+		return false
+	}
 	for _, auth := range auths {
-		if responsesWebsocketAuthRequiresHTTPFallback(auth) {
-			return true
+		if !responsesWebsocketAuthRequiresHTTPFallback(auth) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func responsesWebsocketAuthRequiresHTTPFallback(auth *coreauth.Auth) bool {
-	if auth == nil || coreauth.AuthAllowsWebsockets(auth) {
+	if auth == nil {
 		return false
 	}
 	provider := strings.TrimSpace(strings.ToLower(auth.Provider))
+	if provider == "codex" && !coreauth.AuthAllowsWebsockets(auth) {
+		return true
+	}
 	if provider == "openai-compatibility" {
 		return true
 	}
