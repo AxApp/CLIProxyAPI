@@ -768,14 +768,21 @@ FROM codex_api_key_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 		account.CodexAPIKey = &credential
 	case KindOpenAICompatible:
 		var credential OpenAICompatibleCredential
+		var quotaEnabled, billingEnabled int
 		err := queryer.QueryRowContext(ctx, `
-SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url
+SELECT provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url
 FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan(
 			&credential.ProviderName,
 			&credential.RuntimeProviderKey,
 			&credential.BaseURL,
 			&credential.Prefix,
 			&credential.APIKeyEntriesJSON,
+			&credential.QuotaCurl,
+			&quotaEnabled,
+			&credential.BillingCurl,
+			&billingEnabled,
+			&credential.PlatformCookie,
+			&credential.CurlVariablesJSON,
 			&credential.HeadersJSON,
 			&credential.FormatBaseURLsJSON,
 			&credential.ModelsJSON,
@@ -785,6 +792,8 @@ FROM openai_compatible_accounts WHERE account_key = ?`, account.AccountKey).Scan
 		if err != nil {
 			return fmt.Errorf("query openai-compatible credential for %s: %w", account.AccountKey, err)
 		}
+		credential.QuotaEnabled = quotaEnabled != 0
+		credential.BillingEnabled = billingEnabled != 0
 		account.OpenAICompatible = &credential
 	default:
 		return fmt.Errorf("unsupported account kind %q", account.Kind)
@@ -940,14 +949,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			runtimeProviderKey = "openai-compatible:" + candidate.AccountKey
 		}
 		_, err = tx.ExecContext(ctx, `
-INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url, updated_at_unix_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+INSERT INTO openai_compatible_accounts(account_key, provider_name, runtime_provider_key, base_url, prefix, api_key_entries_json, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, headers_json, format_base_urls_json, models_json, model_fetch_api_key, model_fetch_base_url, updated_at_unix_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			candidate.AccountKey,
 			compat.ProviderName,
 			runtimeProviderKey,
 			compat.BaseURL,
 			compat.Prefix,
 			defaultJSON(compat.APIKeyEntriesJSON, "[]"),
+			strings.TrimSpace(compat.QuotaCurl),
+			boolInt(compat.QuotaEnabled && strings.TrimSpace(compat.QuotaCurl) != ""),
+			strings.TrimSpace(compat.BillingCurl),
+			boolInt(compat.BillingEnabled && strings.TrimSpace(compat.BillingCurl) != ""),
+			strings.TrimSpace(compat.PlatformCookie),
+			defaultJSON(compat.CurlVariablesJSON, "{}"),
 			defaultJSON(compat.HeadersJSON, "{}"),
 			defaultJSON(compat.FormatBaseURLsJSON, "{}"),
 			defaultJSON(compat.ModelsJSON, "[]"),

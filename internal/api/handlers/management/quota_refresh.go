@@ -91,12 +91,16 @@ func (h *Handler) RefreshAccountQuota(c *gin.Context) {
 		writeAccountStoreError(c, err)
 		return
 	}
-	if account.Kind != accountstore.KindCodexAPIKey || account.CodexAPIKey == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "account is not a codex-api-key account"})
+	var state gettokenshooks.QuotaRuntimeState
+	switch account.Kind {
+	case accountstore.KindCodexAPIKey:
+		state, err = h.refreshCodexAPIKeyQuota(c.Request.Context(), account, req.IncludeBilling)
+	case accountstore.KindOpenAICompatible:
+		state, err = h.refreshOpenAICompatibleQuota(c.Request.Context(), account, req.IncludeBilling)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account kind does not support quota refresh"})
 		return
 	}
-
-	state, err := h.refreshCodexAPIKeyQuota(c.Request.Context(), account, req.IncludeBilling)
 	if err != nil {
 		if fallback, ok := degradedQuotaRuntimeState(accountKey, err); ok {
 			c.JSON(http.StatusOK, fallback)
@@ -187,6 +191,50 @@ func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountst
 	}
 
 	return gettokenshooks.DefaultQuotaRuntimeStore().Upsert(quotaRuntimeStateFromParsed(account.AccountKey, quotaRefreshSource, gettokenshooks.QuotaRuntimeStatusSuccess, quota), time.Now().UTC())
+}
+
+func (h *Handler) refreshOpenAICompatibleQuota(ctx context.Context, account accountstore.AccountRecord, includeBilling bool) (gettokenshooks.QuotaRuntimeState, error) {
+	credential := account.OpenAICompatible
+	if credential == nil {
+		return gettokenshooks.QuotaRuntimeState{}, errors.New("openai-compatible credential is missing")
+	}
+	apiKey, proxyURL := firstOpenAICompatibleAPIKeyEntry(credential.APIKeyEntriesJSON)
+	if strings.TrimSpace(apiKey) == "" {
+		return gettokenshooks.QuotaRuntimeState{}, errors.New("openai-compatible api key is empty")
+	}
+	if !credential.QuotaEnabled || strings.TrimSpace(credential.QuotaCurl) == "" {
+		return gettokenshooks.QuotaRuntimeState{}, errors.New("openai-compatible quota curl is not configured")
+	}
+
+	auth := authForOpenAICompatibleAccount(account, apiKey, proxyURL)
+	quota, err := h.fetchQuotaFromCurl(ctx, quotaCurlInput{
+		Curl:           credential.QuotaCurl,
+		APIKey:         apiKey,
+		BaseURL:        credential.BaseURL,
+		Prefix:         credential.Prefix,
+		PlatformCookie: credential.PlatformCookie,
+		CurlVariables:  decodeCurlVariablesJSON(credential.CurlVariablesJSON, credential.PlatformCookie),
+	}, auth)
+	if err != nil {
+		return gettokenshooks.QuotaRuntimeState{}, err
+	}
+
+	if includeBilling && credential.BillingEnabled && strings.TrimSpace(credential.BillingCurl) != "" {
+		if billing, errBilling := h.fetchBillingFromCurl(ctx, quotaCurlInput{
+			Curl:           credential.BillingCurl,
+			APIKey:         apiKey,
+			BaseURL:        credential.BaseURL,
+			Prefix:         credential.Prefix,
+			PlatformCookie: credential.PlatformCookie,
+			CurlVariables:  decodeCurlVariablesJSON(credential.CurlVariablesJSON, credential.PlatformCookie),
+		}, auth); errBilling == nil {
+			quota.Billing = billing
+		} else {
+			log.WithError(errBilling).WithField("account_key", account.AccountKey).Debug("openai-compatible billing refresh failed")
+		}
+	}
+
+	return gettokenshooks.DefaultQuotaRuntimeStore().Upsert(quotaRuntimeStateFromParsed(account.AccountKey, "openai-compatible-quota-curl", gettokenshooks.QuotaRuntimeStatusSuccess, quota), time.Now().UTC())
 }
 
 func (h *Handler) testQuotaCurl(ctx context.Context, req quotaCurlTestRequest) (gettokenshooks.QuotaRuntimeState, error) {
@@ -337,6 +385,43 @@ func authForCodexAPIKeyAccount(account accountstore.AccountRecord) *coreauth.Aut
 		auth.Prefix = strings.TrimSpace(account.CodexAPIKey.Prefix)
 		auth.Attributes["api_key"] = strings.TrimSpace(account.CodexAPIKey.APIKey)
 		auth.Attributes["base_url"] = strings.TrimSpace(account.CodexAPIKey.BaseURL)
+	}
+	return auth
+}
+
+func firstOpenAICompatibleAPIKeyEntry(raw string) (string, string) {
+	var entries []struct {
+		APIKey   string `json:"api-key"`
+		ProxyURL string `json:"proxy-url"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &entries); err != nil {
+		return "", ""
+	}
+	for _, entry := range entries {
+		apiKey := strings.TrimSpace(entry.APIKey)
+		if apiKey != "" {
+			return apiKey, strings.TrimSpace(entry.ProxyURL)
+		}
+	}
+	return "", ""
+}
+
+func authForOpenAICompatibleAccount(account accountstore.AccountRecord, apiKey string, proxyURL string) *coreauth.Auth {
+	provider := strings.TrimSpace(account.Provider)
+	if provider == "" {
+		provider = "openai-compatible"
+	}
+	auth := &coreauth.Auth{
+		ID:         account.AccountKey,
+		AccountKey: account.AccountKey,
+		Provider:   provider,
+		ProxyURL:   strings.TrimSpace(proxyURL),
+		Attributes: map[string]string{},
+	}
+	if account.OpenAICompatible != nil {
+		auth.Prefix = strings.TrimSpace(account.OpenAICompatible.Prefix)
+		auth.Attributes["api_key"] = strings.TrimSpace(apiKey)
+		auth.Attributes["base_url"] = strings.TrimSpace(account.OpenAICompatible.BaseURL)
 	}
 	return auth
 }

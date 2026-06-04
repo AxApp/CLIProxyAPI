@@ -95,6 +95,24 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, accountStoreSchema); err != nil {
 		return fmt.Errorf("ensure account store schema: %w", err)
 	}
+	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "quota_curl", "''"); err != nil {
+		return fmt.Errorf("ensure openai-compatible quota curl column: %w", err)
+	}
+	if err := ensureIntegerColumn(ctx, s.db, "openai_compatible_accounts", "quota_enabled", "0"); err != nil {
+		return fmt.Errorf("ensure openai-compatible quota enabled column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "billing_curl", "''"); err != nil {
+		return fmt.Errorf("ensure openai-compatible billing curl column: %w", err)
+	}
+	if err := ensureIntegerColumn(ctx, s.db, "openai_compatible_accounts", "billing_enabled", "0"); err != nil {
+		return fmt.Errorf("ensure openai-compatible billing enabled column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "platform_cookie", "''"); err != nil {
+		return fmt.Errorf("ensure openai-compatible platform cookie column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "curl_variables_json", "'{}'"); err != nil {
+		return fmt.Errorf("ensure openai-compatible curl variables column: %w", err)
+	}
 	if err := ensureTextColumn(ctx, s.db, "openai_compatible_accounts", "format_base_urls_json", "'{}'"); err != nil {
 		return fmt.Errorf("ensure openai-compatible format base URLs column: %w", err)
 	}
@@ -120,6 +138,32 @@ INSERT OR IGNORE INTO account_store_meta(key, value) VALUES
 		return fmt.Errorf("ensure account store metadata: %w", err)
 	}
 	return nil
+}
+
+func ensureIntegerColumn(ctx context.Context, db *sql.DB, table string, column string, defaultValue string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s INTEGER NOT NULL DEFAULT %s", table, column, defaultValue))
+	return err
 }
 
 func ensureTextColumn(ctx context.Context, db *sql.DB, table string, column string, defaultValue string) error {
@@ -254,6 +298,12 @@ CREATE TABLE IF NOT EXISTS openai_compatible_accounts (
   base_url TEXT NOT NULL,
   prefix TEXT NOT NULL DEFAULT '',
   api_key_entries_json TEXT NOT NULL DEFAULT '[]',
+  quota_curl TEXT NOT NULL DEFAULT '',
+  quota_enabled INTEGER NOT NULL DEFAULT 0,
+  billing_curl TEXT NOT NULL DEFAULT '',
+  billing_enabled INTEGER NOT NULL DEFAULT 0,
+  platform_cookie TEXT NOT NULL DEFAULT '',
+  curl_variables_json TEXT NOT NULL DEFAULT '{}',
   headers_json TEXT NOT NULL DEFAULT '{}',
   format_base_urls_json TEXT NOT NULL DEFAULT '{}',
   models_json TEXT NOT NULL DEFAULT '[]',

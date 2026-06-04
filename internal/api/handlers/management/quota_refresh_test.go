@@ -87,6 +87,83 @@ func TestQuotaRefreshCodexAPIKeyAccountWritesRuntimeGuard(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshOpenAICompatibleAccountWritesBillingRuntime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var gotAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/usage":
+			_, _ = w.Write([]byte(`{"plan_type":"billing","rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":3600,"reset_at":` + jsonInt(time.Now().Add(time.Hour).Unix()) + `}}}`))
+		case "/balance":
+			_, _ = w.Write([]byte(`{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"42.00","granted_balance":"12.00","topped_up_balance":"30.00"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(filepath.Join(t.TempDir(), "accounts-v1.sqlite"))
+
+	router := gin.New()
+	router.POST("/v0/management/accounts", h.CreateAccount)
+	router.POST("/v0/management/gettokens/quota-refresh/:account_key", h.RefreshAccountQuota)
+
+	createBody := []byte(`{
+		"kind":"openai-compatible",
+		"title":"DeepSeek",
+		"provider":"deepseek",
+		"openai_compatible":{
+			"provider_name":"deepseek",
+			"base_url":"` + upstream.URL + `",
+			"api_key_entries_json":"[{\"api-key\":\"sk-openai-compatible\"}]",
+			"quota_enabled":true,
+			"quota_curl":"curl -sS \"{{baseUrl}}/usage\" -H \"Authorization: Bearer {{apiKey}}\"",
+			"billing_enabled":true,
+			"billing_curl":"curl -sS \"{{baseUrl}}/balance\" -H \"Authorization: Bearer {{apiKey}}\""
+		}
+	}`)
+	createRecorder := httptest.NewRecorder()
+	router.ServeHTTP(createRecorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts", bytes.NewReader(createBody)))
+	if createRecorder.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created struct {
+		AccountKey string `json:"account_key"`
+	}
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+
+	refreshRecorder := httptest.NewRecorder()
+	router.ServeHTTP(refreshRecorder, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-refresh/"+created.AccountKey, bytes.NewReader([]byte(`{"include_billing":true}`))))
+	if refreshRecorder.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d body=%s", refreshRecorder.Code, refreshRecorder.Body.String())
+	}
+	var state gettokenshooks.QuotaRuntimeState
+	if err := json.Unmarshal(refreshRecorder.Body.Bytes(), &state); err != nil {
+		t.Fatalf("unmarshal refresh: %v", err)
+	}
+	if gotAuthorization != "Bearer sk-openai-compatible" {
+		t.Fatalf("Authorization = %q, want Bearer sk-openai-compatible", gotAuthorization)
+	}
+	if state.AccountKey != created.AccountKey || state.Status != gettokenshooks.QuotaRuntimeStatusSuccess {
+		t.Fatalf("state identity/status = %#v", state)
+	}
+	if len(state.Windows) != 1 {
+		t.Fatalf("windows = %#v, want quota window", state.Windows)
+	}
+	if state.Billing == nil || !state.Billing.IsAvailable || len(state.Billing.BalanceInfos) != 1 {
+		t.Fatalf("billing = %#v, want one balance", state.Billing)
+	}
+	if state.Billing.BalanceInfos[0].TotalBalance != "42.00" {
+		t.Fatalf("balance = %#v, want total 42.00", state.Billing.BalanceInfos[0])
+	}
+}
+
 func TestQuotaDraftTestRejectsShellFeaturesWithoutRuntimeWrite(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

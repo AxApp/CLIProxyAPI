@@ -100,6 +100,12 @@ type OpenAICompatibleCredential struct {
 	BaseURL            string `json:"base_url"`
 	Prefix             string `json:"prefix,omitempty"`
 	APIKeyEntriesJSON  string `json:"api_key_entries_json"`
+	QuotaCurl          string `json:"quota_curl,omitempty"`
+	QuotaEnabled       bool   `json:"quota_enabled,omitempty"`
+	BillingCurl        string `json:"billing_curl,omitempty"`
+	BillingEnabled     bool   `json:"billing_enabled,omitempty"`
+	PlatformCookie     string `json:"platform_cookie,omitempty"`
+	CurlVariablesJSON  string `json:"curl_variables_json,omitempty"`
 	HeadersJSON        string `json:"headers_json"`
 	FormatBaseURLsJSON string `json:"format_base_urls_json,omitempty"`
 	ModelsJSON         string `json:"models_json"`
