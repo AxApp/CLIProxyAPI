@@ -28,7 +28,7 @@ func TestProjectCandidatePoolPolicyExactMatchStrictAllowsAccounts(t *testing.T) 
 	      "projectKeySource": "codex-turn-workspace",
 	      "projectKeyConfidence": "strong",
 	      "enabled": true,
-	      "allowAccountIDs": ["auth-b", "auth-missing"]
+	      "allowAccountIDs": ["auth-b", "auth-a", "auth-missing"]
 	    }
 	  ]
 	}`)
@@ -43,8 +43,11 @@ func TestProjectCandidatePoolPolicyExactMatchStrictAllowsAccounts(t *testing.T) 
 		},
 	})
 
-	assertRouteCandidateIDs(t, result.Candidates, []string{"auth-b"})
+	assertRouteCandidateIDs(t, result.Candidates, []string{"auth-b", "auth-a"})
 	assertProjectCandidatePoolTrace(t, result.Trace, true, "project-candidate-pool:matched")
+	if len(result.Trace) != 1 || strings.Join(result.Trace[0].OrderIDs, ",") != "auth-b,auth-a,auth-missing" {
+		t.Fatalf("project candidate pool order ids = %#v, want allowAccountIDs order", result.Trace)
+	}
 }
 
 func TestProjectCandidatePoolPolicyNoProjectKeyIsNotEvaluated(t *testing.T) {

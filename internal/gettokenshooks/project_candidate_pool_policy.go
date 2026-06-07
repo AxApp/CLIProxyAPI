@@ -90,6 +90,7 @@ func rewriteProjectCandidatePoolCandidates(_ context.Context, req gettokensrouti
 		}
 		return gettokensrouting.PolicyDecision{
 			AllowIDs:      allowIDs,
+			OrderIDs:      allowIDs,
 			AllowFallback: &allowFallback,
 			Reason:        "project-candidate-pool:matched",
 		}
