@@ -149,6 +149,54 @@ func TestOpenAICompatExecutorResponsesRequestUsesChatCompletionsUpstream(t *test
 	}
 }
 
+func TestOpenAICompatExecutorUsesOpenAIChatFormatBaseURL(t *testing.T) {
+	legacyHits := 0
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyHits++
+		http.Error(w, "legacy base_url should not be used", http.StatusTeapot)
+	}))
+	defer legacyServer.Close()
+
+	var gotPath string
+	var gotBody []byte
+	chatServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_fmt","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer chatServer.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url":                    legacyServer.URL + "/legacy",
+		"format_base_url:openai_chat": chatServer.URL + "/v1",
+		"api_key":                     "test",
+	}}
+	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-4.1",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	}); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if legacyHits != 0 {
+		t.Fatalf("legacy base_url hits = %d, want 0", legacyHits)
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("path = %q, want /v1/chat/completions", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-4.1" {
+		t.Fatalf("upstream model = %q, want gpt-4.1; body=%s", got, string(gotBody))
+	}
+}
+
 func TestOpenAICompatExecutorDeepSeekResponsesReasoningUsesDeepSeekChatOptions(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

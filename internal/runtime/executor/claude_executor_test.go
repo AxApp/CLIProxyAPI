@@ -1007,6 +1007,62 @@ func TestClaudeExecutor_ExecuteOpenAINonStreamConvertsValidClaudeStream(t *testi
 	}
 }
 
+func TestClaudeExecutorExecuteUsesAnthropicFormatBaseURL(t *testing.T) {
+	legacyHits := 0
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyHits++
+		http.Error(w, "legacy base_url should not be used", http.StatusTeapot)
+	}))
+	defer legacyServer.Close()
+
+	var gotPath string
+	anthropicBody := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_123","model":"claude-3-5-sonnet-20241022"}}`,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":2,"output_tokens":1}}`,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	anthropicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(anthropicBody))
+	}))
+	defer anthropicServer.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                   "key-123",
+		"base_url":                  legacyServer.URL,
+		"format_base_url:anthropic": anthropicServer.URL,
+	}}
+	payload := []byte(`{"model":"claude-3-5-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}`)
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if legacyHits != 0 {
+		t.Fatalf("legacy base_url hits = %d, want 0", legacyHits)
+	}
+	if gotPath != "/v1/messages" {
+		t.Fatalf("path = %q, want /v1/messages", gotPath)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("response content = %q, want ok; payload=%s", got, string(resp.Payload))
+	}
+}
+
 func executeOpenAIChatCompletionThroughClaude(t *testing.T, upstreamBody string) (cliproxyexecutor.Response, error) {
 	t.Helper()
 

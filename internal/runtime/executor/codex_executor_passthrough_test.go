@@ -52,6 +52,53 @@ func TestCodexExecutePreservesResponsesPayloadFieldsUpstream(t *testing.T) {
 	}
 }
 
+func TestCodexExecuteUsesOpenAIResponsesFormatBaseURL(t *testing.T) {
+	legacyHits := 0
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyHits++
+		http.Error(w, "legacy base_url should not be used", http.StatusTeapot)
+	}))
+	defer legacyServer.Close()
+
+	capturedPayload := make(chan []byte, 1)
+	responsesServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("request path = %s, want /v1/responses", r.URL.Path)
+		}
+		body := readTestRequestBody(t, r)
+		capturedPayload <- bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-2","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}` + "\n\n"))
+	}))
+	defer responsesServer.Close()
+
+	exec := NewCodexExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                          "sk-test",
+		"base_url":                         legacyServer.URL,
+		"format_base_url:openai_responses": responsesServer.URL + "/v1",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: codexPassthroughPayload(),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if legacyHits != 0 {
+		t.Fatalf("legacy base_url hits = %d, want 0", legacyHits)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		assertCodexPassthroughPayload(t, payload)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream HTTP payload")
+	}
+}
+
 func TestCodexExecuteStreamPreservesResponsesPayloadFieldsUpstream(t *testing.T) {
 	capturedPayload := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

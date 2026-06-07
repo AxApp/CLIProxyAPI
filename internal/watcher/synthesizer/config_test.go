@@ -574,12 +574,13 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 		CredentialSource: accountstore.SourceSidecarManagementAPI,
 		Priority:         5,
 		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
-			APIKey:      "sk-db-codex",
-			BaseURL:     "https://db.example.com/v1",
-			Prefix:      "db/",
-			Websockets:  true,
-			HeadersJSON: `{"X-DB":"1"}`,
-			ModelsJSON:  `[{"name":"gpt-5","alias":"gpt-5"}]`,
+			APIKey:             "sk-db-codex",
+			BaseURL:            "https://db.example.com/v1",
+			Prefix:             "db/",
+			Websockets:         true,
+			FormatBaseURLsJSON: `{"openai_responses":"https://db.example.com/responses","openai_chat":"https://db.example.com/chat"}`,
+			HeadersJSON:        `{"X-DB":"1"}`,
+			ModelsJSON:         `[{"name":"gpt-5","alias":"gpt-5"}]`,
 		},
 	})
 	if err != nil {
@@ -597,6 +598,7 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 			Prefix:             "ds/",
 			APIKeyEntriesJSON:  `[{"api-key":"sk-db-ds","proxy-url":"http://proxy.local:9000"}]`,
 			HeadersJSON:        `{"X-Provider":"DeepSeek"}`,
+			FormatBaseURLsJSON: `{"openai_chat":"https://deepseek.example.com/v1","anthropic":"https://deepseek.example.com/anthropic"}`,
 			ModelsJSON:         `[{"name":"deepseek-chat","alias":"deepseek-chat"}]`,
 		},
 	})
@@ -636,6 +638,12 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	if auths[0].Attributes["api_key"] != "sk-db-codex" || auths[0].Attributes["base_url"] != "https://db.example.com/v1" {
 		t.Fatalf("codex auth not synthesized from db: %+v", auths[0].Attributes)
 	}
+	if got := auths[0].Attributes["format_base_url:openai_responses"]; got != "https://db.example.com/responses" {
+		t.Fatalf("codex openai_responses base URL = %q", got)
+	}
+	if got := auths[0].Attributes["format_base_url:openai_chat"]; got != "https://db.example.com/chat" {
+		t.Fatalf("codex openai_chat base URL = %q", got)
+	}
 	if auths[0].Attributes["header:X-DB"] != "1" {
 		t.Fatalf("codex headers not synthesized from db: %+v", auths[0].Attributes)
 	}
@@ -644,6 +652,12 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	}
 	if auths[1].Provider != "deepseek" || auths[1].Attributes["api_key"] != "sk-db-ds" {
 		t.Fatalf("compat auth not synthesized from db: provider=%s attrs=%+v", auths[1].Provider, auths[1].Attributes)
+	}
+	if got := auths[1].Attributes["format_base_url:openai_chat"]; got != "https://deepseek.example.com/v1" {
+		t.Fatalf("compat openai_chat base URL = %q", got)
+	}
+	if got := auths[1].Attributes["format_base_url:anthropic"]; got != "https://deepseek.example.com/anthropic" {
+		t.Fatalf("compat anthropic base URL = %q", got)
 	}
 	if auths[1].Attributes["openai_compat_models"] != `[{"name":"deepseek-chat","alias":"deepseek-chat"}]` {
 		t.Fatalf("compat models not synthesized from db: %+v", auths[1].Attributes)

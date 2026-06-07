@@ -735,7 +735,7 @@ func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (base
 		return "", ""
 	}
 	if auth.Attributes != nil {
-		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		baseURL = authFormatBaseURL(auth, "openai_chat")
 		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 	}
 	return

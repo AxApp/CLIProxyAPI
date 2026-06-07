@@ -304,6 +304,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreCodexKey(ctx *SynthesisContext
 	if base != "" {
 		attrs["base_url"] = base
 	}
+	addFormatBaseURLsToAttrs(account.CodexAPIKey.FormatBaseURLsJSON, attrs)
 	if account.CodexAPIKey.Websockets {
 		attrs["websockets"] = "true"
 	}
@@ -346,6 +347,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 	base := strings.TrimSpace(compat.BaseURL)
 	prefix := strings.TrimSpace(compat.Prefix)
 	headers := decodeStringMap(compat.HeadersJSON)
+	formatBaseURLs := decodeStringMap(compat.FormatBaseURLsJSON)
 	models := decodeOpenAICompatModels(compat.ModelsJSON)
 	modelsAttr := openAICompatModelsJSONAttr(compat.ModelsJSON, compat.ProviderName, base, models)
 	entries := decodeOpenAICompatAPIKeys(compat.APIKeyEntriesJSON)
@@ -381,6 +383,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreOpenAICompat(ctx *SynthesisCon
 		for header, value := range headers {
 			attrs["header:"+header] = value
 		}
+		addFormatBaseURLsToAttrs(formatBaseURLs, attrs)
 		auth := &coreauth.Auth{
 			ID:         id,
 			AccountKey: account.AccountKey,
@@ -758,6 +761,29 @@ func decodeStringMap(raw string) map[string]string {
 	var values map[string]string
 	_ = json.Unmarshal([]byte(strings.TrimSpace(raw)), &values)
 	return values
+}
+
+func addFormatBaseURLsToAttrs(values any, attrs map[string]string) {
+	if attrs == nil {
+		return
+	}
+	var items map[string]string
+	switch typed := values.(type) {
+	case string:
+		items = decodeStringMap(typed)
+	case map[string]string:
+		items = typed
+	default:
+		return
+	}
+	for format, baseURL := range items {
+		trimmedFormat := strings.TrimSpace(format)
+		trimmedBaseURL := strings.TrimSpace(baseURL)
+		if trimmedFormat == "" || trimmedBaseURL == "" {
+			continue
+		}
+		attrs["format_base_url:"+trimmedFormat] = trimmedBaseURL
+	}
 }
 
 func decodeStringSlice(raw string) []string {

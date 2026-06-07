@@ -1036,7 +1036,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	}
 	if a.Attributes != nil {
 		apiKey = a.Attributes["api_key"]
-		baseURL = a.Attributes["base_url"]
+		baseURL = authFormatBaseURL(a, "anthropic")
 	}
 	if apiKey == "" && a.Metadata != nil {
 		if v, ok := a.Metadata["access_token"].(string); ok {
