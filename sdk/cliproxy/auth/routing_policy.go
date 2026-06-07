@@ -32,16 +32,7 @@ func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, en
 	if len(policies) == 0 {
 		return entries, false
 	}
-	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
-		Provider:     req.Provider,
-		Providers:    append([]string(nil), req.Providers...),
-		Model:        req.Model,
-		Options:      req.Options,
-		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
-		Candidates:   routeCandidatesFromScheduled(entries),
-		Tried:        req.Tried,
-		Now:          req.Now,
-	})
+	result := gettokensrouting.NewEngine(policies...).Route(ctx, routeContextFromRouteRequest(req, routeCandidatesFromScheduled(entries)))
 	if !routeResultActive(result) {
 		return entries, false
 	}
@@ -135,16 +126,7 @@ func rewriteAuthCandidates(ctx context.Context, req routeRequest, auths []*Auth)
 	if len(policies) == 0 {
 		return auths, false
 	}
-	result := gettokensrouting.NewEngine(policies...).Route(ctx, gettokensrouting.RouteContext{
-		Provider:     req.Provider,
-		Providers:    append([]string(nil), req.Providers...),
-		Model:        req.Model,
-		Options:      req.Options,
-		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
-		Candidates:   routeCandidatesFromAuths(auths),
-		Tried:        req.Tried,
-		Now:          req.Now,
-	})
+	result := gettokensrouting.NewEngine(policies...).Route(ctx, routeContextFromRouteRequest(req, routeCandidatesFromAuths(auths)))
 	if !routeResultActive(result) {
 		return auths, false
 	}
@@ -227,22 +209,33 @@ func admitAuthCandidate(ctx context.Context, req routeRequest, auth *Auth) getto
 	if auth == nil || strings.TrimSpace(auth.ID) == "" {
 		return gettokensrouting.AdmissionDecision{}
 	}
-	return gettokensrouting.AdmitCandidate(ctx, gettokensrouting.RouteContext{
+	candidate := gettokensrouting.RouteCandidate{
+		ID:    strings.TrimSpace(auth.ID),
+		Value: auth.Clone(),
+	}
+	return gettokensrouting.AdmitCandidate(ctx, routeContextFromRouteRequest(req, []gettokensrouting.RouteCandidate{candidate}), candidate)
+}
+
+func routeContextFromRouteRequest(req routeRequest, candidates []gettokensrouting.RouteCandidate) gettokensrouting.RouteContext {
+	codexRequest := gettokenscodex.RequestContextFromMetadata(req.Options.Metadata)
+	routeCtx := gettokensrouting.RouteContext{
 		Provider:     req.Provider,
 		Providers:    append([]string(nil), req.Providers...),
 		Model:        req.Model,
 		Options:      req.Options,
-		CodexRequest: gettokenscodex.RequestContextFromMetadata(req.Options.Metadata),
-		Candidates: []gettokensrouting.RouteCandidate{{
-			ID:    strings.TrimSpace(auth.ID),
-			Value: auth.Clone(),
-		}},
-		Tried: req.Tried,
-		Now:   req.Now,
-	}, gettokensrouting.RouteCandidate{
-		ID:    strings.TrimSpace(auth.ID),
-		Value: auth.Clone(),
-	})
+		CodexRequest: codexRequest,
+		Candidates:   candidates,
+		Tried:        req.Tried,
+		Now:          req.Now,
+	}
+	if codexRequest != nil {
+		routeCtx.ProjectKey = strings.TrimSpace(codexRequest.ProjectKey)
+		routeCtx.ProjectName = strings.TrimSpace(codexRequest.ProjectName)
+		routeCtx.ProjectKeySource = strings.TrimSpace(codexRequest.ProjectKeySource)
+		routeCtx.ProjectKeyConfidence = strings.TrimSpace(codexRequest.ProjectKeyConfidence)
+		routeCtx.ProjectMatchKeys = append([]string(nil), codexRequest.ProjectMatchKeys...)
+	}
+	return routeCtx
 }
 
 func markAdmissionDenied(tried map[string]struct{}, auth *Auth) map[string]struct{} {

@@ -1785,6 +1785,7 @@ func ConfigureGetTokensManagementRoutes(group *gin.RouterGroup, handler *handler
 	ConfigureUsageAttributionRoutes(group, handler, cfg)
 	ConfigureQuotaRuntimeRoutes(group, handler, cfg)
 	ConfigureRateLimitRoutes(group, handler, cfg)
+	ConfigureProjectCandidatePoolRoutes(group, handler, cfg)
 	ConfigureLiveSessionRoutes(group, handler, cfg)
 }
 

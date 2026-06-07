@@ -20,8 +20,13 @@ func registerTestRoutingPolicy(policy gettokensrouting.Policy) func() {
 
 func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.T) {
 	codexCtx := gettokenscodex.RequestContext{
-		RequestKind:    gettokenscodex.RequestKindMain,
-		RequestedModel: "gpt-5.1",
+		RequestKind:          gettokenscodex.RequestKindMain,
+		RequestedModel:       "gpt-5.1",
+		ProjectKey:           "workspace:abc",
+		ProjectName:          "GetTokens",
+		ProjectKeySource:     "codex-turn-workspace",
+		ProjectKeyConfidence: "strong",
+		ProjectMatchKeys:     []string{"workspace:abc"},
 	}
 	entries := []*scheduledAuth{{auth: &Auth{ID: "auth-a"}}}
 	policy := gettokensrouting.Policy{
@@ -33,6 +38,15 @@ func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.
 			}
 			if req.CodexRequest.RequestedModel != "gpt-5.1" {
 				t.Fatalf("RouteContext.CodexRequest.RequestedModel = %q, want gpt-5.1", req.CodexRequest.RequestedModel)
+			}
+			if req.ProjectKey != "workspace:abc" || req.ProjectName != "GetTokens" {
+				t.Fatalf("RouteContext project identity = (%q, %q), want workspace:abc/GetTokens", req.ProjectKey, req.ProjectName)
+			}
+			if req.ProjectKeySource != "codex-turn-workspace" || req.ProjectKeyConfidence != "strong" {
+				t.Fatalf("RouteContext project source = (%q, %q), want codex-turn-workspace/strong", req.ProjectKeySource, req.ProjectKeyConfidence)
+			}
+			if len(req.ProjectMatchKeys) != 1 || req.ProjectMatchKeys[0] != "workspace:abc" {
+				t.Fatalf("RouteContext.ProjectMatchKeys = %#v, want workspace:abc", req.ProjectMatchKeys)
 			}
 			return gettokensrouting.PolicyDecision{OrderIDs: []string{"auth-a"}, Reason: "codex context observed"}
 		},

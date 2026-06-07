@@ -1,7 +1,11 @@
 package gettokenscodex
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -61,6 +65,59 @@ func TestExtractRequestContextUsesModelAndIgnoresSubagentForRoutingContext(t *te
 	if got.MetadataParseError != "" {
 		t.Fatalf("MetadataParseError = %q, want empty", got.MetadataParseError)
 	}
+}
+
+func TestExtractRequestContextDerivesProjectIdentityFromSingleWorkspace(t *testing.T) {
+	workspacePath := "/Users/linhey/Desktop/linhay-open-sources/GetTokens"
+	headers := http.Header{}
+	headers.Set("X-Codex-Turn-Metadata", `{"session_id":"session-1","thread_id":"thread-1","workspaces":{"`+workspacePath+`":{"has_changes":false}}}`)
+
+	got := ExtractRequestContext(headers, nil, "fallback-model")
+
+	if got.ProjectName != "GetTokens" {
+		t.Fatalf("ProjectName = %q, want GetTokens", got.ProjectName)
+	}
+	wantKey := "workspace:" + sha256HexForTest(filepath.Clean(workspacePath))
+	if got.ProjectKey != wantKey {
+		t.Fatalf("ProjectKey = %q, want %q", got.ProjectKey, wantKey)
+	}
+	if strings.Contains(got.ProjectKey, workspacePath) {
+		t.Fatalf("ProjectKey leaks raw workspace path: %q", got.ProjectKey)
+	}
+	if got.ProjectKeySource != "codex-turn-workspace" {
+		t.Fatalf("ProjectKeySource = %q, want codex-turn-workspace", got.ProjectKeySource)
+	}
+	if got.ProjectKeyConfidence != "strong" {
+		t.Fatalf("ProjectKeyConfidence = %q, want strong", got.ProjectKeyConfidence)
+	}
+	if len(got.ProjectMatchKeys) != 1 || got.ProjectMatchKeys[0] != wantKey {
+		t.Fatalf("ProjectMatchKeys = %#v, want [%q]", got.ProjectMatchKeys, wantKey)
+	}
+}
+
+func TestExtractRequestContextDoesNotCreateProjectKeyForAmbiguousWorkspaces(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("X-Codex-Turn-Metadata", `{"session_id":"session-1","thread_id":"thread-1","workspaces":{"/repo/a":{"has_changes":false},"/repo/b":{"has_changes":true}}}`)
+
+	got := ExtractRequestContext(headers, nil, "fallback-model")
+
+	if got.ProjectKey != "" {
+		t.Fatalf("ProjectKey = %q, want empty for ambiguous workspaces", got.ProjectKey)
+	}
+	if len(got.ProjectMatchKeys) != 0 {
+		t.Fatalf("ProjectMatchKeys = %#v, want empty for ambiguous workspaces", got.ProjectMatchKeys)
+	}
+	if got.ProjectKeySource != "codex-turn-workspace" {
+		t.Fatalf("ProjectKeySource = %q, want codex-turn-workspace", got.ProjectKeySource)
+	}
+	if got.ProjectKeyConfidence != "ambiguous" {
+		t.Fatalf("ProjectKeyConfidence = %q, want ambiguous", got.ProjectKeyConfidence)
+	}
+}
+
+func sha256HexForTest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func TestExtractRequestContextMainRequestAndMalformedMetadata(t *testing.T) {

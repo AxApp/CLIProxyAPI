@@ -16,8 +16,10 @@ func InstallRoutingPolicies() {
 
 func InstallRoutingPoliciesWithConfigPath(configPath string) {
 	SetChannelRoutingPolicyConfigPathFromConfig(configPath)
+	SetProjectCandidatePoolPolicyConfigPathFromConfig(configPath)
 	installRoutingPoliciesOnce.Do(func() {
 		gettokensrouting.RegisterPolicy(channelRoutingPolicy())
+		gettokensrouting.RegisterPolicy(projectCandidatePoolPolicy())
 		gettokensrouting.RegisterPolicy(accountRouteGuardRoutingPolicy(nil))
 	})
 }

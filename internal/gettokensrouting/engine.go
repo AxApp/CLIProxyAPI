@@ -21,14 +21,19 @@ const (
 )
 
 type RouteContext struct {
-	Provider     string
-	Providers    []string
-	Model        string
-	Options      cliproxyexecutor.Options
-	CodexRequest *gettokenscodex.RequestContext
-	Candidates   []RouteCandidate
-	Tried        map[string]struct{}
-	Now          time.Time
+	Provider             string
+	Providers            []string
+	Model                string
+	Options              cliproxyexecutor.Options
+	CodexRequest         *gettokenscodex.RequestContext
+	ProjectKey           string
+	ProjectName          string
+	ProjectKeySource     string
+	ProjectKeyConfidence string
+	ProjectMatchKeys     []string
+	Candidates           []RouteCandidate
+	Tried                map[string]struct{}
+	Now                  time.Time
 }
 
 type RouteCandidate struct {

@@ -2,8 +2,12 @@ package gettokenscodex
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -35,20 +39,25 @@ const (
 )
 
 type RequestContext struct {
-	RequestKind         RequestKind
-	RequestedModel      string
-	SessionID           string
-	ClientRequestID     string
-	ThreadID            string
-	ThreadSource        string
-	TurnID              string
-	Sandbox             string
-	TurnStartedAtUnixMs int64
-	CodexWindowID       string
-	ParentThreadID      string
-	InstallationID      string
-	PromptCacheKey      string
-	MetadataParseError  string
+	RequestKind          RequestKind
+	RequestedModel       string
+	SessionID            string
+	ClientRequestID      string
+	ThreadID             string
+	ThreadSource         string
+	TurnID               string
+	Sandbox              string
+	TurnStartedAtUnixMs  int64
+	CodexWindowID        string
+	ParentThreadID       string
+	InstallationID       string
+	PromptCacheKey       string
+	ProjectKey           string
+	ProjectName          string
+	ProjectKeySource     string
+	ProjectKeyConfidence string
+	ProjectMatchKeys     []string
+	MetadataParseError   string
 }
 
 type HeaderSet map[string]struct{}
@@ -126,12 +135,14 @@ func RequestContextFromMetadata(metadata map[string]any) *RequestContext {
 	switch value := raw.(type) {
 	case RequestContext:
 		copy := value
+		copy.ProjectMatchKeys = append([]string(nil), value.ProjectMatchKeys...)
 		return &copy
 	case *RequestContext:
 		if value == nil {
 			return nil
 		}
 		copy := *value
+		copy.ProjectMatchKeys = append([]string(nil), value.ProjectMatchKeys...)
 		return &copy
 	default:
 		return nil
@@ -139,12 +150,13 @@ func RequestContextFromMetadata(metadata map[string]any) *RequestContext {
 }
 
 type turnMetadata struct {
-	SessionID           string          `json:"session_id"`
-	ThreadID            string          `json:"thread_id"`
-	ThreadSource        string          `json:"thread_source"`
-	TurnID              string          `json:"turn_id"`
-	Sandbox             string          `json:"sandbox"`
-	TurnStartedAtUnixMs json.RawMessage `json:"turn_started_at_unix_ms"`
+	SessionID           string                     `json:"session_id"`
+	ThreadID            string                     `json:"thread_id"`
+	ThreadSource        string                     `json:"thread_source"`
+	TurnID              string                     `json:"turn_id"`
+	Sandbox             string                     `json:"sandbox"`
+	TurnStartedAtUnixMs json.RawMessage            `json:"turn_started_at_unix_ms"`
+	Workspaces          map[string]json.RawMessage `json:"workspaces"`
 }
 
 func parseTurnMetadata(raw string, ctx *RequestContext) {
@@ -176,6 +188,41 @@ func parseTurnMetadata(raw string, ctx *RequestContext) {
 			}
 		}
 	}
+	applyProjectIdentityFromWorkspaces(metadata.Workspaces, ctx)
+}
+
+func applyProjectIdentityFromWorkspaces(workspaces map[string]json.RawMessage, ctx *RequestContext) {
+	if ctx == nil || len(workspaces) == 0 {
+		return
+	}
+	workspacePaths := make([]string, 0, len(workspaces))
+	for workspacePath := range workspaces {
+		cleaned := filepath.Clean(strings.TrimSpace(workspacePath))
+		if cleaned == "" || cleaned == "." {
+			continue
+		}
+		workspacePaths = append(workspacePaths, cleaned)
+	}
+	if len(workspacePaths) == 0 {
+		return
+	}
+	sort.Strings(workspacePaths)
+	ctx.ProjectKeySource = "codex-turn-workspace"
+	if len(workspacePaths) != 1 {
+		ctx.ProjectKeyConfidence = "ambiguous"
+		return
+	}
+	workspacePath := workspacePaths[0]
+	projectKey := "workspace:" + sha256Hex(workspacePath)
+	ctx.ProjectName = filepath.Base(workspacePath)
+	ctx.ProjectKey = projectKey
+	ctx.ProjectKeyConfidence = "strong"
+	ctx.ProjectMatchKeys = []string{projectKey}
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func headerValue(headers http.Header, key string) string {
