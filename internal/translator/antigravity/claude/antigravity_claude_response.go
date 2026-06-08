@@ -164,9 +164,44 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			// Extract the different types of content from each part
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
+			thoughtSignatureResult := partResult.Get("thoughtSignature")
+			if !thoughtSignatureResult.Exists() {
+				thoughtSignatureResult = partResult.Get("thought_signature")
+			}
 
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
+				if thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != "" && !functionCallResult.Exists() {
+					// Accept signature carrier chunks even when upstream omits thought=true.
+					if partText := partTextResult.String(); partText != "" {
+						if params.ResponseType != 2 {
+							if params.ResponseType != 0 {
+								appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
+								params.ResponseIndex++
+							}
+							appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex))
+							params.ResponseType = 2
+							params.CurrentThinkingText.Reset()
+						}
+						params.CurrentThinkingText.WriteString(partText)
+						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex)), "delta.thinking", partText)
+						appendEvent("content_block_delta", string(data))
+					}
+
+					if params.CurrentThinkingText.Len() > 0 {
+						cache.CacheSignature(modelName, params.CurrentThinkingText.String(), thoughtSignatureResult.String())
+						params.CurrentThinkingText.Reset()
+					}
+
+					if params.ResponseType == 2 {
+						sigValue := formatClaudeSignatureValue(modelName, thoughtSignatureResult.String())
+						data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex)), "delta.signature", sigValue)
+						appendEvent("content_block_delta", string(data))
+						params.HasContent = true
+					}
+					continue
+				}
+
 				// Process thinking content (internal reasoning)
 				if partResult.Get("thought").Bool() {
 					if thoughtSignature := partResult.Get("thoughtSignature"); thoughtSignature.Exists() && thoughtSignature.String() != "" {
@@ -475,18 +510,17 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	if parts.IsArray() {
 		for _, part := range parts.Array() {
 			isThought := part.Get("thought").Bool()
-			if isThought {
-				sig := part.Get("thoughtSignature")
-				if !sig.Exists() {
-					sig = part.Get("thought_signature")
-				}
-				if sig.Exists() && sig.String() != "" {
-					thinkingSignature = sig.String()
-				}
+			sig := part.Get("thoughtSignature")
+			if !sig.Exists() {
+				sig = part.Get("thought_signature")
+			}
+			hasSignature := sig.Exists() && sig.String() != "" && !part.Get("functionCall").Exists()
+			if hasSignature {
+				thinkingSignature = sig.String()
 			}
 
 			if text := part.Get("text"); text.Exists() && text.String() != "" {
-				if isThought {
+				if isThought || hasSignature {
 					flushText()
 					thinkingBuilder.WriteString(text.String())
 					continue

@@ -21,14 +21,15 @@ import (
 
 // Params holds parameters for response conversion.
 type Params struct {
-	IsGlAPIKey       bool
-	HasFirstResponse bool
-	ResponseType     int
-	ResponseIndex    int
-	HasContent       bool // Tracks whether any content (text, thinking, or tool use) has been output
-	ToolNameMap      map[string]string
-	SanitizedNameMap map[string]string
-	SawToolCall      bool
+	IsGlAPIKey         bool
+	HasFirstResponse   bool
+	ResponseType       int
+	ResponseIndex      int
+	HasContent         bool // Tracks whether any content (text, thinking, or tool use) has been output
+	ToolNameMap        map[string]string
+	SanitizedNameMap   map[string]string
+	SawToolCall        bool
+	HasSentFinalEvents bool
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -106,6 +107,32 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 			// Extract the different types of content from each part
 			partTextResult := partResult.Get("text")
 			functionCallResult := partResult.Get("functionCall")
+			thoughtSignatureResult := partResult.Get("thoughtSignature")
+			if !thoughtSignatureResult.Exists() {
+				thoughtSignatureResult = partResult.Get("thought_signature")
+			}
+
+			if thoughtSignatureResult.Exists() && thoughtSignatureResult.String() != "" && !functionCallResult.Exists() {
+				if partTextResult.Exists() && partTextResult.String() != "" {
+					if (*param).(*Params).ResponseType != 2 {
+						if (*param).(*Params).ResponseType != 0 {
+							appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+							(*param).(*Params).ResponseIndex++
+						}
+						appendEvent("content_block_start", fmt.Sprintf(`{"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, (*param).(*Params).ResponseIndex))
+						(*param).(*Params).ResponseType = 2
+					}
+					data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex)), "delta.thinking", partTextResult.String())
+					appendEvent("content_block_delta", string(data))
+					(*param).(*Params).HasContent = true
+				}
+				if (*param).(*Params).ResponseType == 2 {
+					data, _ := sjson.SetBytes([]byte(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, (*param).(*Params).ResponseIndex)), "delta.signature", thoughtSignatureResult.String())
+					appendEvent("content_block_delta", string(data))
+					(*param).(*Params).HasContent = true
+				}
+				continue
+			}
 
 			// Handle text content (both regular content and thinking)
 			if partTextResult.Exists() {
@@ -224,23 +251,28 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	usageResult := gjson.GetBytes(rawJSON, "usageMetadata")
 	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) {
-		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
-			// Only send final events if we have actually output content
-			if (*param).(*Params).HasContent {
-				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
+		candidatesTokenCountResult := usageResult.Get("candidatesTokenCount")
+		thoughtsTokenCountResult := usageResult.Get("thoughtsTokenCount")
+		if candidatesTokenCountResult.Exists() || thoughtsTokenCountResult.Exists() {
+			params := (*param).(*Params)
+			if params.HasContent && !params.HasSentFinalEvents {
+				if params.ResponseType != 0 {
+					appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, params.ResponseIndex))
+					params.ResponseType = 0
+				}
 
 				template := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-				if (*param).(*Params).SawToolCall {
+				if params.SawToolCall {
 					template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 				} else if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() && finish.String() == "MAX_TOKENS" {
 					template = []byte(`{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 				}
 
-				thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
-				template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
+				template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCountResult.Int())
 				template, _ = sjson.SetBytes(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
 
 				appendEvent("message_delta", string(template))
+				params.HasSentFinalEvents = true
 			}
 		}
 	}

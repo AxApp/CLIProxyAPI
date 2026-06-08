@@ -347,3 +347,84 @@ func TestConvertAntigravityResponseToClaude_SignatureOnlyChunk(t *testing.T) {
 		t.Errorf("Signature-only chunk should still cache correctly, got %q", cachedSig)
 	}
 }
+
+func TestConvertAntigravityResponseToClaude_SignatureOnlyChunkWithoutThoughtFlag(t *testing.T) {
+	cache.ClearSignatureCache("")
+
+	requestJSON := []byte(`{
+		"model": "claude-sonnet-4-5-thinking",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "Test"}]}]
+	}`)
+
+	validSignature := "RtestSigNoThought123456789012345678901234567890123456789"
+	chunk1 := []byte(`{
+		"response": {
+			"candidates": [{
+				"content": {
+					"parts": [{"text": "Thinking without thought flag on signature.", "thought": true}]
+				}
+			}]
+		}
+	}`)
+	chunk2 := []byte(`{
+		"response": {
+			"candidates": [{
+				"content": {
+					"parts": [{"text": "", "thoughtSignature": "` + validSignature + `"}]
+				}
+			}]
+		}
+	}`)
+
+	var param any
+	ctx := context.Background()
+
+	ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-5-thinking", requestJSON, requestJSON, chunk1, &param)
+	output := string(bytes.Join(ConvertAntigravityResponseToClaude(ctx, "claude-sonnet-4-5-thinking", requestJSON, requestJSON, chunk2, &param), nil))
+
+	if !strings.Contains(output, "signature_delta") {
+		t.Fatalf("signature-only chunk without thought flag should emit signature_delta, got: %s", output)
+	}
+	cachedSig := cache.GetCachedSignature("claude-sonnet-4-5-thinking", "Thinking without thought flag on signature.")
+	if cachedSig != validSignature {
+		t.Errorf("signature-only chunk without thought flag should cache signature, got %q", cachedSig)
+	}
+}
+
+func TestConvertAntigravityResponseToClaudeNonStream_SignatureOnlyPartWithoutThoughtFlag(t *testing.T) {
+	cache.ClearSignatureCache("")
+
+	requestJSON := []byte(`{
+		"model": "claude-sonnet-4-5-thinking",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "Test"}]}]
+	}`)
+	validSignature := "RnonStreamSigNoThought123456789012345678901234567890123456"
+	responseJSON := []byte(`{
+		"response": {
+			"responseId": "resp_1",
+			"modelVersion": "claude-sonnet-4-5-thinking",
+			"candidates": [{
+				"finishReason": "STOP",
+				"content": {
+					"parts": [
+						{"text": "Non-stream thinking.", "thought": true},
+						{"text": "", "thoughtSignature": "` + validSignature + `"}
+					]
+				}
+			}],
+			"usageMetadata": {
+				"promptTokenCount": 3,
+				"candidatesTokenCount": 0,
+				"thoughtsTokenCount": 2
+			}
+		}
+	}`)
+
+	output := ConvertAntigravityResponseToClaudeNonStream(context.Background(), "claude-sonnet-4-5-thinking", requestJSON, requestJSON, responseJSON, nil)
+	if !bytes.Contains(output, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected thinking block, got: %s", string(output))
+	}
+	if !bytes.Contains(output, []byte(`"signature":"`)) {
+		t.Fatalf("expected signature on thinking block, got: %s", string(output))
+	}
+}
