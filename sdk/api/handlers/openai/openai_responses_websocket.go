@@ -906,19 +906,58 @@ func dedupeResponsesWebsocketInputRaw(rawArray string) (string, error) {
 		return "", errUnmarshal
 	}
 
-	lastIndexByID := make(map[string]int, len(items))
+	type itemMetadata struct {
+		itemType string
+		id       string
+		callID   string
+	}
+	meta := make([]itemMetadata, len(items))
 	for index, item := range items {
-		itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String())
+		if len(item) == 0 {
+			continue
+		}
+		values := gjson.GetManyBytes(item, "type", "id", "call_id")
+		meta[index] = itemMetadata{
+			itemType: strings.TrimSpace(values[0].String()),
+			id:       strings.TrimSpace(values[1].String()),
+			callID:   strings.TrimSpace(values[2].String()),
+		}
+	}
+
+	referencedCallIDs := make(map[string]struct{}, len(items))
+	for index := range items {
+		switch meta[index].itemType {
+		case "function_call_output", "custom_tool_call_output":
+			if meta[index].callID != "" {
+				referencedCallIDs[meta[index].callID] = struct{}{}
+			}
+		}
+	}
+
+	keepIndexByID := make(map[string]int, len(items))
+	keepReferencedByID := make(map[string]bool, len(items))
+	for index := range items {
+		itemID := meta[index].id
 		if itemID == "" {
 			continue
 		}
-		lastIndexByID[itemID] = index
+		_, referenced := referencedCallIDs[meta[index].callID]
+		referenced = referenced && meta[index].callID != ""
+		if _, seen := keepIndexByID[itemID]; !seen {
+			keepIndexByID[itemID] = index
+			keepReferencedByID[itemID] = referenced
+			continue
+		}
+		if referenced || !keepReferencedByID[itemID] {
+			keepIndexByID[itemID] = index
+			keepReferencedByID[itemID] = referenced
+		}
 	}
 
 	filtered := make([]json.RawMessage, 0, len(items))
 	for index, item := range items {
-		itemID := strings.TrimSpace(gjson.GetBytes(item, "id").String())
-		if itemID != "" && lastIndexByID[itemID] != index {
+		itemID := meta[index].id
+		if itemID != "" && keepIndexByID[itemID] != index {
 			continue
 		}
 		filtered = append(filtered, item)

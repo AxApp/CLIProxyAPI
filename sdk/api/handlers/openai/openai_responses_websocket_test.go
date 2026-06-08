@@ -2358,6 +2358,38 @@ func TestNormalizeSubsequentRequestDedupesInputItemsByIDKeepingLast(t *testing.T
 	}
 }
 
+func TestNormalizeSubsequentRequestKeepsReferencedToolCallWhenDedupingInputIDs(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[
+		{"type":"message","role":"user","id":"msg-1","content":"hello"},
+		{"type":"function_call","id":"fc-dup","call_id":"call-referenced","name":"tool","arguments":"{}"}
+	]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"function_call","id":"fc-dup","call_id":"call-stale","name":"tool","arguments":"{}"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[
+		{"type":"function_call_output","id":"out-1","call_id":"call-referenced","output":"done"}
+	]}`)
+
+	normalized, next, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("input len = %d, want 3: %s", len(input), normalized)
+	}
+	if got := input[1].Get("call_id").String(); got != "call-referenced" {
+		t.Fatalf("dedupe kept call_id = %q, want referenced call: %s", got, normalized)
+	}
+	if got := input[2].Get("call_id").String(); got != "call-referenced" {
+		t.Fatalf("output call_id = %q, want referenced call: %s", got, normalized)
+	}
+	if string(next) != string(normalized) {
+		t.Fatalf("last request snapshot must use deduped input: next=%s normalized=%s", next, normalized)
+	}
+}
+
 func TestRepairResponsesWebsocketToolCallsThenDedupesTopLevelInput(t *testing.T) {
 	outputCache := newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
 	callCache := newWebsocketToolOutputCache(0, websocketToolOutputCacheMaxPerSession)
