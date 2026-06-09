@@ -52,6 +52,89 @@ func TestOpenAccountStoreReusesInitializedStoreWhenExternalWriterHoldsLock(t *te
 	}
 }
 
+func TestPurgeSoftDeletedAccountsOnceHardDeletesExpiredRows(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("openAccountStore: %v", err)
+	}
+	expired, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Expired",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-expired",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount expired: %v", err)
+	}
+	recent, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Recent",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-recent",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount recent: %v", err)
+	}
+	if err := store.DeleteAccount(ctx, expired.AccountKey); err != nil {
+		t.Fatalf("DeleteAccount expired: %v", err)
+	}
+	if err := store.DeleteAccount(ctx, recent.AccountKey); err != nil {
+		t.Fatalf("DeleteAccount recent: %v", err)
+	}
+
+	now := time.UnixMilli(1_700_000_000_000)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	_, err = db.ExecContext(ctx, `
+UPDATE account_cards
+SET deleted_at_unix_ms = CASE account_key
+  WHEN ? THEN ?
+  WHEN ? THEN ?
+  ELSE deleted_at_unix_ms
+END
+WHERE account_key IN (?, ?)`,
+		expired.AccountKey, now.Add(-accountStoreSoftDeleteRetention-time.Millisecond).UnixMilli(),
+		recent.AccountKey, now.Add(-accountStoreSoftDeleteRetention+time.Millisecond).UnixMilli(),
+		expired.AccountKey, recent.AccountKey,
+	)
+	if err != nil {
+		t.Fatalf("backdate deleted rows: %v", err)
+	}
+
+	purged, err := h.purgeSoftDeletedAccountsOnce(ctx, now)
+	if err != nil {
+		t.Fatalf("purgeSoftDeletedAccountsOnce: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1", purged)
+	}
+	if got := countAccountStoreRows(t, db, "account_cards", expired.AccountKey); got != 0 {
+		t.Fatalf("expired account card rows = %d, want 0", got)
+	}
+	if got := countAccountStoreRows(t, db, "codex_api_key_accounts", expired.AccountKey); got != 0 {
+		t.Fatalf("expired credential rows = %d, want 0", got)
+	}
+	if got := countAccountStoreRows(t, db, "account_cards", recent.AccountKey); got != 1 {
+		t.Fatalf("recent account card rows = %d, want 1", got)
+	}
+}
+
 func TestListAccountsReopensCachedStoreAfterRecoverableReadFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
@@ -622,4 +705,18 @@ func TestAccountsBatchDeleteEndpointDeletesMultipleAccountsWithOneApply(t *testi
 	if len(list.Accounts) != 0 {
 		t.Fatalf("accounts after batch delete = %#v", list.Accounts)
 	}
+}
+
+func countAccountStoreRows(t *testing.T, db *sql.DB, table string, accountKey string) int {
+	t.Helper()
+	switch table {
+	case "account_cards", "codex_api_key_accounts":
+	default:
+		t.Fatalf("unsupported account store table %q", table)
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM "+table+" WHERE account_key = ?", accountKey).Scan(&count); err != nil {
+		t.Fatalf("count %s rows for %s: %v", table, accountKey, err)
+	}
+	return count
 }

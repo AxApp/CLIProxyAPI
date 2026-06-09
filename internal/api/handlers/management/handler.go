@@ -59,6 +59,7 @@ type Handler struct {
 	accountStoreLastReadError       string
 	accountStoreLastReadRecovered   bool
 	accountStoreLastReadRecoveredAt int64
+	accountStoreCleanupCancel       context.CancelFunc
 	quotaRefreshBatchJobs           *quotaRefreshBatchJobStore
 }
 
@@ -78,6 +79,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		quotaRefreshBatchJobs: newQuotaRefreshBatchJobStore(),
 	}
 	h.startAttemptCleanup()
+	h.startAccountStoreSoftDeleteCleanup()
 	return h
 }
 

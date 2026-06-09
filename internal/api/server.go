@@ -1372,6 +1372,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 	if s.mgmt != nil {
+		s.mgmt.StopBackgroundTasks()
 		s.mgmt.CancelQuotaRefreshBatchJobs("server shutdown", time.Now().UTC())
 	}
 

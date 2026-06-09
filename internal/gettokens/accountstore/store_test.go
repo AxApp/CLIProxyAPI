@@ -884,6 +884,105 @@ func TestDeleteAccountsSoftDeletesMultipleAccountsWithPartialErrors(t *testing.T
 	}
 }
 
+func TestPurgeSoftDeletedAccountsHardDeletesExpiredRowsWithCascade(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	active, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Active",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-active",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount active: %v", err)
+	}
+	expired, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Expired",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-expired",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount expired: %v", err)
+	}
+	recent, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Recent",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-recent",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount recent: %v", err)
+	}
+
+	if err := store.DeleteAccount(ctx, expired.AccountKey); err != nil {
+		t.Fatalf("DeleteAccount expired: %v", err)
+	}
+	if err := store.DeleteAccount(ctx, recent.AccountKey); err != nil {
+		t.Fatalf("DeleteAccount recent: %v", err)
+	}
+	const cutoff = int64(1_700_000_000_000)
+	_, err = store.db.ExecContext(ctx, `
+UPDATE account_cards
+SET deleted_at_unix_ms = CASE account_key
+  WHEN ? THEN ?
+  WHEN ? THEN ?
+  ELSE deleted_at_unix_ms
+END
+WHERE account_key IN (?, ?)`,
+		expired.AccountKey, cutoff-1,
+		recent.AccountKey, cutoff+1,
+		expired.AccountKey, recent.AccountKey,
+	)
+	if err != nil {
+		t.Fatalf("backdate deleted rows: %v", err)
+	}
+
+	purged, err := store.PurgeSoftDeletedAccounts(ctx, cutoff, 100)
+	if err != nil {
+		t.Fatalf("PurgeSoftDeletedAccounts: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1", purged)
+	}
+	if countAccountCardRows(t, store, active.AccountKey) != 1 {
+		t.Fatal("active account card was removed")
+	}
+	if countAccountCardRows(t, store, expired.AccountKey) != 0 {
+		t.Fatal("expired soft-deleted account card still exists")
+	}
+	if countAccountCardRows(t, store, recent.AccountKey) != 1 {
+		t.Fatal("recent soft-deleted account card was removed")
+	}
+	if countCodexAPIKeyRows(t, store, expired.AccountKey) != 0 {
+		t.Fatal("expired account credential did not cascade delete")
+	}
+	if countCodexAPIKeyRows(t, store, recent.AccountKey) != 1 {
+		t.Fatal("recent account credential should remain")
+	}
+}
+
 func TestUpdateAuthFileCredentialUpdatesAuthJSONWithoutChangingRevision(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
@@ -1114,4 +1213,22 @@ func TestOpenAICompatibleModelFetchFieldsRoundTrip(t *testing.T) {
 	if loaded.OpenAICompatible.ModelFetchBaseURL != "https://api.xiaomimimo.com/v1" {
 		t.Fatalf("ModelFetchBaseURL = %q, want https://api.xiaomimimo.com/v1", loaded.OpenAICompatible.ModelFetchBaseURL)
 	}
+}
+
+func countAccountCardRows(t *testing.T, store *Store, accountKey string) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow("SELECT count(*) FROM account_cards WHERE account_key = ?", accountKey).Scan(&count); err != nil {
+		t.Fatalf("count account_cards for %s: %v", accountKey, err)
+	}
+	return count
+}
+
+func countCodexAPIKeyRows(t *testing.T, store *Store, accountKey string) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow("SELECT count(*) FROM codex_api_key_accounts WHERE account_key = ?", accountKey).Scan(&count); err != nil {
+		t.Fatalf("count codex_api_key_accounts for %s: %v", accountKey, err)
+	}
+	return count
 }
