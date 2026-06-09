@@ -59,6 +59,7 @@ type Handler struct {
 	accountStoreLastReadError       string
 	accountStoreLastReadRecovered   bool
 	accountStoreLastReadRecoveredAt int64
+	quotaRefreshBatchJobs           *quotaRefreshBatchJobStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -67,13 +68,14 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
+		cfg:                   cfg,
+		configFilePath:        configFilePath,
+		failedAttempts:        make(map[string]*attemptInfo),
+		authManager:           manager,
+		tokenStore:            sdkAuth.GetTokenStore(),
+		allowRemoteOverride:   envSecret != "",
+		envSecret:             envSecret,
+		quotaRefreshBatchJobs: newQuotaRefreshBatchJobStore(),
 	}
 	h.startAttemptCleanup()
 	return h

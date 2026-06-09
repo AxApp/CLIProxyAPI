@@ -125,6 +125,35 @@ func (s *QuotaRuntimeStore) StateForAccount(accountKey string) (QuotaRuntimeStat
 	return s.withGuardState(cloneQuotaRuntimeState(state)), true
 }
 
+func (s *QuotaRuntimeStore) StatesForAccounts(accountKeys []string) []QuotaRuntimeState {
+	if s == nil {
+		return nil
+	}
+	states := make([]QuotaRuntimeState, 0, len(accountKeys))
+	s.mu.RLock()
+	for _, accountKey := range accountKeys {
+		accountKey = strings.TrimSpace(accountKey)
+		if accountKey == "" {
+			continue
+		}
+		if state, ok := s.states[accountKey]; ok {
+			states = append(states, cloneQuotaRuntimeState(state))
+			continue
+		}
+		states = append(states, QuotaRuntimeState{
+			AccountKey: accountKey,
+			Status:     QuotaRuntimeStatusStale,
+			Windows:    []QuotaRuntimeWindow{},
+			Sources:    []QuotaRuntimeSourceState{},
+		})
+	}
+	s.mu.RUnlock()
+	for index := range states {
+		states[index] = s.withGuardState(states[index])
+	}
+	return states
+}
+
 func (s *QuotaRuntimeStore) States() []QuotaRuntimeState {
 	if s == nil {
 		return nil
@@ -333,7 +362,13 @@ func configureQuotaRuntimeRoutes(group *gin.RouterGroup, store *QuotaRuntimeStor
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota runtime store is not initialized"})
 			return
 		}
-		if accountKey := strings.TrimSpace(c.Query("account_key")); accountKey != "" {
+		accountKeys := quotaRuntimeRequestedAccountKeys(c)
+		if len(accountKeys) > 1 || strings.TrimSpace(c.Query("account_keys")) != "" {
+			c.JSON(http.StatusOK, gin.H{"items": store.StatesForAccounts(accountKeys)})
+			return
+		}
+		if len(accountKeys) == 1 {
+			accountKey := accountKeys[0]
 			if state, exists := store.StateForAccount(accountKey); exists {
 				c.JSON(http.StatusOK, state)
 				return
@@ -361,4 +396,22 @@ func configureQuotaRuntimeRoutes(group *gin.RouterGroup, store *QuotaRuntimeStor
 		}
 		c.JSON(http.StatusOK, next)
 	})
+}
+
+func quotaRuntimeRequestedAccountKeys(c *gin.Context) []string {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	query := c.Request.URL.Query()
+	values := append([]string{}, query["account_key"]...)
+	values = append(values, query["account_keys"]...)
+	keys := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, key := range strings.Split(value, ",") {
+			if trimmed := strings.TrimSpace(key); trimmed != "" {
+				keys = append(keys, trimmed)
+			}
+		}
+	}
+	return keys
 }

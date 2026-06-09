@@ -675,6 +675,96 @@ func TestGetAccountUsesSingleAccountQueryInsteadOfFullList(t *testing.T) {
 	}
 }
 
+func TestGetAccountsUsesKeyScopedQueryWithMissingDuplicatesAndBrokenSibling(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	codexAccount, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Codex",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-codex",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount codex: %v", err)
+	}
+	authAccount, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindAuthFile,
+		Title:            "Auth",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		AuthFile: &AuthFileCredential{
+			SourceFileName: "codex.json",
+			AuthJSON:       `{"type":"codex","access_token":"token"}`,
+			AuthType:       "codex",
+			Email:          "user@example.com",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount auth: %v", err)
+	}
+	openAIAccount, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindOpenAICompatible,
+		Title:            "DeepSeek",
+		Provider:         "deepseek",
+		CredentialSource: SourceSidecarManagementAPI,
+		OpenAICompatible: &OpenAICompatibleCredential{
+			ProviderName:      "deepseek",
+			BaseURL:           "https://api.deepseek.com/v1",
+			APIKeyEntriesJSON: `[{"api-key":"sk-deepseek"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount openai-compatible: %v", err)
+	}
+	brokenSibling, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Broken sibling",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-broken",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount broken sibling: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "DELETE FROM codex_api_key_accounts WHERE account_key = ?", brokenSibling.AccountKey); err != nil {
+		t.Fatalf("delete sibling credential: %v", err)
+	}
+
+	missingKey := "acct_00000000-0000-4000-8000-000000000999"
+	accounts, err := store.GetAccounts(ctx, []string{openAIAccount.AccountKey, missingKey, codexAccount.AccountKey, codexAccount.AccountKey, authAccount.AccountKey})
+	if err != nil {
+		t.Fatalf("GetAccounts should not scan broken sibling: %v", err)
+	}
+	if len(accounts) != 3 {
+		t.Fatalf("GetAccounts returned %d accounts: %#v", len(accounts), accounts)
+	}
+	if accounts[0].AccountKey != openAIAccount.AccountKey || accounts[0].OpenAICompatible == nil {
+		t.Fatalf("first account = %+v, want openai-compatible target", accounts[0])
+	}
+	if accounts[1].AccountKey != codexAccount.AccountKey || accounts[1].CodexAPIKey == nil || accounts[1].CodexAPIKey.APIKey != "sk-codex" {
+		t.Fatalf("second account = %+v, want codex target", accounts[1])
+	}
+	if accounts[2].AccountKey != authAccount.AccountKey || accounts[2].AuthFile == nil || accounts[2].AuthFile.SourceFileName != "codex.json" {
+		t.Fatalf("third account = %+v, want auth target", accounts[2])
+	}
+}
+
 func TestSetAccountStatusOnlyUpdatesDisabledWithoutRuntimeApply(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
@@ -733,6 +823,64 @@ func TestSetAccountStatusOnlyUpdatesDisabledWithoutRuntimeApply(t *testing.T) {
 	}
 	if enabled.RuntimeApplyStatus != "applied" {
 		t.Fatalf("enable runtime apply status = %q, want applied", enabled.RuntimeApplyStatus)
+	}
+}
+
+func TestDeleteAccountsSoftDeletesMultipleAccountsWithPartialErrors(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	first, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "First",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-first",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount first: %v", err)
+	}
+	second, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Second",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-second",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount second: %v", err)
+	}
+
+	deleted, failures, err := store.DeleteAccounts(ctx, []string{first.AccountKey, "not-an-account-key", second.AccountKey, first.AccountKey})
+	if err != nil {
+		t.Fatalf("DeleteAccounts: %v", err)
+	}
+	if strings.Join(deleted, ",") != first.AccountKey+","+second.AccountKey {
+		t.Fatalf("deleted = %#v, want first and second once", deleted)
+	}
+	if len(failures) != 2 {
+		t.Fatalf("failures = %#v, want invalid key and duplicate not found", failures)
+	}
+	accounts, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts after delete: %v", err)
+	}
+	if len(accounts) != 0 {
+		t.Fatalf("accounts after delete = %#v, want empty active list", accounts)
 	}
 }
 

@@ -2,6 +2,7 @@ package gettokenshooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -204,4 +205,172 @@ func TestQuotaRuntimeRoutesPutAndGetStatus(t *testing.T) {
 	if getState.AccountKey != putState.AccountKey || !getState.Blocked {
 		t.Fatalf("GET state = %#v, want stored blocked quota state", getState)
 	}
+}
+
+func TestQuotaRuntimeRoutesGetStatusesByKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	now := time.Now().UTC()
+	keys := []string{
+		"acct_00000000-0000-4000-8000-000000000201",
+		"acct_00000000-0000-4000-8000-000000000202",
+	}
+	for index, key := range keys {
+		if _, err := store.Upsert(QuotaRuntimeState{
+			AccountKey: key,
+			Status:     QuotaRuntimeStatusSuccess,
+			PlanType:   fmt.Sprintf("plan-%d", index),
+			Windows:    []QuotaRuntimeWindow{},
+		}, now); err != nil {
+			t.Fatalf("Upsert %s: %v", key, err)
+		}
+	}
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+
+	request := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/quota-status?account_key="+keys[1]+"&account_key=acct_missing&account_key="+keys[0], nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Items []QuotaRuntimeState `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Items) != 3 {
+		t.Fatalf("items = %#v, want 3", response.Items)
+	}
+	if response.Items[0].AccountKey != keys[1] || response.Items[0].PlanType != "plan-1" {
+		t.Fatalf("first item = %#v, want second requested key", response.Items[0])
+	}
+	if response.Items[1].AccountKey != "acct_missing" || response.Items[1].Status != QuotaRuntimeStatusStale {
+		t.Fatalf("missing item = %#v, want stale missing state", response.Items[1])
+	}
+	if response.Items[2].AccountKey != keys[0] || response.Items[2].PlanType != "plan-0" {
+		t.Fatalf("third item = %#v, want first requested key", response.Items[2])
+	}
+}
+
+func TestQuotaRuntimeRoutesGetStatusesByCommaKeys(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	key := "acct_00000000-0000-4000-8000-000000000203"
+	if _, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: key,
+		Status:     QuotaRuntimeStatusSuccess,
+		PlanType:   "team",
+		Windows:    []QuotaRuntimeWindow{},
+	}, time.Now().UTC()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+
+	request := httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/quota-status?account_keys="+key+",acct_missing", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Items []QuotaRuntimeState `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Items) != 2 || response.Items[0].AccountKey != key || response.Items[1].Status != QuotaRuntimeStatusStale {
+		t.Fatalf("items = %#v, want stored then stale", response.Items)
+	}
+}
+
+func BenchmarkQuotaRuntimeStatusSnapshot1652Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusSnapshot(b, 1652)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget1Of1652Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 1)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget10Of1652Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 10)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget100Of1652Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 100)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget1652Of1652Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 1652)
+}
+
+func benchmarkQuotaRuntimeStatusSnapshot(b *testing.B, totalAccounts int) {
+	gin.SetMode(gin.TestMode)
+	store := seedQuotaRuntimeBenchmarkStore(b, totalAccounts)
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/quota-status", nil))
+		if recorder.Code != http.StatusOK {
+			b.Fatalf("GET status = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func benchmarkQuotaRuntimeStatusByKeys(b *testing.B, totalAccounts int, targetAccounts int) {
+	gin.SetMode(gin.TestMode)
+	store := seedQuotaRuntimeBenchmarkStore(b, totalAccounts)
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+	query := strings.Builder{}
+	for index := 0; index < targetAccounts; index++ {
+		if index > 0 {
+			query.WriteByte('&')
+		}
+		query.WriteString("account_key=")
+		query.WriteString(fmt.Sprintf("acct_00000000-0000-4000-8000-%012d", index))
+	}
+	url := "/v0/management/gettokens/quota-status?" + query.String()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, url, nil))
+		if recorder.Code != http.StatusOK {
+			b.Fatalf("GET status = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func seedQuotaRuntimeBenchmarkStore(b *testing.B, totalAccounts int) *QuotaRuntimeStore {
+	b.Helper()
+	store := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	remaining := 87
+	now := time.Now().UTC()
+	for index := 0; index < totalAccounts; index++ {
+		_, err := store.Upsert(QuotaRuntimeState{
+			AccountKey: fmt.Sprintf("acct_00000000-0000-4000-8000-%012d", index),
+			Source:     "quota-curl",
+			Status:     QuotaRuntimeStatusSuccess,
+			PlanType:   "team",
+			Windows: []QuotaRuntimeWindow{{
+				ID:               "five-hour",
+				Label:            "5H",
+				RemainingPercent: &remaining,
+				ResetAtUnix:      now.Add(time.Hour).Unix(),
+			}},
+			Sources: []QuotaRuntimeSourceState{},
+		}, now)
+		if err != nil {
+			b.Fatalf("upsert quota state %d: %v", index, err)
+		}
+	}
+	return store
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,6 +32,80 @@ const (
 type quotaRefreshRequest struct {
 	IncludeBilling bool `json:"include_billing"`
 	Force          bool `json:"force"`
+}
+
+type quotaRefreshBatchRequest struct {
+	AccountKeys    []string `json:"account_keys"`
+	IncludeBilling bool     `json:"include_billing"`
+	Force          bool     `json:"force"`
+	Concurrency    int      `json:"concurrency,omitempty"`
+}
+
+type quotaRefreshBatchError struct {
+	AccountKey string `json:"account_key"`
+	Error      string `json:"error"`
+}
+
+type quotaRefreshBatchResponse struct {
+	Items     []gettokenshooks.QuotaRuntimeState `json:"items"`
+	Errors    []quotaRefreshBatchError           `json:"errors"`
+	Succeeded int                                `json:"succeeded"`
+	Failed    int                                `json:"failed"`
+}
+
+type quotaRefreshBatchWorkResult struct {
+	index int
+	state gettokenshooks.QuotaRuntimeState
+	err   quotaRefreshBatchError
+	ok    bool
+}
+
+const (
+	quotaRefreshBatchJobStatusPending   = "pending"
+	quotaRefreshBatchJobStatusRunning   = "running"
+	quotaRefreshBatchJobStatusSucceeded = "succeeded"
+	quotaRefreshBatchJobStatusFailed    = "failed"
+	quotaRefreshBatchJobStatusCanceled  = "canceled"
+)
+
+type quotaRefreshBatchJob struct {
+	JobID          string
+	Status         string
+	AccountKeys    []string
+	IncludeBilling bool
+	Force          bool
+	Concurrency    int
+	Context        context.Context
+	Cancel         context.CancelFunc
+	Total          int
+	Pending        int
+	Running        int
+	Items          []gettokenshooks.QuotaRuntimeState
+	Errors         []quotaRefreshBatchError
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	CompletedAt    time.Time
+}
+
+type quotaRefreshBatchJobResponse struct {
+	JobID       string                             `json:"job_id"`
+	Status      string                             `json:"status"`
+	Total       int                                `json:"total"`
+	Pending     int                                `json:"pending"`
+	Running     int                                `json:"running"`
+	Succeeded   int                                `json:"succeeded"`
+	Failed      int                                `json:"failed"`
+	Items       []gettokenshooks.QuotaRuntimeState `json:"items"`
+	Errors      []quotaRefreshBatchError           `json:"errors"`
+	CreatedAt   string                             `json:"created_at"`
+	UpdatedAt   string                             `json:"updated_at"`
+	CompletedAt string                             `json:"completed_at,omitempty"`
+}
+
+type quotaRefreshBatchJobStore struct {
+	mu   sync.Mutex
+	seq  int64
+	jobs map[string]*quotaRefreshBatchJob
 }
 
 type quotaCurlTestRequest struct {
@@ -65,6 +140,262 @@ type quotaParsedResponse struct {
 	PlanType string
 	Windows  []gettokenshooks.QuotaRuntimeWindow
 	Billing  *gettokenshooks.QuotaRuntimeBilling
+}
+
+func newQuotaRefreshBatchJobStore() *quotaRefreshBatchJobStore {
+	return &quotaRefreshBatchJobStore{jobs: map[string]*quotaRefreshBatchJob{}}
+}
+
+func (s *quotaRefreshBatchJobStore) create(req quotaRefreshBatchRequest, accountKeys []string, now time.Time) quotaRefreshBatchJobResponse {
+	if s == nil {
+		return quotaRefreshBatchJobResponse{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	jobCtx, cancel := context.WithCancel(context.Background())
+	jobID := fmt.Sprintf("quota_refresh_%d_%d", now.UnixNano(), s.seq)
+	job := &quotaRefreshBatchJob{
+		JobID:          jobID,
+		Status:         quotaRefreshBatchJobStatusPending,
+		AccountKeys:    append([]string(nil), accountKeys...),
+		IncludeBilling: req.IncludeBilling,
+		Force:          req.Force,
+		Concurrency:    req.Concurrency,
+		Context:        jobCtx,
+		Cancel:         cancel,
+		Total:          len(accountKeys),
+		Pending:        len(accountKeys),
+		Items:          []gettokenshooks.QuotaRuntimeState{},
+		Errors:         []quotaRefreshBatchError{},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	s.jobs[jobID] = job
+	return quotaRefreshBatchJobSnapshot(job)
+}
+
+func (s *quotaRefreshBatchJobStore) markRunning(jobID string, now time.Time) (quotaRefreshBatchJob, bool) {
+	if s == nil {
+		return quotaRefreshBatchJob{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return quotaRefreshBatchJob{}, false
+	}
+	if isQuotaRefreshBatchJobTerminal(job.Status) {
+		return cloneQuotaRefreshBatchJob(job), false
+	}
+	job.Status = quotaRefreshBatchJobStatusRunning
+	job.Pending = 0
+	job.Running = job.Total
+	job.UpdatedAt = now
+	return cloneQuotaRefreshBatchJob(job), true
+}
+
+func (s *quotaRefreshBatchJobStore) complete(jobID string, items []gettokenshooks.QuotaRuntimeState, errors []quotaRefreshBatchError, now time.Time) (quotaRefreshBatchJobResponse, bool) {
+	if s == nil {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	if job.Status == quotaRefreshBatchJobStatusCanceled {
+		return quotaRefreshBatchJobSnapshot(job), true
+	}
+	job.Items = append([]gettokenshooks.QuotaRuntimeState(nil), items...)
+	job.Errors = append([]quotaRefreshBatchError(nil), errors...)
+	job.Pending = 0
+	job.Running = 0
+	if len(errors) > 0 {
+		job.Status = quotaRefreshBatchJobStatusFailed
+	} else {
+		job.Status = quotaRefreshBatchJobStatusSucceeded
+	}
+	job.UpdatedAt = now
+	job.CompletedAt = now
+	if job.Cancel != nil {
+		job.Cancel()
+	}
+	return quotaRefreshBatchJobSnapshot(job), true
+}
+
+func (s *quotaRefreshBatchJobStore) cancelForAccountKeys(accountKeys []string, reason string, now time.Time) int {
+	if s == nil || len(accountKeys) == 0 {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	keySet := make(map[string]struct{}, len(accountKeys))
+	for _, accountKey := range accountKeys {
+		accountKey = strings.TrimSpace(accountKey)
+		if accountKey != "" {
+			keySet[accountKey] = struct{}{}
+		}
+	}
+	if len(keySet) == 0 {
+		return 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	canceled := 0
+	for _, job := range s.jobs {
+		if job == nil || isQuotaRefreshBatchJobTerminal(job.Status) || !quotaRefreshBatchJobIntersects(job, keySet) {
+			continue
+		}
+		cancelQuotaRefreshBatchJobLocked(job, reason, now, keySet)
+		canceled++
+	}
+	return canceled
+}
+
+func (s *quotaRefreshBatchJobStore) cancelAll(reason string, now time.Time) int {
+	if s == nil {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	canceled := 0
+	for _, job := range s.jobs {
+		if job == nil || isQuotaRefreshBatchJobTerminal(job.Status) {
+			continue
+		}
+		cancelQuotaRefreshBatchJobLocked(job, reason, now, nil)
+		canceled++
+	}
+	return canceled
+}
+
+func (s *quotaRefreshBatchJobStore) get(jobID string) (quotaRefreshBatchJobResponse, bool) {
+	if s == nil {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[strings.TrimSpace(jobID)]
+	if !ok {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	return quotaRefreshBatchJobSnapshot(job), true
+}
+
+func cloneQuotaRefreshBatchJob(job *quotaRefreshBatchJob) quotaRefreshBatchJob {
+	if job == nil {
+		return quotaRefreshBatchJob{}
+	}
+	cloned := *job
+	cloned.AccountKeys = append([]string(nil), job.AccountKeys...)
+	cloned.Items = append([]gettokenshooks.QuotaRuntimeState(nil), job.Items...)
+	cloned.Errors = append([]quotaRefreshBatchError(nil), job.Errors...)
+	return cloned
+}
+
+func isQuotaRefreshBatchJobTerminal(status string) bool {
+	switch strings.TrimSpace(status) {
+	case quotaRefreshBatchJobStatusSucceeded, quotaRefreshBatchJobStatusFailed, quotaRefreshBatchJobStatusCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func quotaRefreshBatchJobIntersects(job *quotaRefreshBatchJob, keySet map[string]struct{}) bool {
+	if job == nil || len(keySet) == 0 {
+		return false
+	}
+	for _, accountKey := range job.AccountKeys {
+		if _, ok := keySet[accountKey]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func cancelQuotaRefreshBatchJobLocked(job *quotaRefreshBatchJob, reason string, now time.Time, accountKeySet map[string]struct{}) {
+	if job == nil {
+		return
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		reason = "quota refresh job canceled"
+	}
+	if job.Cancel != nil {
+		job.Cancel()
+	}
+	job.Status = quotaRefreshBatchJobStatusCanceled
+	job.Pending = 0
+	job.Running = 0
+	job.UpdatedAt = now
+	job.CompletedAt = now
+	if len(job.Errors) == 0 {
+		job.Errors = quotaRefreshBatchJobCancellationErrors(job, reason, accountKeySet)
+	}
+}
+
+func quotaRefreshBatchJobCancellationErrors(job *quotaRefreshBatchJob, reason string, accountKeySet map[string]struct{}) []quotaRefreshBatchError {
+	if job == nil {
+		return []quotaRefreshBatchError{{Error: reason}}
+	}
+	errors := make([]quotaRefreshBatchError, 0)
+	for _, accountKey := range job.AccountKeys {
+		if len(accountKeySet) > 0 {
+			if _, ok := accountKeySet[accountKey]; !ok {
+				continue
+			}
+		}
+		errors = append(errors, quotaRefreshBatchError{AccountKey: accountKey, Error: reason})
+	}
+	if len(errors) == 0 {
+		errors = append(errors, quotaRefreshBatchError{Error: reason})
+	}
+	return errors
+}
+
+func quotaRefreshBatchJobSnapshot(job *quotaRefreshBatchJob) quotaRefreshBatchJobResponse {
+	if job == nil {
+		return quotaRefreshBatchJobResponse{}
+	}
+	completedAt := ""
+	if !job.CompletedAt.IsZero() {
+		completedAt = job.CompletedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return quotaRefreshBatchJobResponse{
+		JobID:       job.JobID,
+		Status:      job.Status,
+		Total:       job.Total,
+		Pending:     job.Pending,
+		Running:     job.Running,
+		Succeeded:   len(job.Items),
+		Failed:      len(job.Errors),
+		Items:       append([]gettokenshooks.QuotaRuntimeState(nil), job.Items...),
+		Errors:      append([]quotaRefreshBatchError(nil), job.Errors...),
+		CreatedAt:   job.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:   job.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		CompletedAt: completedAt,
+	}
 }
 
 func (h *Handler) RefreshAccountQuota(c *gin.Context) {
@@ -112,6 +443,111 @@ func (h *Handler) RefreshAccountQuota(c *gin.Context) {
 	c.JSON(http.StatusOK, state)
 }
 
+func (h *Handler) RefreshAccountQuotaBatch(c *gin.Context) {
+	var req quotaRefreshBatchRequest
+	if err := bindOptionalQuotaJSON(c, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	accountKeys, err := normalizeQuotaRefreshBatchAccountKeys(req.AccountKeys)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	targets, missing, err := h.resolveQuotaRefreshBatchTargets(c.Request.Context(), accountKeys)
+	if err != nil {
+		writeAccountStoreError(c, err)
+		return
+	}
+
+	items, errors := h.refreshAccountQuotaBatch(c.Request.Context(), targets, req.IncludeBilling, req.Concurrency)
+	errors = append(missing, errors...)
+	c.JSON(http.StatusOK, quotaRefreshBatchResponse{
+		Items:     items,
+		Errors:    errors,
+		Succeeded: len(items),
+		Failed:    len(errors),
+	})
+}
+
+func (h *Handler) StartAccountQuotaBatchRefreshJob(c *gin.Context) {
+	var req quotaRefreshBatchRequest
+	if err := bindOptionalQuotaJSON(c, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	accountKeys, err := normalizeQuotaRefreshBatchAccountKeys(req.AccountKeys)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	store := h.quotaRefreshBatchJobStore()
+	started := store.create(req, accountKeys, time.Now().UTC())
+	go h.runAccountQuotaBatchRefreshJob(started.JobID)
+	c.JSON(http.StatusAccepted, started)
+}
+
+func (h *Handler) GetAccountQuotaBatchRefreshJob(c *gin.Context) {
+	jobID := strings.TrimSpace(c.Param("job_id"))
+	if jobID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job_id is required"})
+		return
+	}
+	if snapshot, ok := h.quotaRefreshBatchJobStore().get(jobID); ok {
+		c.JSON(http.StatusOK, snapshot)
+		return
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "quota refresh job not found"})
+}
+
+func (h *Handler) quotaRefreshBatchJobStore() *quotaRefreshBatchJobStore {
+	if h == nil {
+		return newQuotaRefreshBatchJobStore()
+	}
+	if h.quotaRefreshBatchJobs == nil {
+		h.quotaRefreshBatchJobs = newQuotaRefreshBatchJobStore()
+	}
+	return h.quotaRefreshBatchJobs
+}
+
+func (h *Handler) cancelQuotaRefreshBatchJobsForAccountKeys(accountKeys []string, reason string, now time.Time) int {
+	if h == nil {
+		return 0
+	}
+	return h.quotaRefreshBatchJobStore().cancelForAccountKeys(accountKeys, reason, now)
+}
+
+func (h *Handler) cancelAllQuotaRefreshBatchJobs(reason string, now time.Time) int {
+	if h == nil {
+		return 0
+	}
+	return h.quotaRefreshBatchJobStore().cancelAll(reason, now)
+}
+
+func (h *Handler) CancelQuotaRefreshBatchJobs(reason string, now time.Time) int {
+	return h.cancelAllQuotaRefreshBatchJobs(reason, now)
+}
+
+func (h *Handler) runAccountQuotaBatchRefreshJob(jobID string) {
+	job, ok := h.quotaRefreshBatchJobStore().markRunning(jobID, time.Now().UTC())
+	if !ok {
+		return
+	}
+	jobCtx := job.Context
+	if jobCtx == nil {
+		jobCtx = context.Background()
+	}
+	targets, missing, err := h.resolveQuotaRefreshBatchTargets(jobCtx, job.AccountKeys)
+	if err != nil {
+		h.quotaRefreshBatchJobStore().complete(jobID, []gettokenshooks.QuotaRuntimeState{}, []quotaRefreshBatchError{{Error: err.Error()}}, time.Now().UTC())
+		return
+	}
+	items, errors := h.refreshAccountQuotaBatch(jobCtx, targets, job.IncludeBilling, job.Concurrency)
+	errors = append(missing, errors...)
+	h.quotaRefreshBatchJobStore().complete(jobID, items, errors, time.Now().UTC())
+}
+
 func (h *Handler) TestQuotaCurl(c *gin.Context) {
 	var req quotaCurlTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -149,6 +585,189 @@ func bindOptionalQuotaJSON(c *gin.Context, out any) error {
 		return nil
 	}
 	return err
+}
+
+func normalizeQuotaRefreshBatchAccountKeys(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return nil, errors.New("account_keys is required")
+	}
+	keys := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		accountKey := strings.TrimSpace(value)
+		if !accountstore.IsAccountKey(accountKey) {
+			return nil, fmt.Errorf("invalid account_key %q", accountKey)
+		}
+		if _, ok := seen[accountKey]; ok {
+			continue
+		}
+		seen[accountKey] = struct{}{}
+		keys = append(keys, accountKey)
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("account_keys is required")
+	}
+	return keys, nil
+}
+
+func (h *Handler) resolveQuotaRefreshBatchTargets(ctx context.Context, accountKeys []string) ([]accountstore.AccountRecord, []quotaRefreshBatchError, error) {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	accounts, err := store.GetAccounts(ctx, accountKeys)
+	if err != nil {
+		return nil, nil, err
+	}
+	accountByKey := make(map[string]accountstore.AccountRecord, len(accounts))
+	for _, account := range accounts {
+		accountByKey[account.AccountKey] = account
+	}
+	targets := make([]accountstore.AccountRecord, 0, len(accountKeys))
+	missing := make([]quotaRefreshBatchError, 0)
+	for _, accountKey := range accountKeys {
+		account, ok := accountByKey[accountKey]
+		if !ok {
+			missing = append(missing, quotaRefreshBatchError{AccountKey: accountKey, Error: "account not found"})
+			continue
+		}
+		targets = append(targets, account)
+	}
+	return targets, missing, nil
+}
+
+func (h *Handler) refreshAccountQuotaBatch(ctx context.Context, accounts []accountstore.AccountRecord, includeBilling bool, concurrency int) ([]gettokenshooks.QuotaRuntimeState, []quotaRefreshBatchError) {
+	if len(accounts) == 0 {
+		return []gettokenshooks.QuotaRuntimeState{}, []quotaRefreshBatchError{}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workerCount := normalizeQuotaRefreshBatchConcurrency(concurrency, len(accounts))
+	jobs := make(chan int)
+	results := make(chan quotaRefreshBatchWorkResult, len(accounts))
+	var workers sync.WaitGroup
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				account := accounts[index]
+				if err := ctx.Err(); err != nil {
+					sendQuotaRefreshBatchResult(ctx, results, quotaRefreshBatchWorkResult{index: index, err: quotaRefreshBatchError{AccountKey: account.AccountKey, Error: err.Error()}})
+					continue
+				}
+				if err := h.ensureQuotaRefreshAccountStillActive(ctx, account.AccountKey); err != nil {
+					sendQuotaRefreshBatchResult(ctx, results, quotaRefreshBatchWorkResult{index: index, err: quotaRefreshBatchError{AccountKey: account.AccountKey, Error: err.Error()}})
+					continue
+				}
+				state, err := h.refreshAccountQuotaRecord(ctx, account, includeBilling)
+				if err != nil {
+					if fallback, ok := degradedQuotaRuntimeState(account.AccountKey, err); ok {
+						sendQuotaRefreshBatchResult(ctx, results, quotaRefreshBatchWorkResult{index: index, state: fallback, ok: true})
+						continue
+					}
+					sendQuotaRefreshBatchResult(ctx, results, quotaRefreshBatchWorkResult{index: index, err: quotaRefreshBatchError{AccountKey: account.AccountKey, Error: err.Error()}})
+					continue
+				}
+				sendQuotaRefreshBatchResult(ctx, results, quotaRefreshBatchWorkResult{index: index, state: state, ok: true})
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for index := range accounts {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- index:
+			}
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	orderedStates := make([]gettokenshooks.QuotaRuntimeState, len(accounts))
+	stateOK := make([]bool, len(accounts))
+	orderedErrors := make([]quotaRefreshBatchError, len(accounts))
+	errorOK := make([]bool, len(accounts))
+	for result := range results {
+		if result.ok {
+			orderedStates[result.index] = result.state
+			stateOK[result.index] = true
+		} else {
+			orderedErrors[result.index] = result.err
+			errorOK[result.index] = true
+		}
+	}
+	items := make([]gettokenshooks.QuotaRuntimeState, 0, len(accounts))
+	for index, ok := range stateOK {
+		if ok {
+			items = append(items, orderedStates[index])
+		}
+	}
+	errors := make([]quotaRefreshBatchError, 0)
+	for index, ok := range errorOK {
+		if ok {
+			errors = append(errors, orderedErrors[index])
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		for index, account := range accounts {
+			if stateOK[index] || errorOK[index] {
+				continue
+			}
+			errors = append(errors, quotaRefreshBatchError{AccountKey: account.AccountKey, Error: err.Error()})
+		}
+	}
+	return items, errors
+}
+
+func sendQuotaRefreshBatchResult(ctx context.Context, results chan<- quotaRefreshBatchWorkResult, item quotaRefreshBatchWorkResult) {
+	select {
+	case <-ctx.Done():
+	case results <- item:
+	}
+}
+
+func (h *Handler) ensureQuotaRefreshAccountStillActive(ctx context.Context, accountKey string) error {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := store.GetAccount(ctx, accountKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func normalizeQuotaRefreshBatchConcurrency(value int, itemCount int) int {
+	if itemCount <= 0 {
+		return 1
+	}
+	if value <= 0 {
+		value = 4
+	}
+	if value > 6 {
+		value = 6
+	}
+	if value > itemCount {
+		return itemCount
+	}
+	return value
+}
+
+func (h *Handler) refreshAccountQuotaRecord(ctx context.Context, account accountstore.AccountRecord, includeBilling bool) (gettokenshooks.QuotaRuntimeState, error) {
+	switch account.Kind {
+	case accountstore.KindCodexAPIKey:
+		return h.refreshCodexAPIKeyQuota(ctx, account, includeBilling)
+	case accountstore.KindOpenAICompatible:
+		return h.refreshOpenAICompatibleQuota(ctx, account, includeBilling)
+	default:
+		return gettokenshooks.QuotaRuntimeState{}, errors.New("account kind does not support quota refresh")
+	}
 }
 
 func (h *Handler) refreshCodexAPIKeyQuota(ctx context.Context, account accountstore.AccountRecord, includeBilling bool) (gettokenshooks.QuotaRuntimeState, error) {

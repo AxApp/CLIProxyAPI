@@ -487,3 +487,78 @@ func TestAccountsCRUDEndpointsPreserveAccountKeyOnPatch(t *testing.T) {
 		t.Fatalf("get deleted status = %d, want 404 body=%s", getRecorder.Code, getRecorder.Body.String())
 	}
 }
+
+func TestAccountsBatchDeleteEndpointDeletesMultipleAccountsWithOneApply(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+	applyCalls := 0
+	h.SetAccountStoreApplyHook(func(context.Context) error {
+		applyCalls++
+		return nil
+	})
+
+	router := gin.New()
+	router.POST("/v0/management/accounts", h.CreateAccount)
+	router.POST("/v0/management/accounts/batch-delete", h.DeleteAccountsBatch)
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	createAccount := func(title string) string {
+		t.Helper()
+		createBody := []byte(`{
+			"kind":"codex-api-key",
+			"title":"` + title + `",
+			"provider":"codex",
+			"credential":{"api_key":"sk-` + title + `","base_url":"https://api.example.com/v1"}
+		}`)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts", bytes.NewReader(createBody)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("create %s status = %d body=%s", title, recorder.Code, recorder.Body.String())
+		}
+		var created struct {
+			AccountKey string `json:"account_key"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+			t.Fatalf("unmarshal create %s: %v", title, err)
+		}
+		return created.AccountKey
+	}
+	firstKey := createAccount("first")
+	secondKey := createAccount("second")
+	applyCalls = 0
+
+	deleteBody := []byte(`{"account_keys":["` + firstKey + `","` + secondKey + `","not-an-account-key","` + firstKey + `"]}`)
+	deleteRecorder := httptest.NewRecorder()
+	router.ServeHTTP(deleteRecorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts/batch-delete", bytes.NewReader(deleteBody)))
+	if deleteRecorder.Code != http.StatusOK {
+		t.Fatalf("batch delete status = %d body=%s", deleteRecorder.Code, deleteRecorder.Body.String())
+	}
+	var result accountBatchDeleteResponse
+	if err := json.Unmarshal(deleteRecorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal batch delete: %v", err)
+	}
+	if result.Succeeded != 2 || result.Failed != 1 || strings.Join(result.DeletedAccountKeys, ",") != firstKey+","+secondKey {
+		t.Fatalf("batch delete result = %#v", result)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want one batch apply", applyCalls)
+	}
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list.Accounts) != 0 {
+		t.Fatalf("accounts after batch delete = %#v", list.Accounts)
+	}
+}

@@ -655,6 +655,9 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 		mgmt.POST("/gettokens/quota-refresh/:account_key", s.mgmt.RefreshAccountQuota)
+		mgmt.POST("/gettokens/quota-refresh-batch", s.mgmt.RefreshAccountQuotaBatch)
+		mgmt.POST("/gettokens/quota-refresh-batch/jobs", s.mgmt.StartAccountQuotaBatchRefreshJob)
+		mgmt.GET("/gettokens/quota-refresh-batch/jobs/:job_id", s.mgmt.GetAccountQuotaBatchRefreshJob)
 		mgmt.POST("/gettokens/quota-test", s.mgmt.TestQuotaCurl)
 		mgmt.POST("/gettokens/billing-test", s.mgmt.TestBillingCurl)
 
@@ -750,6 +753,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/accounts", s.mgmt.CreateAccount)
 		mgmt.PATCH("/accounts/:account_key", s.mgmt.PatchAccount)
 		mgmt.DELETE("/accounts/:account_key", s.mgmt.DeleteAccount)
+		mgmt.POST("/accounts/batch-delete", s.mgmt.DeleteAccountsBatch)
 		mgmt.PATCH("/accounts/:account_key/status", s.mgmt.PatchAccountStatus)
 		mgmt.PATCH("/accounts/:account_key/priority", s.mgmt.PatchAccountPriority)
 		mgmt.GET("/accounts/:account_key/models", s.mgmt.GetAccountModels)
@@ -1366,6 +1370,9 @@ func (s *Server) Stop(ctx context.Context) error {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
+	}
+	if s.mgmt != nil {
+		s.mgmt.CancelQuotaRefreshBatchJobs("server shutdown", time.Now().UTC())
 	}
 
 	if s.muxHTTPListener != nil {

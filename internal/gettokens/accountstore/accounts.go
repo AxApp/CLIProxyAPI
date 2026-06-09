@@ -65,6 +65,11 @@ type MigrationSourceRecord struct {
 	BackupPath        string `json:"backup_path"`
 }
 
+type AccountBatchMutationError struct {
+	AccountKey string `json:"account_key"`
+	Error      string `json:"error"`
+}
+
 func (s *Store) CreateAccount(ctx context.Context, write AccountWrite) (AccountRecord, error) {
 	if s == nil || s.db == nil {
 		return AccountRecord{}, errors.New("account store is not open")
@@ -245,6 +250,125 @@ WHERE c.account_key = ? AND c.deleted_at_unix_ms IS NULL`, accountKey).Scan(
 	return account, nil
 }
 
+func (s *Store) GetAccounts(ctx context.Context, accountKeys []string) ([]AccountRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	keys := make([]string, 0, len(accountKeys))
+	seen := make(map[string]struct{}, len(accountKeys))
+	for _, value := range accountKeys {
+		accountKey := strings.TrimSpace(value)
+		if !IsAccountKey(accountKey) {
+			return nil, fmt.Errorf("invalid account key %q", accountKey)
+		}
+		if _, ok := seen[accountKey]; ok {
+			continue
+		}
+		seen[accountKey] = struct{}{}
+		keys = append(keys, accountKey)
+	}
+	if len(keys) == 0 {
+		return []AccountRecord{}, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin get accounts transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	accountByKey := make(map[string]AccountRecord, len(keys))
+	const chunkSize = 400
+	for start := 0; start < len(keys); start += chunkSize {
+		end := start + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunk := keys[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, len(chunk))
+		for _, key := range chunk {
+			args = append(args, key)
+		}
+		rows, err := tx.QueryContext(ctx, `
+SELECT
+  c.account_key,
+  c.kind,
+  c.title,
+  c.provider,
+  c.credential_source,
+  c.priority,
+  c.disabled,
+  c.revision,
+  c.metadata_json,
+  c.created_at_unix_ms,
+  c.updated_at_unix_ms,
+  COALESCE(c.deleted_at_unix_ms, 0),
+  COALESCE(a.status, ''),
+  COALESCE(a.last_error, '')
+FROM account_cards c
+LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
+WHERE c.deleted_at_unix_ms IS NULL
+  AND c.account_key IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("query accounts by keys: %w", err)
+		}
+		for rows.Next() {
+			var account AccountRecord
+			var disabled int
+			if err := rows.Scan(
+				&account.AccountKey,
+				&account.Kind,
+				&account.Title,
+				&account.Provider,
+				&account.CredentialSource,
+				&account.Priority,
+				&disabled,
+				&account.Revision,
+				&account.MetadataJSON,
+				&account.CreatedAtUnixMs,
+				&account.UpdatedAtUnixMs,
+				&account.DeletedAtUnixMs,
+				&account.RuntimeApplyStatus,
+				&account.RuntimeApplyError,
+			); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan account: %w", err)
+			}
+			account.Disabled = disabled != 0
+			accountByKey[account.AccountKey] = account
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate accounts by keys: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close account rows by keys: %w", err)
+		}
+	}
+
+	accounts := make([]AccountRecord, 0, len(accountByKey))
+	for _, key := range keys {
+		account, ok := accountByKey[key]
+		if !ok {
+			continue
+		}
+		if err := attachCredential(ctx, tx, &account); err != nil {
+			return nil, err
+		}
+		accounts = append(accounts, account)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit get accounts transaction: %w", err)
+	}
+	return accounts, nil
+}
+
 func (s *Store) SetAccountStatus(ctx context.Context, accountKey string, disabled bool) (AccountRecord, error) {
 	if s == nil || s.db == nil {
 		return AccountRecord{}, errors.New("account store is not open")
@@ -396,6 +520,57 @@ func (s *Store) DeleteAccount(ctx context.Context, accountKey string) error {
 		return fmt.Errorf("account %s not found", accountKey)
 	}
 	return nil
+}
+
+func (s *Store) DeleteAccounts(ctx context.Context, accountKeys []string) ([]string, []AccountBatchMutationError, error) {
+	if s == nil || s.db == nil {
+		return nil, nil, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(accountKeys) == 0 {
+		return []string{}, []AccountBatchMutationError{}, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin delete accounts transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	now := unixMs()
+	deleted := make([]string, 0, len(accountKeys))
+	failures := make([]AccountBatchMutationError, 0)
+	for _, accountKey := range accountKeys {
+		accountKey = strings.TrimSpace(accountKey)
+		if !IsAccountKey(accountKey) {
+			failures = append(failures, AccountBatchMutationError{AccountKey: accountKey, Error: fmt.Sprintf("invalid account key %q", accountKey)})
+			continue
+		}
+		result, err := tx.ExecContext(ctx, "UPDATE account_cards SET deleted_at_unix_ms = ?, updated_at_unix_ms = ? WHERE account_key = ? AND deleted_at_unix_ms IS NULL", now, now, accountKey)
+		if err != nil {
+			failures = append(failures, AccountBatchMutationError{AccountKey: accountKey, Error: err.Error()})
+			continue
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			failures = append(failures, AccountBatchMutationError{AccountKey: accountKey, Error: err.Error()})
+			continue
+		}
+		if rows == 0 {
+			failures = append(failures, AccountBatchMutationError{AccountKey: accountKey, Error: fmt.Sprintf("account %s not found", accountKey)})
+			continue
+		}
+		deleted = append(deleted, accountKey)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit delete accounts transaction: %w", err)
+	}
+	tx = nil
+	return deleted, failures, nil
 }
 
 func (s *Store) MarkRuntimeApplyResult(ctx context.Context, accountKey string, revision int, status string, lastError string) error {

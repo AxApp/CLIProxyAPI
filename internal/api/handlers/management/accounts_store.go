@@ -36,6 +36,17 @@ type accountMigrationRequest struct {
 	Report               *accountstore.MigrationReport `json:"report,omitempty"`
 }
 
+type accountBatchDeleteRequest struct {
+	AccountKeys []string `json:"account_keys"`
+}
+
+type accountBatchDeleteResponse struct {
+	DeletedAccountKeys []string                                 `json:"deleted_account_keys"`
+	Errors             []accountstore.AccountBatchMutationError `json:"errors"`
+	Succeeded          int                                      `json:"succeeded"`
+	Failed             int                                      `json:"failed"`
+}
+
 type deleteLegacySourcesRequest struct {
 	BackupDir string `json:"backup_dir,omitempty"`
 }
@@ -111,12 +122,47 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if err := store.DeleteAccount(c.Request.Context(), c.Param("account_key")); err != nil {
+	accountKey := c.Param("account_key")
+	if err := store.DeleteAccount(c.Request.Context(), accountKey); err != nil {
 		writeAccountStoreError(c, err)
 		return
 	}
+	_ = h.cancelQuotaRefreshBatchJobsForAccountKeys([]string{accountKey}, "quota refresh job canceled because account was deleted", time.Now().UTC())
 	_ = h.triggerAccountStoreApply(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *Handler) DeleteAccountsBatch(c *gin.Context) {
+	var body accountBatchDeleteRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	accountKeys := normalizeAccountBatchKeys(body.AccountKeys)
+	if len(accountKeys) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account_keys is required"})
+		return
+	}
+	store, err := h.openAccountStore(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	deleted, failures, err := store.DeleteAccounts(c.Request.Context(), accountKeys)
+	if err != nil {
+		writeAccountStoreError(c, err)
+		return
+	}
+	if len(deleted) > 0 {
+		_ = h.cancelQuotaRefreshBatchJobsForAccountKeys(deleted, "quota refresh job canceled because account was deleted", time.Now().UTC())
+		_ = h.triggerAccountStoreApply(c.Request.Context())
+	}
+	c.JSON(http.StatusOK, accountBatchDeleteResponse{
+		DeletedAccountKeys: deleted,
+		Errors:             failures,
+		Succeeded:          len(deleted),
+		Failed:             len(failures),
+	})
 }
 
 func (h *Handler) PatchAccountStatus(c *gin.Context) {
@@ -694,6 +740,23 @@ func expandPath(path string) (string, error) {
 		return filepath.Join(home, filepath.FromSlash(strings.ReplaceAll(rest, "\\", "/"))), nil
 	}
 	return filepath.Clean(path), nil
+}
+
+func normalizeAccountBatchKeys(values []string) []string {
+	keys := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		key := strings.TrimSpace(value)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func (h *Handler) removeLegacyConfigSource(source accountstore.MigrationSourceRecord) {
