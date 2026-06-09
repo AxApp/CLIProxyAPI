@@ -103,6 +103,67 @@ func TestListAccountsReopensCachedStoreAfterRecoverableReadFailure(t *testing.T)
 	}
 }
 
+func TestListAccountsFallsBackToCardsWhenCredentialReadFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("openAccountStore: %v", err)
+	}
+	created, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Card Survives",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:  "sk-primary",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, "DELETE FROM codex_api_key_accounts WHERE account_key = ?", created.AccountKey); err != nil {
+		t.Fatalf("delete credential row: %v", err)
+	}
+
+	router := gin.New()
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("accounts status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+		Degraded bool                         `json:"degraded"`
+		Warning  string                       `json:"warning"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal accounts: %v", err)
+	}
+	if !body.Degraded || !strings.Contains(body.Warning, "query codex-api-key credential") {
+		t.Fatalf("degraded response = %+v", body)
+	}
+	if len(body.Accounts) != 1 || body.Accounts[0].AccountKey != created.AccountKey || body.Accounts[0].Title != "Card Survives" {
+		t.Fatalf("card fallback accounts = %+v", body.Accounts)
+	}
+	if body.Accounts[0].CodexAPIKey != nil {
+		t.Fatalf("card fallback should not synthesize missing credential: %+v", body.Accounts[0].CodexAPIKey)
+	}
+}
+
 func TestWriteAccountStoreErrorClassifiesRecoverableIOError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

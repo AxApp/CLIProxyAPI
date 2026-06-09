@@ -892,6 +892,89 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 	return accounts, nil
 }
 
+func (s *Store) ListAccountCards(ctx context.Context) ([]AccountRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin list account cards transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	rows, err := tx.QueryContext(ctx, `
+SELECT
+  c.account_key,
+  c.kind,
+  c.title,
+  c.provider,
+  c.credential_source,
+  c.priority,
+  c.disabled,
+  c.revision,
+  c.metadata_json,
+  c.created_at_unix_ms,
+  c.updated_at_unix_ms,
+  COALESCE(c.deleted_at_unix_ms, 0),
+  COALESCE(a.status, ''),
+  COALESCE(a.last_error, '')
+FROM account_cards c
+LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
+WHERE c.deleted_at_unix_ms IS NULL
+ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query account cards: %w", err)
+	}
+
+	var accounts []AccountRecord
+	for rows.Next() {
+		var account AccountRecord
+		var disabled int
+		if err := rows.Scan(
+			&account.AccountKey,
+			&account.Kind,
+			&account.Title,
+			&account.Provider,
+			&account.CredentialSource,
+			&account.Priority,
+			&disabled,
+			&account.Revision,
+			&account.MetadataJSON,
+			&account.CreatedAtUnixMs,
+			&account.UpdatedAtUnixMs,
+			&account.DeletedAtUnixMs,
+			&account.RuntimeApplyStatus,
+			&account.RuntimeApplyError,
+		); err != nil {
+			_ = rows.Close()
+			if len(accounts) > 0 {
+				return accounts, fmt.Errorf("scan account card: %w", err)
+			}
+			return nil, fmt.Errorf("scan account card: %w", err)
+		}
+		account.Disabled = disabled != 0
+		accounts = append(accounts, account)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		if len(accounts) > 0 {
+			return accounts, fmt.Errorf("iterate account cards: %w", err)
+		}
+		return nil, fmt.Errorf("iterate account cards: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close account card rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit list account cards transaction: %w", err)
+	}
+	return accounts, nil
+}
+
 func attachCredential(ctx context.Context, queryer accountStoreQueryer, account *AccountRecord) error {
 	switch account.Kind {
 	case KindAuthFile:

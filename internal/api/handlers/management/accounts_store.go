@@ -212,6 +212,18 @@ func (h *Handler) PatchAccountPriority(c *gin.Context) {
 func (h *Handler) ListAccounts(c *gin.Context) {
 	store, accounts, err := h.listAccountsWithReadRecovery(c.Request.Context())
 	if err != nil {
+		_, cardAccounts, cardErr := h.listAccountCardsWithReadRecovery(c.Request.Context())
+		if len(cardAccounts) > 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"accounts": cardAccounts,
+				"degraded": true,
+				"warning":  err.Error(),
+			})
+			return
+		}
+		if cardErr != nil {
+			err = fmt.Errorf("%w; degraded account card snapshot failed: %v", err, cardErr)
+		}
 		writeAccountStoreError(c, err)
 		return
 	}
@@ -263,6 +275,29 @@ func (h *Handler) listAccountsWithReadRecovery(ctx context.Context) (*accountsto
 	}
 	accounts, retryErr = store.ListAccounts(ctx)
 	h.recordAccountStoreReadRecovery("accounts", err, retryErr == nil)
+	return store, accounts, retryErr
+}
+
+func (h *Handler) listAccountCardsWithReadRecovery(ctx context.Context) (*accountstore.Store, []accountstore.AccountRecord, error) {
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	accounts, err := store.ListAccountCards(ctx)
+	if err == nil || !isRecoverableAccountStoreReadError(err) {
+		return store, accounts, err
+	}
+	h.resetAccountStore(store)
+	store, retryErr := h.openAccountStore(ctx)
+	if retryErr != nil {
+		h.recordAccountStoreReadRecovery("accounts:cards", err, false)
+		return nil, accounts, retryErr
+	}
+	retryAccounts, retryErr := store.ListAccountCards(ctx)
+	h.recordAccountStoreReadRecovery("accounts:cards", err, retryErr == nil)
+	if len(retryAccounts) > 0 {
+		return store, retryAccounts, retryErr
+	}
 	return store, accounts, retryErr
 }
 
