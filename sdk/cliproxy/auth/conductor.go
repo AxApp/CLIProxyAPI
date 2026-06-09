@@ -2869,7 +2869,9 @@ func isUnauthorizedError(err error) bool {
 		return true
 	}
 	raw := strings.ToLower(err.Error())
-	return strings.Contains(raw, "status 401") || strings.Contains(raw, "401 unauthorized")
+	return strings.Contains(raw, "status 401") ||
+		strings.Contains(raw, "401 unauthorized") ||
+		isTerminalOAuthCredentialError(raw)
 }
 
 func hasUnauthorizedAuthFailure(auth *Auth) bool {
@@ -2884,7 +2886,7 @@ func refreshErrorFromError(err error) *Error {
 		return nil
 	}
 	statusCode := statusCodeFromError(err)
-	if statusCode == 0 && isUnauthorizedError(err) {
+	if isUnauthorizedError(err) {
 		statusCode = http.StatusUnauthorized
 	}
 	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
@@ -2893,6 +2895,18 @@ func refreshErrorFromError(err error) *Error {
 		authErr.Retryable = false
 	}
 	return authErr
+}
+
+func isTerminalOAuthCredentialError(raw string) bool {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return false
+	}
+	return strings.Contains(raw, "refresh_token_reused") ||
+		strings.Contains(raw, "app_session_terminated") ||
+		strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "session has ended") ||
+		strings.Contains(raw, "please log in again")
 }
 
 func retryAfterFromError(err error) *time.Duration {

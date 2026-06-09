@@ -45,6 +45,14 @@ func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
 }
 
+type terminalRefreshTestExecutor struct {
+	schedulerProviderTestExecutor
+}
+
+func (e terminalRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	return nil, errors.New(`token refresh failed with status 400: {"error":{"code":"app_session_terminated","message":"Your session has ended. Please log in again."}}`)
+}
+
 type refreshRecoveryTestExecutor struct {
 	schedulerProviderTestExecutor
 	refreshCalls int
@@ -100,6 +108,52 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	}
 	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
 		t.Fatal("expected unauthorized auth to be removed from the auto-refresh schedule")
+	}
+}
+
+func TestManager_RefreshAuthTerminalOAuthFailureStopsAutoRefreshRetry(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(terminalRefreshTestExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+	})
+
+	auth := &Auth{
+		ID:       "terminal-refresh",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":         "x@example.com",
+			"refresh_token": "refresh-token",
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh", auth.ID)
+	}
+	if updated.LastError == nil {
+		t.Fatal("expected terminal refresh failure to be recorded")
+	}
+	if updated.LastError.Code != "unauthorized" {
+		t.Fatalf("LastError.Code = %q, want unauthorized", updated.LastError.Code)
+	}
+	if got := updated.LastError.StatusCode(); got != http.StatusUnauthorized {
+		t.Fatalf("LastError.StatusCode() = %d, want %d", got, http.StatusUnauthorized)
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("NextRefreshAfter = %s, want zero for terminal refresh failure", updated.NextRefreshAfter)
+	}
+	now := time.Now()
+	if manager.shouldRefresh(updated, now) {
+		t.Fatal("expected terminal refresh failure to stop refresh attempts")
+	}
+	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
+		t.Fatal("expected terminal refresh failure to be removed from the auto-refresh schedule")
 	}
 }
 
