@@ -83,7 +83,7 @@ func MarkManualDisabledAuth(auth *coreauth.Auth, reason string) {
 	defaultAccountRouteGuardStore.MarkBlocked(AccountRouteGuardBlock{
 		Source:     AccountRouteGuardSourceManualDisabled,
 		AuthID:     strings.TrimSpace(auth.ID),
-		AccountKey: "auth-id:" + strings.TrimSpace(auth.ID),
+		AccountKey: firstNonEmptyRouteGuardString(auth.AccountKey, "auth-id:"+strings.TrimSpace(auth.ID)),
 		LookupKeys: accountRouteGuardIdentityKeysForAuth(auth),
 		Reason:     reason,
 	})
@@ -160,13 +160,14 @@ func (s *AccountRouteGuardStore) MarkBlocked(block AccountRouteGuardBlock) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.removeLocked(block.Source, accountRouteGuardBlockKey(block))
 	if s.blocks[block.Source] == nil {
 		s.blocks[block.Source] = map[string]AccountRouteGuardBlock{}
 	}
 	s.blocks[block.Source][accountRouteGuardBlockKey(block)] = block
 	s.indexLocked(block)
+	s.mu.Unlock()
+	persistAccountRouteGuardBlock(block)
 }
 
 func (s *AccountRouteGuardStore) ReplaceSource(source string, blocks []AccountRouteGuardBlock) {
@@ -178,8 +179,8 @@ func (s *AccountRouteGuardStore) ReplaceSource(source string, blocks []AccountRo
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.clearSourceLocked(source)
+	persistedBlocks := make([]AccountRouteGuardBlock, 0, len(blocks))
 	for _, block := range blocks {
 		block.Source = source
 		block = normalizeAccountRouteGuardBlock(block)
@@ -191,7 +192,10 @@ func (s *AccountRouteGuardStore) ReplaceSource(source string, blocks []AccountRo
 		}
 		s.blocks[source][accountRouteGuardBlockKey(block)] = block
 		s.indexLocked(block)
+		persistedBlocks = append(persistedBlocks, block)
 	}
+	s.mu.Unlock()
+	replacePersistedAccountRouteGuardSource(source, persistedBlocks)
 }
 
 func (s *AccountRouteGuardStore) ClearSource(source string) {
@@ -203,8 +207,9 @@ func (s *AccountRouteGuardStore) ClearSource(source string) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.clearSourceLocked(source)
+	s.mu.Unlock()
+	clearPersistedAccountRouteGuardSource(source)
 }
 
 func (s *AccountRouteGuardStore) ClearAuth(source string, authID string) {
@@ -217,9 +222,11 @@ func (s *AccountRouteGuardStore) ClearAuth(source string, authID string) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	affected := s.blocksForAuthLocked(source, authID)
 	s.removeLocked(source, authID)
 	s.removeLookupKeyLocked(source, authID)
+	s.mu.Unlock()
+	clearPersistedAccountRouteGuardAuth(source, authID, affected)
 }
 
 func (s *AccountRouteGuardStore) DenyIDsForCandidates(candidates []*coreauth.Auth) []string {
@@ -421,7 +428,9 @@ func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req gett
 	if store == nil {
 		store = defaultAccountRouteGuardStore
 	}
-	blocksByID := store.ActiveBlocksForCandidates(authCandidatesFromRouteContext(req))
+	candidates := authCandidatesFromRouteContext(req)
+	blocksByID := store.ActiveBlocksForCandidates(candidates)
+	blocksByID = mergeAccountRouteGuardBlocks(blocksByID, activePersistedChannelRuntimeBlocksForCandidates(candidates))
 	if len(blocksByID) == 0 {
 		return gettokensrouting.PolicyDecision{}
 	}
@@ -465,6 +474,23 @@ func accountRouteGuardDecisionReason(blocksByID map[string][]AccountRouteGuardBl
 		return base
 	}
 	return base + ": " + strings.Join(parts, "; ")
+}
+
+func mergeAccountRouteGuardBlocks(target map[string][]AccountRouteGuardBlock, extra map[string][]AccountRouteGuardBlock) map[string][]AccountRouteGuardBlock {
+	if len(extra) == 0 {
+		return target
+	}
+	if target == nil {
+		target = map[string][]AccountRouteGuardBlock{}
+	}
+	for id, blocks := range extra {
+		id = strings.TrimSpace(id)
+		if id == "" || len(blocks) == 0 {
+			continue
+		}
+		target[id] = append(target[id], blocks...)
+	}
+	return target
 }
 
 func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteGuardBlock {
@@ -559,6 +585,38 @@ func accountRouteGuardBlockKey(block AccountRouteGuardBlock) string {
 		return block.AuthID
 	}
 	return block.AccountKey
+}
+
+func (s *AccountRouteGuardStore) blocksForAuthLocked(source string, authID string) []AccountRouteGuardBlock {
+	source = strings.TrimSpace(source)
+	authID = strings.TrimSpace(authID)
+	if source == "" || authID == "" {
+		return nil
+	}
+	out := []AccountRouteGuardBlock{}
+	seen := map[string]struct{}{}
+	add := func(block AccountRouteGuardBlock) {
+		key := accountRouteGuardBlockKey(block)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, block)
+	}
+	if block, ok := s.blocks[source][authID]; ok {
+		add(block)
+	}
+	for _, lookupKey := range []string{authID, "auth-id:" + authID} {
+		for _, block := range s.lookup[lookupKey] {
+			if strings.TrimSpace(block.Source) == source {
+				add(block)
+			}
+		}
+	}
+	return out
 }
 
 func accountRouteGuardKeysForAuth(auth *coreauth.Auth) []string {

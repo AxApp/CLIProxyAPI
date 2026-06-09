@@ -2,7 +2,11 @@ package gettokenshooks
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -187,5 +191,251 @@ func TestAccountRouteGuardResultHookDoesNotClearManualDisabled(t *testing.T) {
 	store.ClearAuth(AccountRouteGuardSourceManualDisabled, authID)
 	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: authID, Provider: "codex"}}); len(got) != 0 {
 		t.Fatalf("DenyIDs after clearing manual-disabled = %#v, want empty", got)
+	}
+}
+
+func TestAccountRouteGuardPolicyDeniesCandidatesFromPersistedRuntimeStates(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": [],
+      "channelGroupStates": {}
+    }
+  },
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "auth-error": {
+          "source": "auth-error",
+          "reason": "token expired",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	decision := accountRouteGuardPolicy{store: NewAccountRouteGuardStore()}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Candidates: []gettokensrouting.RouteCandidate{
+			{
+				ID: "auth-a",
+				Value: &coreauth.Auth{
+					ID:         "auth-a",
+					AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+					Provider:   "codex",
+				},
+			},
+			{
+				ID: "auth-b",
+				Value: &coreauth.Auth{
+					ID:         "auth-b",
+					AccountKey: "acct_00000000-0000-4000-8000-000000000002",
+					Provider:   "codex",
+				},
+			},
+		},
+	})
+
+	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "auth-a" {
+		t.Fatalf("DenyIDs = %#v, want persisted blocked auth only", decision.DenyIDs)
+	}
+	if !strings.Contains(decision.Reason, "auth-error") {
+		t.Fatalf("Reason = %q, want persisted auth-error source", decision.Reason)
+	}
+}
+
+func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "manualRequestableAccountIDs": ["acct_manual"],
+      "orderedAccountIDs": [],
+      "accountGroups": [
+        {
+          "id": "group-default",
+          "name": "Default",
+          "enabled": true,
+          "accountIDs": ["acct_00000000-0000-4000-8000-000000000001"]
+        }
+      ],
+      "shadowEnabled": true,
+      "shadowRouteMode": "balanced",
+      "channelGroupStates": {}
+    }
+  },
+  "events": [
+    {
+      "id": "route-000001",
+      "recordedAt": "2026-06-09T10:00:00Z",
+      "channel": "codex",
+      "routeMode": "sequential",
+      "snapshotVersion": "snapshot-a",
+      "policyVersion": "channel-routing-v1",
+      "redacted": true
+    }
+  ],
+  "nextEventID": 1,
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "rate-limit": {
+          "source": "rate-limit",
+          "reason": "cooldown",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	store := NewAccountRouteGuardStore()
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceManualDisabled,
+		AuthID:     "auth-a",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Reason:     "disabled by user",
+	})
+
+	raw := readRouteGuardChannelRoutingConfig(t, configPath)
+	state, ok := raw.RuntimeStates["acct_00000000-0000-4000-8000-000000000001"]
+	if !ok {
+		t.Fatalf("runtimeStates missing persisted account key: %#v", raw.RuntimeStates)
+	}
+	if source := state.Sources[AccountRouteGuardSourceManualDisabled]; source.Source != AccountRouteGuardSourceManualDisabled {
+		t.Fatalf("persisted source = %#v, want manual-disabled", source)
+	}
+	if source := state.Sources[AccountRouteGuardSourceManualDisabled]; source.Reason != "disabled by user" {
+		t.Fatalf("persisted reason = %q, want disabled by user", source.Reason)
+	}
+	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
+		t.Fatalf("existing persisted rate-limit source = %#v, want preserved cooldown", source)
+	}
+	if raw.NextEventID != 1 {
+		t.Fatalf("nextEventID = %d, want preserved 1", raw.NextEventID)
+	}
+	if len(raw.Events) == 0 {
+		t.Fatalf("events = %s, want preserved route event", string(raw.Events))
+	}
+	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"manualRequestableAccountIDs"}, []string{"acct_manual"})
+	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"accountGroups", "0", "name"}, "Default")
+	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"shadowEnabled"}, true)
+	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"shadowRouteMode"}, "balanced")
+
+	store.ClearAuth(AccountRouteGuardSourceManualDisabled, "auth-a")
+
+	raw = readRouteGuardChannelRoutingConfig(t, configPath)
+	state, ok = raw.RuntimeStates["acct_00000000-0000-4000-8000-000000000001"]
+	if !ok {
+		t.Fatalf("runtimeStates after source clear = %#v, want account preserved for rate-limit", raw.RuntimeStates)
+	}
+	if _, ok := state.Sources[AccountRouteGuardSourceManualDisabled]; ok {
+		t.Fatalf("runtimeStates after source clear = %#v, want manual-disabled removed", state.Sources)
+	}
+	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
+		t.Fatalf("runtimeStates after source clear = %#v, want rate-limit preserved", state.Sources)
+	}
+}
+
+type routeGuardChannelRoutingConfig struct {
+	Channels      map[string]json.RawMessage                 `json:"channels"`
+	Events        json.RawMessage                            `json:"events"`
+	NextEventID   int                                        `json:"nextEventID"`
+	RuntimeStates map[string]routeGuardPersistedRuntimeState `json:"runtimeStates"`
+}
+
+type routeGuardPersistedRuntimeState struct {
+	Sources map[string]routeGuardPersistedRuntimeSource `json:"sources"`
+}
+
+type routeGuardPersistedRuntimeSource struct {
+	Source string `json:"source"`
+	Reason string `json:"reason"`
+}
+
+func writeRouteGuardChannelRoutingConfig(t *testing.T, body string) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(home, ".config", "gettokens-dev", "config.yaml")
+	channelConfigPath := filepath.Join(filepath.Dir(configPath), "channel-routing", "config.json")
+	if err := os.MkdirAll(filepath.Dir(channelConfigPath), 0o700); err != nil {
+		t.Fatalf("mkdir channel routing config: %v", err)
+	}
+	if err := os.WriteFile(channelConfigPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write channel routing config: %v", err)
+	}
+	return configPath
+}
+
+func setRouteGuardChannelRoutingConfigPathForTest(t *testing.T, configPath string) {
+	t.Helper()
+	channelRoutingPolicyConfigPathState.Lock()
+	previous := channelRoutingPolicyConfigPathState.path
+	channelRoutingPolicyConfigPathState.path = filepath.Join(filepath.Dir(configPath), "channel-routing", "config.json")
+	channelRoutingPolicyConfigPathState.Unlock()
+	t.Cleanup(func() {
+		channelRoutingPolicyConfigPathState.Lock()
+		channelRoutingPolicyConfigPathState.path = previous
+		channelRoutingPolicyConfigPathState.Unlock()
+	})
+}
+
+func readRouteGuardChannelRoutingConfig(t *testing.T, configPath string) routeGuardChannelRoutingConfig {
+	t.Helper()
+	path := filepath.Join(filepath.Dir(configPath), "channel-routing", "config.json")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read channel routing config: %v", err)
+	}
+	var cfg routeGuardChannelRoutingConfig
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		t.Fatalf("unmarshal channel routing config: %v", err)
+	}
+	if cfg.RuntimeStates == nil {
+		cfg.RuntimeStates = map[string]routeGuardPersistedRuntimeState{}
+	}
+	return cfg
+}
+
+func assertRouteGuardRawJSONPath(t *testing.T, raw json.RawMessage, path []string, want any) {
+	t.Helper()
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("unmarshal raw channel config: %v", err)
+	}
+	for _, part := range path {
+		switch node := value.(type) {
+		case map[string]any:
+			value = node[part]
+		case []any:
+			index, err := strconv.Atoi(part)
+			if err != nil || index < 0 || index >= len(node) {
+				t.Fatalf("invalid raw JSON array path %v at %q", path, part)
+			}
+			value = node[index]
+		default:
+			t.Fatalf("raw JSON path %v reached non-container %#v", path, value)
+		}
+	}
+	gotJSON, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal raw JSON path %v value: %v", path, err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal raw JSON path %v want: %v", path, err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("raw JSON path %v = %#v, want %#v", path, value, want)
 	}
 }

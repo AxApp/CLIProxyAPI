@@ -14,7 +14,10 @@ import (
 )
 
 type channelRoutingPolicyStore struct {
-	Channels map[string]channelRoutingPolicyConfig `json:"channels"`
+	Channels      map[string]json.RawMessage                     `json:"channels"`
+	Events        json.RawMessage                                `json:"events,omitempty"`
+	NextEventID   int                                            `json:"nextEventID,omitempty"`
+	RuntimeStates map[string]persistedChannelAccountRuntimeState `json:"runtimeStates,omitempty"`
 }
 
 type channelRoutingPolicyConfig struct {
@@ -87,8 +90,12 @@ func loadChannelRoutingPolicyConfig(channel string) (channelRoutingPolicyConfig,
 	if err := json.Unmarshal(body, &store); err != nil {
 		return channelRoutingPolicyConfig{}, false
 	}
-	cfg, ok := store.Channels[channel]
+	raw, ok := store.Channels[channel]
 	if !ok {
+		return channelRoutingPolicyConfig{}, false
+	}
+	var cfg channelRoutingPolicyConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return channelRoutingPolicyConfig{}, false
 	}
 	if strings.TrimSpace(cfg.Channel) == "" {
