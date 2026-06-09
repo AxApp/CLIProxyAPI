@@ -102,6 +102,74 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 }
 
+func TestServiceApplyCoreAuthAddOrUpdate_CredentialRefreshResetsStaleRuntimeState(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	authID := "service-credential-refresh-reset"
+	modelID := "stale-model"
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	staleRetry := time.Now().Add(30 * time.Minute)
+	if _, err := service.coreManager.Register(context.Background(), &coreauth.Auth{
+		ID:               authID,
+		Provider:         "codex",
+		Status:           coreauth.StatusError,
+		StatusMessage:    "token refresh failed",
+		Unavailable:      true,
+		LastError:        &coreauth.Error{Code: "unauthorized", HTTPStatus: 401, Message: "token refresh failed"},
+		LastRefreshedAt:  time.Now().Add(-24 * time.Hour),
+		NextRefreshAfter: staleRetry,
+		Metadata: map[string]any{
+			"refresh_token": "old-refresh-token",
+			"access_token":  "old-access-token",
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			modelID: {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "stale quota",
+				Unavailable:    true,
+				NextRetryAfter: staleRetry,
+				LastError:      &coreauth.Error{HTTPStatus: 429, Message: "quota"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed stale auth: %v", err)
+	}
+
+	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
+		ID:       authID,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"refresh_token": "new-refresh-token",
+			"access_token":  "new-access-token",
+			"last_refresh":  time.Now().Format(time.RFC3339),
+		},
+	})
+
+	updated, ok := service.coreManager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected refreshed auth to be present")
+	}
+	if updated.Status != coreauth.StatusActive || updated.Unavailable || updated.StatusMessage != "" || updated.LastError != nil {
+		t.Fatalf("refreshed auth state = status=%q unavailable=%v message=%q last_error=%v, want clean active", updated.Status, updated.Unavailable, updated.StatusMessage, updated.LastError)
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("expected NextRefreshAfter to reset after credential refresh, got %v", updated.NextRefreshAfter)
+	}
+	if !updated.LastRefreshedAt.IsZero() {
+		t.Fatalf("expected LastRefreshedAt to reset after credential refresh, got %v", updated.LastRefreshedAt)
+	}
+	if len(updated.ModelStates) != 0 {
+		t.Fatalf("expected ModelStates to reset after credential refresh, got %d entries", len(updated.ModelStates))
+	}
+}
+
 func TestForceHomeRuntimeConfigEnablesUsageStatistics(t *testing.T) {
 	cfg := &config.Config{
 		UsageStatisticsEnabled: false,

@@ -317,14 +317,18 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	var err error
 	wasRouteable := false
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
+		credentialsChanged := coreAuthCredentialsChanged(existing, auth)
 		auth.CreatedAt = existing.CreatedAt
 		wasRouteable = !existing.Disabled && existing.Status != coreauth.StatusDisabled
-		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
+		if !credentialsChanged && !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			auth.NextRefreshAfter = existing.NextRefreshAfter
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
+		}
+		if credentialsChanged {
+			resetCoreAuthRuntimeStateAfterCredentialChange(auth)
 		}
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)
@@ -353,6 +357,115 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+}
+
+func resetCoreAuthRuntimeStateAfterCredentialChange(auth *coreauth.Auth) {
+	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return
+	}
+	auth.Status = coreauth.StatusActive
+	auth.StatusMessage = ""
+	auth.Unavailable = false
+	auth.LastError = nil
+	auth.NextRefreshAfter = time.Time{}
+	auth.LastRefreshedAt = time.Time{}
+	auth.ModelStates = nil
+	auth.Quota = coreauth.QuotaState{}
+}
+
+func coreAuthCredentialsChanged(existing, next *coreauth.Auth) bool {
+	if existing == nil || next == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(existing.Provider), strings.TrimSpace(next.Provider)) {
+		return true
+	}
+	if next.AccountKey != "" && existing.AccountKey != "" && strings.TrimSpace(existing.AccountKey) != strings.TrimSpace(next.AccountKey) {
+		return true
+	}
+	for _, key := range []string{
+		"refresh_token",
+		"access_token",
+		"id_token",
+		"expired",
+		"expire",
+		"expires_at",
+		"expiresAt",
+		"expiry",
+		"expires",
+		"last_refresh",
+		"lastRefresh",
+		"last_refreshed_at",
+		"lastRefreshedAt",
+	} {
+		if metadataCredentialValueChanged(existing.Metadata, next.Metadata, key) {
+			return true
+		}
+	}
+	for _, key := range []string{
+		"api_key",
+		"base_url",
+		"prefix",
+		"proxy_url",
+		"project_id",
+		"quota_project_id",
+	} {
+		if attributeCredentialValueChanged(existing.Attributes, next.Attributes, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func metadataCredentialValueChanged(existing, next map[string]any, key string) bool {
+	oldValue, oldOK := metadataCredentialString(existing, key)
+	newValue, newOK := metadataCredentialString(next, key)
+	if !oldOK && !newOK {
+		return false
+	}
+	return oldValue != newValue
+}
+
+func metadataCredentialString(values map[string]any, key string) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	value, ok := values[key]
+	if !ok {
+		return "", false
+	}
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v), true
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String()), true
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return "", true
+		}
+		return string(raw), true
+	}
+}
+
+func attributeCredentialValueChanged(existing, next map[string]string, key string) bool {
+	oldValue, oldOK := attributeCredentialString(existing, key)
+	newValue, newOK := attributeCredentialString(next, key)
+	if !oldOK && !newOK {
+		return false
+	}
+	return oldValue != newValue
+}
+
+func attributeCredentialString(values map[string]string, key string) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	value, ok := values[key]
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(value), true
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
