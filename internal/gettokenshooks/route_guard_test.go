@@ -249,6 +249,50 @@ func TestAccountRouteGuardPolicyDeniesCandidatesFromPersistedRuntimeStates(t *te
 	}
 }
 
+func TestAccountRouteGuardPolicyIgnoresLegacyManualDisabledPersistedRuntimeState(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": [],
+      "channelGroupStates": {}
+    }
+  },
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "manual-disabled": {
+          "source": "manual-disabled",
+          "reason": "account disabled",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	decision := accountRouteGuardPolicy{store: NewAccountRouteGuardStore()}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Candidates: []gettokensrouting.RouteCandidate{
+			{
+				ID: "auth-a",
+				Value: &coreauth.Auth{
+					ID:         "auth-a",
+					AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+					Provider:   "codex",
+				},
+			},
+		},
+	})
+
+	if len(decision.DenyIDs) != 0 {
+		t.Fatalf("DenyIDs = %#v, want legacy persisted manual-disabled ignored", decision.DenyIDs)
+	}
+}
+
 func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *testing.T) {
 	configPath := writeRouteGuardChannelRoutingConfig(t, `{
   "channels": {
@@ -300,10 +344,10 @@ func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *tes
 
 	store := NewAccountRouteGuardStore()
 	store.MarkBlocked(AccountRouteGuardBlock{
-		Source:     AccountRouteGuardSourceManualDisabled,
+		Source:     AccountRouteGuardSourceAuthError,
 		AuthID:     "auth-a",
 		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
-		Reason:     "disabled by user",
+		Reason:     "token expired",
 	})
 
 	raw := readRouteGuardChannelRoutingConfig(t, configPath)
@@ -311,11 +355,11 @@ func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *tes
 	if !ok {
 		t.Fatalf("runtimeStates missing persisted account key: %#v", raw.RuntimeStates)
 	}
-	if source := state.Sources[AccountRouteGuardSourceManualDisabled]; source.Source != AccountRouteGuardSourceManualDisabled {
-		t.Fatalf("persisted source = %#v, want manual-disabled", source)
+	if source := state.Sources[AccountRouteGuardSourceAuthError]; source.Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("persisted source = %#v, want auth-error", source)
 	}
-	if source := state.Sources[AccountRouteGuardSourceManualDisabled]; source.Reason != "disabled by user" {
-		t.Fatalf("persisted reason = %q, want disabled by user", source.Reason)
+	if source := state.Sources[AccountRouteGuardSourceAuthError]; source.Reason != "token expired" {
+		t.Fatalf("persisted reason = %q, want token expired", source.Reason)
 	}
 	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
 		t.Fatalf("existing persisted rate-limit source = %#v, want preserved cooldown", source)
@@ -331,18 +375,69 @@ func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *tes
 	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"shadowEnabled"}, true)
 	assertRouteGuardRawJSONPath(t, raw.Channels["codex"], []string{"shadowRouteMode"}, "balanced")
 
-	store.ClearAuth(AccountRouteGuardSourceManualDisabled, "auth-a")
+	store.ClearAuth(AccountRouteGuardSourceAuthError, "auth-a")
 
 	raw = readRouteGuardChannelRoutingConfig(t, configPath)
 	state, ok = raw.RuntimeStates["acct_00000000-0000-4000-8000-000000000001"]
 	if !ok {
 		t.Fatalf("runtimeStates after source clear = %#v, want account preserved for rate-limit", raw.RuntimeStates)
 	}
-	if _, ok := state.Sources[AccountRouteGuardSourceManualDisabled]; ok {
-		t.Fatalf("runtimeStates after source clear = %#v, want manual-disabled removed", state.Sources)
+	if _, ok := state.Sources[AccountRouteGuardSourceAuthError]; ok {
+		t.Fatalf("runtimeStates after source clear = %#v, want auth-error removed", state.Sources)
 	}
 	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
 		t.Fatalf("runtimeStates after source clear = %#v, want rate-limit preserved", state.Sources)
+	}
+}
+
+func TestAccountRouteGuardStoreDoesNotPersistManualDisabledRuntimeState(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": [],
+      "channelGroupStates": {}
+    }
+  },
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "rate-limit": {
+          "source": "rate-limit",
+          "reason": "cooldown",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	store := NewAccountRouteGuardStore()
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceManualDisabled,
+		AuthID:     "auth-a",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Reason:     "disabled by user",
+	})
+
+	raw := readRouteGuardChannelRoutingConfig(t, configPath)
+	state := raw.RuntimeStates["acct_00000000-0000-4000-8000-000000000001"]
+	if _, ok := state.Sources[AccountRouteGuardSourceManualDisabled]; ok {
+		t.Fatalf("manual-disabled source should not be persisted: %#v", state.Sources)
+	}
+	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
+		t.Fatalf("rate-limit source = %#v, want preserved cooldown", source)
+	}
+	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "auth-a",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != "auth-a" {
+		t.Fatalf("in-memory DenyIDs = %#v, want immediate manual-disabled block", got)
 	}
 }
 

@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -198,8 +199,50 @@ func (s *Service) refreshAccountStoreAuths(ctx context.Context) error {
 	}
 	if s.coreManager != nil && s.cfg != nil {
 		s.coreManager.SetConfig(s.cfg)
+		s.refreshAccountStoreAuthsWithoutWatcher(ctx)
 	}
 	return nil
+}
+
+func (s *Service) refreshAccountStoreAuthsWithoutWatcher(ctx context.Context) {
+	if s == nil || s.coreManager == nil || s.cfg == nil {
+		return
+	}
+	synth := synthesizer.NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&synthesizer.SynthesisContext{
+		Config:      s.cfg,
+		AuthDir:     s.cfg.AuthDir,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	})
+	if err != nil {
+		log.Warnf("failed to synthesize account-store auths without watcher: %v", err)
+		return
+	}
+	desired := make(map[string]*coreauth.Auth)
+	for _, auth := range auths {
+		if !isAccountStoreRuntimeAuth(auth) {
+			continue
+		}
+		desired[auth.ID] = auth
+		s.applyCoreAuthAddOrUpdate(ctx, auth)
+	}
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || !isAccountStoreRuntimeAuth(auth) {
+			continue
+		}
+		if _, ok := desired[auth.ID]; ok {
+			continue
+		}
+		s.applyCoreAuthRemoval(ctx, auth.ID)
+	}
+}
+
+func isAccountStoreRuntimeAuth(auth *coreauth.Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Attributes["source"]), "account-store:")
 }
 
 func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdate) {

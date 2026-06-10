@@ -270,6 +270,11 @@ func (h *Handler) GetAccountModels(c *gin.Context) {
 	}
 
 	models := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	if len(models) == 0 {
+		if fallbackModels := h.accountStoreCodexDefaultModels(c.Request.Context(), accountKey); len(fallbackModels) > 0 {
+			models = fallbackModels
+		}
+	}
 	result := make([]gin.H, 0, len(models))
 	for _, m := range models {
 		entry := gin.H{"id": m.ID}
@@ -285,6 +290,39 @@ func (h *Handler) GetAccountModels(c *gin.Context) {
 		result = append(result, entry)
 	}
 	c.JSON(http.StatusOK, gin.H{"models": result})
+}
+
+func (h *Handler) accountStoreCodexDefaultModels(ctx context.Context, accountKey string) []*registry.ModelInfo {
+	if h == nil || strings.TrimSpace(accountKey) == "" {
+		return nil
+	}
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		return nil
+	}
+	account, err := store.GetAccount(ctx, accountKey)
+	if err != nil || account.Kind != accountstore.KindCodexAPIKey || account.CodexAPIKey == nil {
+		return nil
+	}
+	if account.Disabled {
+		return nil
+	}
+	if !accountStoreCodexModelsEmpty(account.CodexAPIKey.ModelsJSON) {
+		return nil
+	}
+	return registry.GetCodexProModels()
+}
+
+func accountStoreCodexModelsEmpty(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+	var models []any
+	if err := json.Unmarshal([]byte(raw), &models); err != nil {
+		return false
+	}
+	return len(models) == 0
 }
 
 func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {

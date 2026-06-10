@@ -85,7 +85,7 @@ func accountRouteGuardBlocksFromPersistedState(key string, state persistedChanne
 	for sourceKey, source := range state.Sources {
 		source.Source = firstNonEmptyRouteGuardString(source.Source, sourceKey)
 		source.Source = strings.TrimSpace(source.Source)
-		if source.Source == "" {
+		if source.Source == "" || !isPersistedChannelRuntimeSourceRouteBlocking(source.Source) {
 			continue
 		}
 		expiresAt := parseRouteGuardTime(source.ExpiresAt)
@@ -123,7 +123,7 @@ func accountRouteGuardBlocksFromPersistedState(key string, state persistedChanne
 func persistAccountRouteGuardBlock(block AccountRouteGuardBlock) {
 	block = normalizeAccountRouteGuardBlock(block)
 	accountID := persistedAccountRuntimeIDForBlock(block)
-	if accountID == "" || block.Source == "" {
+	if accountID == "" || block.Source == "" || !isPersistedChannelRuntimeSourceRouteBlocking(block.Source) {
 		return
 	}
 	channelRoutingRuntimeStateFileMu.Lock()
@@ -159,6 +159,10 @@ func replacePersistedAccountRouteGuardSource(source string, blocks []AccountRout
 		return
 	}
 	removePersistedRouteGuardSourceLocked(store.RuntimeStates, source)
+	if !isPersistedChannelRuntimeSourceRouteBlocking(source) {
+		_ = writeChannelRoutingPolicyStore(path, store)
+		return
+	}
 	if store.RuntimeStates == nil {
 		store.RuntimeStates = map[string]persistedChannelAccountRuntimeState{}
 	}
@@ -315,6 +319,15 @@ func writeChannelRoutingPolicyStore(path string, store channelRoutingPolicyStore
 		return err
 	}
 	return os.WriteFile(path, body, 0o600)
+}
+
+func isPersistedChannelRuntimeSourceRouteBlocking(source string) bool {
+	switch strings.TrimSpace(source) {
+	case "", AccountRouteGuardSourceManualDisabled:
+		return false
+	default:
+		return true
+	}
 }
 
 func persistedRuntimeSourceFromRouteGuardBlock(block AccountRouteGuardBlock) persistedChannelRuntimeStateSource {

@@ -102,6 +102,59 @@ func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeSt
 	}
 }
 
+func TestServiceRefreshAccountStoreAuthsWithoutWatcherRegistersCodexAPIKeyModels(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/accounts-v1.sqlite"
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "DB Codex",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:     "sk-db-codex",
+			BaseURL:    "https://codex.example.com/v1",
+			ModelsJSON: `[]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	if err := service.refreshAccountStoreAuths(ctx); err != nil {
+		t.Fatalf("refresh account-store auths: %v", err)
+	}
+
+	var authID string
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == account.AccountKey {
+			authID = auth.ID
+			break
+		}
+	}
+	if authID == "" {
+		t.Fatalf("expected account-store codex auth for %s to be registered", account.AccountKey)
+	}
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
+		t.Fatalf("account-store codex auth %s should support default Codex model gpt-5.5", authID)
+	}
+}
+
 func TestServiceApplyCoreAuthAddOrUpdate_CredentialRefreshResetsStaleRuntimeState(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

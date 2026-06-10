@@ -52,6 +52,57 @@ func TestOpenAccountStoreReusesInitializedStoreWhenExternalWriterHoldsLock(t *te
 	}
 }
 
+func TestGetAccountModelsFallsBackToCodexDefaultsForAccountStoreAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+
+	store, err := h.openAccountStore(ctx)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Company 1",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:     "sk-company",
+			BaseURL:    "https://codex.example.com/v1",
+			ModelsJSON: `[]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	router := gin.New()
+	router.GET("/v0/management/accounts/:account_key/models", h.GetAccountModels)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/accounts/"+account.AccountKey+"/models", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, model := range body.Models {
+		if model.ID == "gpt-5.5" {
+			return
+		}
+	}
+	t.Fatalf("expected default Codex model gpt-5.5, got %+v", body.Models)
+}
+
 func TestPurgeSoftDeletedAccountsOnceHardDeletesExpiredRows(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
