@@ -246,6 +246,75 @@ func TestRateLimitEvaluatorBlocksTokenWindowRule(t *testing.T) {
 	}
 }
 
+func TestRateLimitEvaluatorTokenWindowIgnoresFailedUsageTokens(t *testing.T) {
+	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	if err := store.upsertRule(RateLimitRule{
+		ID:         "rule-token-success-only",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyTokenWindow,
+		Window:     "24h",
+		LimitValue: 500,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now); err != nil {
+		t.Fatalf("upsert token rule: %v", err)
+	}
+	events := []usageAttributionEvent{
+		{
+			ID:                "successful-token-event",
+			CompletedAtUnixMs: now.Add(2 * time.Minute).UnixMilli(),
+			AttributionKey:    "auth-id:codex:apikey:abc123",
+			AttributionKind:   "auth_id",
+			AccountKey:        accountKey,
+			Provider:          "codex",
+			RequestedModel:    "gpt-5.4",
+			TotalTokens:       100,
+			EvidenceKind:      "auth_id",
+		},
+		{
+			ID:                "failed-token-event",
+			CompletedAtUnixMs: now.Add(3 * time.Minute).UnixMilli(),
+			AttributionKey:    "auth-id:codex:apikey:abc123",
+			AttributionKind:   "auth_id",
+			AccountKey:        accountKey,
+			Provider:          "codex",
+			RequestedModel:    "gpt-5.4",
+			StatusCode:        http.StatusTooManyRequests,
+			Failed:            true,
+			TotalTokens:       900,
+			EvidenceKind:      "auth_id",
+		},
+	}
+	for _, event := range events {
+		if err := store.insertUsageAttributionEvent(event); err != nil {
+			t.Fatalf("insert event %s: %v", event.ID, err)
+		}
+	}
+
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return now.Add(30 * time.Minute) },
+	})
+	if err := evaluator.EvaluateNow(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	state, ok := evaluator.StateForAccount(accountKey)
+	if !ok {
+		t.Fatal("missing account state")
+	}
+	if state.Blocked {
+		t.Fatalf("state = %#v, failed usage tokens should not trip token-window", state)
+	}
+	if got := state.Rules[0].CurrentUsage; got != 100 {
+		t.Fatalf("current usage = %d, want only successful token usage", got)
+	}
+}
+
 func TestRateLimitEvaluatorCalendarDayWindowStartsAtLocalMidnight(t *testing.T) {
 	store, err := newRateLimitStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {

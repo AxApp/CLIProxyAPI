@@ -297,7 +297,8 @@ func (rateLimitTokenWindowStrategy) UsageForRule(ctx context.Context, store *rat
 		ctx,
 		`SELECT COALESCE(SUM(total_tokens), 0) FROM usage_attribution_events
 		  WHERE completed_at_unix_ms >= ?
-		    AND account_key = ?`,
+		    AND account_key = ?
+		    AND failed = 0`,
 		since,
 		rule.AccountKey,
 	).Scan(&total)
