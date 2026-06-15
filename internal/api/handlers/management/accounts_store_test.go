@@ -103,6 +103,48 @@ func TestGetAccountModelsFallsBackToCodexDefaultsForAccountStoreAPIKey(t *testin
 	t.Fatalf("expected default Codex model gpt-5.5, got %+v", body.Models)
 }
 
+func TestCreateAccountMarksAppliedNotRegisteredWhenRuntimeAuthMissing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+	h.SetAccountStoreApplyHook(func(context.Context) error { return nil })
+
+	router := gin.New()
+	router.POST("/v0/management/accounts", h.CreateAccount)
+
+	createBody := []byte(`{
+		"kind":"codex-api-key",
+		"title":"Company 1",
+		"provider":"codex",
+		"credential":{"api_key":"sk-company","base_url":"https://codex.example.com/v1"}
+	}`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts", bytes.NewReader(createBody)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("create status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var created struct {
+		AccountKey                string `json:"account_key"`
+		RuntimeApplyStatus        string `json:"runtime_apply_status"`
+		RuntimeRouteabilityStatus string `json:"runtime_routeability_status"`
+		RuntimeRouteabilityReason string `json:"runtime_routeability_reason"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+	if created.RuntimeApplyStatus != "applied" {
+		t.Fatalf("runtime apply = %q, want applied", created.RuntimeApplyStatus)
+	}
+	if created.RuntimeRouteabilityStatus != "applied_not_registered" {
+		t.Fatalf("runtime routeability status = %q, want applied_not_registered", created.RuntimeRouteabilityStatus)
+	}
+	if created.RuntimeRouteabilityReason == "" {
+		t.Fatalf("runtime routeability reason should not be empty: %s", recorder.Body.String())
+	}
+}
+
 func TestPurgeSoftDeletedAccountsOnceHardDeletesExpiredRows(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

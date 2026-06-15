@@ -258,6 +258,14 @@ func (m *Manager) snapshotAuths() []*Auth {
 	return out
 }
 
+// SnapshotAuths returns a clone-only snapshot of all registered runtime auths.
+func (m *Manager) SnapshotAuths() []*Auth {
+	if m == nil {
+		return nil
+	}
+	return m.snapshotAuths()
+}
+
 // RefreshSchedulerEntry re-upserts a single auth into the scheduler so that its
 // supportedModelSet is rebuilt from the current global model registry state.
 // This must be called after models have been registered for a newly added auth,
@@ -3298,7 +3306,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	if rewritten, active := rewriteAuthCandidates(ctx, routeRequest{
+	if rewritten, result, active := rewriteAuthCandidates(ctx, routeRequest{
 		Provider: strings.TrimSpace(strings.ToLower(provider)),
 		Model:    model,
 		Options:  opts,
@@ -3306,6 +3314,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		Now:      time.Now(),
 	}, available); active {
 		available = rewritten
+		recordRouteDecision(routeRequest{
+			Provider: strings.TrimSpace(strings.ToLower(provider)),
+			Model:    model,
+			Options:  opts,
+			Tried:    tried,
+			Now:      time.Now(),
+		}, "legacy-routing-policy", result, nil, nil)
 		if len(available) == 0 {
 			m.mu.RUnlock()
 			return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available after routing policy"}
@@ -3467,7 +3482,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	if rewritten, active := rewriteAuthCandidates(ctx, routeRequest{
+	if rewritten, result, active := rewriteAuthCandidates(ctx, routeRequest{
 		Provider:  "mixed",
 		Providers: normalizedProviders,
 		Model:     model,
@@ -3476,6 +3491,14 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		Now:       time.Now(),
 	}, available); active {
 		available = rewritten
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: normalizedProviders,
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "legacy-mixed-routing-policy", result, nil, nil)
 		if len(available) == 0 {
 			m.mu.RUnlock()
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available after routing policy"}

@@ -128,6 +128,39 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	if err := ensureTextColumn(ctx, s.db, "codex_api_key_accounts", "platform_cookie", "''"); err != nil {
 		return fmt.Errorf("ensure codex api key platform cookie column: %w", err)
 	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "routeability_status", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime routeability status column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "routeability_reason", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime routeability reason column: %w", err)
+	}
+	if err := ensureIntegerColumn(ctx, s.db, "account_runtime_apply_state", "registered_models_count", "0"); err != nil {
+		return fmt.Errorf("ensure account runtime registered models count column: %w", err)
+	}
+	if err := ensureIntegerColumn(ctx, s.db, "account_runtime_apply_state", "last_reconcile_at_unix_ms", "0"); err != nil {
+		return fmt.Errorf("ensure account runtime reconcile time column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "failure_class", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime failure class column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "repair_outcome", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime repair outcome column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "repair_action", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime repair action column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "repair_trigger_status", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime repair trigger status column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "repair_trigger_class", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime repair trigger class column: %w", err)
+	}
+	if err := ensureTextColumn(ctx, s.db, "account_runtime_apply_state", "repair_trigger_reason", "''"); err != nil {
+		return fmt.Errorf("ensure account runtime repair trigger reason column: %w", err)
+	}
+	if err := ensureIntegerColumn(ctx, s.db, "account_runtime_apply_state", "last_repair_at_unix_ms", "0"); err != nil {
+		return fmt.Errorf("ensure account runtime repair time column: %w", err)
+	}
 	now := fmt.Sprintf("%d", time.Now().UnixMilli())
 	_, err := s.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO account_store_meta(key, value) VALUES
@@ -331,6 +364,17 @@ CREATE TABLE IF NOT EXISTS account_runtime_apply_state (
   revision INTEGER NOT NULL,
   status TEXT NOT NULL,
   last_error TEXT NOT NULL DEFAULT '',
+  routeability_status TEXT NOT NULL DEFAULT '',
+  routeability_reason TEXT NOT NULL DEFAULT '',
+  registered_models_count INTEGER NOT NULL DEFAULT 0,
+  last_reconcile_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+  failure_class TEXT NOT NULL DEFAULT '',
+  repair_outcome TEXT NOT NULL DEFAULT '',
+  repair_action TEXT NOT NULL DEFAULT '',
+  repair_trigger_status TEXT NOT NULL DEFAULT '',
+  repair_trigger_class TEXT NOT NULL DEFAULT '',
+  repair_trigger_reason TEXT NOT NULL DEFAULT '',
+  last_repair_at_unix_ms INTEGER NOT NULL DEFAULT 0,
   applied_at_unix_ms INTEGER NOT NULL DEFAULT 0,
   updated_at_unix_ms INTEGER NOT NULL
 );

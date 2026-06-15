@@ -14,20 +14,31 @@ type accountStoreQueryer interface {
 }
 
 type AccountRecord struct {
-	AccountKey         string           `json:"account_key"`
-	Kind               AccountKind      `json:"kind"`
-	Title              string           `json:"title"`
-	Provider           string           `json:"provider"`
-	CredentialSource   CredentialSource `json:"credential_source"`
-	Priority           int              `json:"priority"`
-	Disabled           bool             `json:"disabled"`
-	Revision           int              `json:"revision"`
-	MetadataJSON       string           `json:"metadata_json"`
-	CreatedAtUnixMs    int64            `json:"created_at_unix_ms"`
-	UpdatedAtUnixMs    int64            `json:"updated_at_unix_ms"`
-	DeletedAtUnixMs    int64            `json:"deleted_at_unix_ms,omitempty"`
-	RuntimeApplyStatus string           `json:"runtime_apply_status,omitempty"`
-	RuntimeApplyError  string           `json:"runtime_apply_error,omitempty"`
+	AccountKey                   string           `json:"account_key"`
+	Kind                         AccountKind      `json:"kind"`
+	Title                        string           `json:"title"`
+	Provider                     string           `json:"provider"`
+	CredentialSource             CredentialSource `json:"credential_source"`
+	Priority                     int              `json:"priority"`
+	Disabled                     bool             `json:"disabled"`
+	Revision                     int              `json:"revision"`
+	MetadataJSON                 string           `json:"metadata_json"`
+	CreatedAtUnixMs              int64            `json:"created_at_unix_ms"`
+	UpdatedAtUnixMs              int64            `json:"updated_at_unix_ms"`
+	DeletedAtUnixMs              int64            `json:"deleted_at_unix_ms,omitempty"`
+	RuntimeApplyStatus           string           `json:"runtime_apply_status,omitempty"`
+	RuntimeApplyError            string           `json:"runtime_apply_error,omitempty"`
+	RuntimeRouteabilityStatus    string           `json:"runtime_routeability_status,omitempty"`
+	RuntimeRouteabilityReason    string           `json:"runtime_routeability_reason,omitempty"`
+	RuntimeRegisteredModelsCount int              `json:"runtime_registered_models_count,omitempty"`
+	LastRuntimeReconcileAtUnixMs int64            `json:"last_runtime_reconcile_at_unix_ms,omitempty"`
+	RuntimeFailureClass          string           `json:"runtime_failure_class,omitempty"`
+	RuntimeRepairOutcome         string           `json:"runtime_repair_outcome,omitempty"`
+	RuntimeRepairAction          string           `json:"runtime_repair_action,omitempty"`
+	RuntimeRepairTriggerStatus   string           `json:"runtime_repair_trigger_status,omitempty"`
+	RuntimeRepairTriggerClass    string           `json:"runtime_repair_trigger_class,omitempty"`
+	RuntimeRepairTriggerReason   string           `json:"runtime_repair_trigger_reason,omitempty"`
+	LastRuntimeRepairAtUnixMs    int64            `json:"last_runtime_repair_at_unix_ms,omitempty"`
 
 	AuthFile         *AuthFileCredential         `json:"auth_file,omitempty"`
 	CodexAPIKey      *CodexAPIKeyCredential      `json:"codex_api_key,omitempty"`
@@ -215,7 +226,18 @@ SELECT
   c.updated_at_unix_ms,
   COALESCE(c.deleted_at_unix_ms, 0),
   COALESCE(a.status, ''),
-  COALESCE(a.last_error, '')
+  COALESCE(a.last_error, ''),
+  COALESCE(a.routeability_status, ''),
+  COALESCE(a.routeability_reason, ''),
+  COALESCE(a.registered_models_count, 0),
+  COALESCE(a.last_reconcile_at_unix_ms, 0),
+  COALESCE(a.failure_class, ''),
+  COALESCE(a.repair_outcome, ''),
+  COALESCE(a.repair_action, ''),
+  COALESCE(a.repair_trigger_status, ''),
+  COALESCE(a.repair_trigger_class, ''),
+  COALESCE(a.repair_trigger_reason, ''),
+  COALESCE(a.last_repair_at_unix_ms, 0)
 FROM account_cards c
 LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
 WHERE c.account_key = ? AND c.deleted_at_unix_ms IS NULL`, accountKey).Scan(
@@ -233,6 +255,17 @@ WHERE c.account_key = ? AND c.deleted_at_unix_ms IS NULL`, accountKey).Scan(
 		&account.DeletedAtUnixMs,
 		&account.RuntimeApplyStatus,
 		&account.RuntimeApplyError,
+		&account.RuntimeRouteabilityStatus,
+		&account.RuntimeRouteabilityReason,
+		&account.RuntimeRegisteredModelsCount,
+		&account.LastRuntimeReconcileAtUnixMs,
+		&account.RuntimeFailureClass,
+		&account.RuntimeRepairOutcome,
+		&account.RuntimeRepairAction,
+		&account.RuntimeRepairTriggerStatus,
+		&account.RuntimeRepairTriggerClass,
+		&account.RuntimeRepairTriggerReason,
+		&account.LastRuntimeRepairAtUnixMs,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AccountRecord{}, fmt.Errorf("account %s not found", accountKey)
@@ -310,7 +343,18 @@ SELECT
   c.updated_at_unix_ms,
   COALESCE(c.deleted_at_unix_ms, 0),
   COALESCE(a.status, ''),
-  COALESCE(a.last_error, '')
+  COALESCE(a.last_error, ''),
+  COALESCE(a.routeability_status, ''),
+  COALESCE(a.routeability_reason, ''),
+  COALESCE(a.registered_models_count, 0),
+  COALESCE(a.last_reconcile_at_unix_ms, 0),
+  COALESCE(a.failure_class, ''),
+  COALESCE(a.repair_outcome, ''),
+  COALESCE(a.repair_action, ''),
+  COALESCE(a.repair_trigger_status, ''),
+  COALESCE(a.repair_trigger_class, ''),
+  COALESCE(a.repair_trigger_reason, ''),
+  COALESCE(a.last_repair_at_unix_ms, 0)
 FROM account_cards c
 LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
 WHERE c.deleted_at_unix_ms IS NULL
@@ -336,6 +380,17 @@ WHERE c.deleted_at_unix_ms IS NULL
 				&account.DeletedAtUnixMs,
 				&account.RuntimeApplyStatus,
 				&account.RuntimeApplyError,
+				&account.RuntimeRouteabilityStatus,
+				&account.RuntimeRouteabilityReason,
+				&account.RuntimeRegisteredModelsCount,
+				&account.LastRuntimeReconcileAtUnixMs,
+				&account.RuntimeFailureClass,
+				&account.RuntimeRepairOutcome,
+				&account.RuntimeRepairAction,
+				&account.RuntimeRepairTriggerStatus,
+				&account.RuntimeRepairTriggerClass,
+				&account.RuntimeRepairTriggerReason,
+				&account.LastRuntimeRepairAtUnixMs,
 			); err != nil {
 				_ = rows.Close()
 				return nil, fmt.Errorf("scan account: %w", err)
@@ -597,11 +652,24 @@ func (s *Store) MarkRuntimeApplyResult(ctx context.Context, accountKey string, r
 	}
 	_, err := s.db.ExecContext(ctx, `
 UPDATE account_runtime_apply_state
-SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?
+SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?,
+    routeability_status = CASE WHEN ? = 'failed' THEN 'degraded' ELSE routeability_status END,
+    routeability_reason = CASE WHEN ? = 'failed' THEN ? ELSE routeability_reason END,
+    failure_class = CASE WHEN ? = 'failed' THEN 'runtime_apply_failed' WHEN ? = 'applied' THEN '' ELSE failure_class END,
+    registered_models_count = CASE WHEN ? = 'failed' THEN 0 ELSE registered_models_count END,
+    last_reconcile_at_unix_ms = CASE WHEN ? = 'failed' THEN ? ELSE last_reconcile_at_unix_ms END
 WHERE account_key = ? AND revision = ?`,
 		status,
 		strings.TrimSpace(lastError),
 		appliedAt,
+		now,
+		status,
+		status,
+		strings.TrimSpace(lastError),
+		status,
+		status,
+		status,
+		status,
 		now,
 		accountKey,
 		revision,
@@ -633,7 +701,12 @@ func (s *Store) MarkPendingRuntimeApplyResults(ctx context.Context, status strin
 	}
 	_, err := s.db.ExecContext(ctx, `
 UPDATE account_runtime_apply_state
-SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?
+SET status = ?, last_error = ?, applied_at_unix_ms = ?, updated_at_unix_ms = ?,
+    routeability_status = CASE WHEN ? = 'failed' THEN 'degraded' WHEN ? = 'applied' THEN 'pending' ELSE routeability_status END,
+    routeability_reason = CASE WHEN ? = 'failed' THEN ? ELSE '' END,
+    failure_class = CASE WHEN ? = 'failed' THEN 'runtime_apply_failed' ELSE '' END,
+    registered_models_count = 0,
+    last_reconcile_at_unix_ms = CASE WHEN ? = 'failed' THEN ? ELSE 0 END
 WHERE status = 'pending'
   AND EXISTS (
     SELECT 1
@@ -646,9 +719,98 @@ WHERE status = 'pending'
 		strings.TrimSpace(lastError),
 		appliedAt,
 		now,
+		status,
+		status,
+		status,
+		strings.TrimSpace(lastError),
+		status,
+		status,
+		now,
 	)
 	if err != nil {
 		return fmt.Errorf("mark pending runtime apply results: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkRuntimeRouteability(ctx context.Context, accountKey string, revision int, status string, reason string, failureClass string, registeredModelsCount int) error {
+	if s == nil || s.db == nil {
+		return errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return fmt.Errorf("invalid account key %q", accountKey)
+	}
+	status = strings.TrimSpace(status)
+	switch status {
+	case "pending", "applied_not_registered", "registered_routeable", "degraded":
+	default:
+		return fmt.Errorf("invalid runtime routeability status %q", status)
+	}
+	if registeredModelsCount < 0 {
+		registeredModelsCount = 0
+	}
+	now := unixMs()
+	_, err := s.db.ExecContext(ctx, `
+UPDATE account_runtime_apply_state
+SET routeability_status = ?, routeability_reason = ?, failure_class = ?, registered_models_count = ?, last_reconcile_at_unix_ms = ?, updated_at_unix_ms = ?
+WHERE account_key = ? AND revision = ?`,
+		status,
+		strings.TrimSpace(reason),
+		strings.TrimSpace(failureClass),
+		registeredModelsCount,
+		now,
+		now,
+		accountKey,
+		revision,
+	)
+	if err != nil {
+		return fmt.Errorf("mark runtime routeability %s: %w", accountKey, err)
+	}
+	return nil
+}
+
+func (s *Store) MarkRuntimeRepairResult(ctx context.Context, accountKey string, revision int, outcome string, action string, triggerStatus string, triggerClass string, triggerReason string) error {
+	if s == nil || s.db == nil {
+		return errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return fmt.Errorf("invalid account key %q", accountKey)
+	}
+	outcome = strings.TrimSpace(outcome)
+	switch outcome {
+	case "recovered", "failed":
+	default:
+		return fmt.Errorf("invalid runtime repair outcome %q", outcome)
+	}
+	action = strings.TrimSpace(action)
+	switch action {
+	case "watcher_refresh", "resynthesize_refresh":
+	default:
+		return fmt.Errorf("invalid runtime repair action %q", action)
+	}
+	now := unixMs()
+	_, err := s.db.ExecContext(ctx, `
+UPDATE account_runtime_apply_state
+SET repair_outcome = ?, repair_action = ?, repair_trigger_status = ?, repair_trigger_class = ?, repair_trigger_reason = ?, last_repair_at_unix_ms = ?, updated_at_unix_ms = ?
+WHERE account_key = ? AND revision = ?`,
+		outcome,
+		action,
+		strings.TrimSpace(triggerStatus),
+		strings.TrimSpace(triggerClass),
+		strings.TrimSpace(triggerReason),
+		now,
+		now,
+		accountKey,
+		revision,
+	)
+	if err != nil {
+		return fmt.Errorf("mark runtime repair result %s: %w", accountKey, err)
 	}
 	return nil
 }
@@ -839,7 +1001,18 @@ SELECT
   c.updated_at_unix_ms,
   COALESCE(c.deleted_at_unix_ms, 0),
   COALESCE(a.status, ''),
-  COALESCE(a.last_error, '')
+  COALESCE(a.last_error, ''),
+  COALESCE(a.routeability_status, ''),
+  COALESCE(a.routeability_reason, ''),
+  COALESCE(a.registered_models_count, 0),
+  COALESCE(a.last_reconcile_at_unix_ms, 0),
+  COALESCE(a.failure_class, ''),
+  COALESCE(a.repair_outcome, ''),
+  COALESCE(a.repair_action, ''),
+  COALESCE(a.repair_trigger_status, ''),
+  COALESCE(a.repair_trigger_class, ''),
+  COALESCE(a.repair_trigger_reason, ''),
+  COALESCE(a.last_repair_at_unix_ms, 0)
 FROM account_cards c
 LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
 WHERE c.deleted_at_unix_ms IS NULL
@@ -867,6 +1040,17 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 			&account.DeletedAtUnixMs,
 			&account.RuntimeApplyStatus,
 			&account.RuntimeApplyError,
+			&account.RuntimeRouteabilityStatus,
+			&account.RuntimeRouteabilityReason,
+			&account.RuntimeRegisteredModelsCount,
+			&account.LastRuntimeReconcileAtUnixMs,
+			&account.RuntimeFailureClass,
+			&account.RuntimeRepairOutcome,
+			&account.RuntimeRepairAction,
+			&account.RuntimeRepairTriggerStatus,
+			&account.RuntimeRepairTriggerClass,
+			&account.RuntimeRepairTriggerReason,
+			&account.LastRuntimeRepairAtUnixMs,
 		); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan account: %w", err)
@@ -921,7 +1105,18 @@ SELECT
   c.updated_at_unix_ms,
   COALESCE(c.deleted_at_unix_ms, 0),
   COALESCE(a.status, ''),
-  COALESCE(a.last_error, '')
+  COALESCE(a.last_error, ''),
+  COALESCE(a.routeability_status, ''),
+  COALESCE(a.routeability_reason, ''),
+  COALESCE(a.registered_models_count, 0),
+  COALESCE(a.last_reconcile_at_unix_ms, 0),
+  COALESCE(a.failure_class, ''),
+  COALESCE(a.repair_outcome, ''),
+  COALESCE(a.repair_action, ''),
+  COALESCE(a.repair_trigger_status, ''),
+  COALESCE(a.repair_trigger_class, ''),
+  COALESCE(a.repair_trigger_reason, ''),
+  COALESCE(a.last_repair_at_unix_ms, 0)
 FROM account_cards c
 LEFT JOIN account_runtime_apply_state a ON a.account_key = c.account_key
 WHERE c.deleted_at_unix_ms IS NULL
@@ -949,6 +1144,17 @@ ORDER BY c.priority DESC, c.created_at_unix_ms ASC, c.account_key ASC`)
 			&account.DeletedAtUnixMs,
 			&account.RuntimeApplyStatus,
 			&account.RuntimeApplyError,
+			&account.RuntimeRouteabilityStatus,
+			&account.RuntimeRouteabilityReason,
+			&account.RuntimeRegisteredModelsCount,
+			&account.LastRuntimeReconcileAtUnixMs,
+			&account.RuntimeFailureClass,
+			&account.RuntimeRepairOutcome,
+			&account.RuntimeRepairAction,
+			&account.RuntimeRepairTriggerStatus,
+			&account.RuntimeRepairTriggerClass,
+			&account.RuntimeRepairTriggerReason,
+			&account.LastRuntimeRepairAtUnixMs,
 		); err != nil {
 			_ = rows.Close()
 			if len(accounts) > 0 {
@@ -1250,12 +1456,28 @@ func deleteCredentialRows(ctx context.Context, tx *sql.Tx, accountKey string) er
 
 func upsertRuntimeApplyState(ctx context.Context, tx *sql.Tx, accountKey string, revision int, now int64) error {
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO account_runtime_apply_state(account_key, revision, status, last_error, applied_at_unix_ms, updated_at_unix_ms)
-VALUES (?, ?, 'pending', '', 0, ?)
+INSERT INTO account_runtime_apply_state(
+  account_key, revision, status, last_error,
+  routeability_status, routeability_reason, registered_models_count, last_reconcile_at_unix_ms,
+  failure_class, repair_outcome, repair_action, repair_trigger_status, repair_trigger_class, repair_trigger_reason, last_repair_at_unix_ms,
+  applied_at_unix_ms, updated_at_unix_ms
+)
+VALUES (?, ?, 'pending', '', 'pending', '', 0, 0, '', '', '', '', '', '', 0, 0, ?)
 ON CONFLICT(account_key) DO UPDATE SET
   revision = excluded.revision,
   status = 'pending',
   last_error = '',
+  routeability_status = 'pending',
+  routeability_reason = '',
+  registered_models_count = 0,
+  last_reconcile_at_unix_ms = 0,
+  failure_class = '',
+  repair_outcome = '',
+  repair_action = '',
+  repair_trigger_status = '',
+  repair_trigger_class = '',
+  repair_trigger_reason = '',
+  last_repair_at_unix_ms = 0,
   updated_at_unix_ms = excluded.updated_at_unix_ms`,
 		accountKey,
 		revision,

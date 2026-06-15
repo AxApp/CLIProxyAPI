@@ -2,6 +2,7 @@ package synthesizer
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	_ "modernc.org/sqlite"
 )
 
 func TestNewConfigSynthesizer(t *testing.T) {
@@ -661,6 +663,153 @@ func TestConfigSynthesizer_UsesAccountStoreForCodexAndOpenAICompatible(t *testin
 	}
 	if auths[1].Attributes["openai_compat_models"] != `[{"name":"deepseek-chat","alias":"deepseek-chat"}]` {
 		t.Fatalf("compat models not synthesized from db: %+v", auths[1].Attributes)
+	}
+}
+
+func TestConfigSynthesizer_UsesLegacyAccountStoreSchemaAfterEnsureSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	createLegacyAccountStoreDB(t, dbPath)
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auths len = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.AccountKey != "acct_dd2172ea-9dd9-458a-88bd-590cc55a468c" {
+		t.Fatalf("account key = %q, want 公司 1 account", auth.AccountKey)
+	}
+	if auth.Attributes["api_key"] != "sk-legacy-company-1" {
+		t.Fatalf("api key = %q, want legacy company key", auth.Attributes["api_key"])
+	}
+	if auth.Attributes["base_url"] != "http://cpa.host.dxy/v1" {
+		t.Fatalf("base url = %q, want company base url", auth.Attributes["base_url"])
+	}
+}
+
+func createLegacyAccountStoreDB(t *testing.T, dbPath string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	defer db.Close()
+
+	statements := []string{
+		`CREATE TABLE account_cards (
+		  account_key TEXT PRIMARY KEY,
+		  kind TEXT NOT NULL,
+		  title TEXT NOT NULL DEFAULT '',
+		  provider TEXT NOT NULL DEFAULT '',
+		  credential_source TEXT NOT NULL DEFAULT '',
+		  priority INTEGER NOT NULL DEFAULT 0,
+		  disabled INTEGER NOT NULL DEFAULT 0,
+		  revision INTEGER NOT NULL DEFAULT 1,
+		  metadata_json TEXT NOT NULL DEFAULT '{}',
+		  created_at_unix_ms INTEGER NOT NULL,
+		  updated_at_unix_ms INTEGER NOT NULL,
+		  deleted_at_unix_ms INTEGER
+		)`,
+		`CREATE TABLE codex_api_key_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  api_key TEXT NOT NULL,
+		  api_key_fingerprint TEXT NOT NULL DEFAULT '',
+		  base_url TEXT NOT NULL,
+		  prefix TEXT NOT NULL DEFAULT '',
+		  proxy_url TEXT NOT NULL DEFAULT '',
+		  websockets INTEGER NOT NULL DEFAULT 1,
+		  quota_curl TEXT NOT NULL DEFAULT '',
+		  quota_enabled INTEGER NOT NULL DEFAULT 0,
+		  billing_curl TEXT NOT NULL DEFAULT '',
+		  billing_enabled INTEGER NOT NULL DEFAULT 0,
+		  format_base_urls_json TEXT NOT NULL DEFAULT '{}',
+		  headers_json TEXT NOT NULL DEFAULT '{}',
+		  models_json TEXT NOT NULL DEFAULT '[]',
+		  excluded_models_json TEXT NOT NULL DEFAULT '[]',
+		  updated_at_unix_ms INTEGER NOT NULL,
+		  platform_cookie TEXT NOT NULL DEFAULT '',
+		  curl_variables_json TEXT NOT NULL DEFAULT '{}'
+		)`,
+		`CREATE TABLE account_runtime_apply_state (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  revision INTEGER NOT NULL,
+		  status TEXT NOT NULL,
+		  last_error TEXT NOT NULL DEFAULT '',
+		  applied_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE openai_compatible_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  provider_name TEXT NOT NULL DEFAULT '',
+		  runtime_provider_key TEXT NOT NULL,
+		  base_url TEXT NOT NULL,
+		  prefix TEXT NOT NULL DEFAULT '',
+		  api_key_entries_json TEXT NOT NULL DEFAULT '[]',
+		  headers_json TEXT NOT NULL DEFAULT '{}',
+		  models_json TEXT NOT NULL DEFAULT '[]',
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE auth_file_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  source_file_name TEXT NOT NULL DEFAULT '',
+		  auth_json TEXT NOT NULL,
+		  auth_fingerprint TEXT NOT NULL DEFAULT '',
+		  auth_type TEXT NOT NULL DEFAULT '',
+		  email TEXT NOT NULL DEFAULT '',
+		  plan_type TEXT NOT NULL DEFAULT '',
+		  status TEXT NOT NULL DEFAULT '',
+		  status_message TEXT NOT NULL DEFAULT '',
+		  modified_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  size_bytes INTEGER NOT NULL DEFAULT 0,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE account_runtime_identities (
+		  identity_key TEXT PRIMARY KEY,
+		  account_key TEXT NOT NULL REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  identity_kind TEXT NOT NULL,
+		  created_at_unix_ms INTEGER NOT NULL,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE account_migration_sources (
+		  id TEXT PRIMARY KEY,
+		  account_key TEXT NOT NULL REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  source_kind TEXT NOT NULL,
+		  source_path TEXT NOT NULL DEFAULT '',
+		  source_key TEXT NOT NULL DEFAULT '',
+		  source_fingerprint TEXT NOT NULL DEFAULT '',
+		  imported_at_unix_ms INTEGER NOT NULL,
+		  deleted_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  backup_path TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO account_cards (
+		  account_key, kind, title, provider, credential_source, priority, disabled, revision, metadata_json, created_at_unix_ms, updated_at_unix_ms, deleted_at_unix_ms
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 'codex-api-key', '公司 1', 'codex', 'legacy-gettokens-codex-api-key', 1, 0, 3, '{}', 1780107740986, 1781490144984, NULL
+		)`,
+		`INSERT INTO codex_api_key_accounts (
+		  account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms, platform_cookie, curl_variables_json
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 'sk-legacy-company-1', 'legacy-company-1', 'http://cpa.host.dxy/v1', '', '', 0, '', 0, '', 0, '{}', '{}', '[]', '[]', 1781490144984, '', '{}'
+		)`,
+		`INSERT INTO account_runtime_apply_state (
+		  account_key, revision, status, last_error, applied_at_unix_ms, updated_at_unix_ms
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 3, 'applied', '', 1781490144984, 1781490144984
+		)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec legacy schema statement failed: %v\nsql: %s", err, stmt)
+		}
 	}
 }
 

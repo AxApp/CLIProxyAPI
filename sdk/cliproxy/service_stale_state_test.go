@@ -2,6 +2,8 @@ package cliproxy
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	_ "modernc.org/sqlite"
 )
 
 func TestServiceApplyCoreAuthAddOrUpdate_DeleteReAddDoesNotInheritStaleRuntimeState(t *testing.T) {
@@ -153,6 +156,358 @@ func TestServiceRefreshAccountStoreAuthsWithoutWatcherRegistersCodexAPIKeyModels
 	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
 		t.Fatalf("account-store codex auth %s should support default Codex model gpt-5.5", authID)
 	}
+	refreshed, err := store.GetAccount(ctx, account.AccountKey)
+	if err != nil {
+		t.Fatalf("get account after refresh: %v", err)
+	}
+	if refreshed.RuntimeRouteabilityStatus != "registered_routeable" {
+		t.Fatalf("runtime routeability status = %q, want registered_routeable", refreshed.RuntimeRouteabilityStatus)
+	}
+	if refreshed.RuntimeRegisteredModelsCount == 0 {
+		t.Fatalf("runtime registered models count = %d, want > 0", refreshed.RuntimeRegisteredModelsCount)
+	}
+}
+
+func TestServiceInitializeAccountStoreRuntimeMigratesLegacySchemaAndRegistersRuntimeAuths(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	createLegacyServiceAccountStoreDB(t, dbPath)
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	if err := service.initializeAccountStoreRuntime(ctx); err != nil {
+		t.Fatalf("initializeAccountStoreRuntime: %v", err)
+	}
+
+	var authID string
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == "acct_dd2172ea-9dd9-458a-88bd-590cc55a468c" {
+			authID = auth.ID
+			break
+		}
+	}
+	if authID == "" {
+		t.Fatal("expected legacy account-store codex auth to be registered at startup")
+	}
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
+		t.Fatalf("startup account-store auth %s should support default Codex model gpt-5.5", authID)
+	}
+
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated account store: %v", err)
+	}
+	defer store.Close()
+	account, err := store.GetAccount(ctx, "acct_dd2172ea-9dd9-458a-88bd-590cc55a468c")
+	if err != nil {
+		t.Fatalf("get migrated account: %v", err)
+	}
+	if account.RuntimeRouteabilityStatus != "registered_routeable" {
+		t.Fatalf("runtime routeability status = %q, want registered_routeable", account.RuntimeRouteabilityStatus)
+	}
+}
+
+func createLegacyServiceAccountStoreDB(t *testing.T, dbPath string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	defer db.Close()
+
+	statements := []string{
+		`CREATE TABLE account_cards (
+		  account_key TEXT PRIMARY KEY,
+		  kind TEXT NOT NULL,
+		  title TEXT NOT NULL DEFAULT '',
+		  provider TEXT NOT NULL DEFAULT '',
+		  credential_source TEXT NOT NULL DEFAULT '',
+		  priority INTEGER NOT NULL DEFAULT 0,
+		  disabled INTEGER NOT NULL DEFAULT 0,
+		  revision INTEGER NOT NULL DEFAULT 1,
+		  metadata_json TEXT NOT NULL DEFAULT '{}',
+		  created_at_unix_ms INTEGER NOT NULL,
+		  updated_at_unix_ms INTEGER NOT NULL,
+		  deleted_at_unix_ms INTEGER
+		)`,
+		`CREATE TABLE codex_api_key_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  api_key TEXT NOT NULL,
+		  api_key_fingerprint TEXT NOT NULL DEFAULT '',
+		  base_url TEXT NOT NULL,
+		  prefix TEXT NOT NULL DEFAULT '',
+		  proxy_url TEXT NOT NULL DEFAULT '',
+		  websockets INTEGER NOT NULL DEFAULT 1,
+		  quota_curl TEXT NOT NULL DEFAULT '',
+		  quota_enabled INTEGER NOT NULL DEFAULT 0,
+		  billing_curl TEXT NOT NULL DEFAULT '',
+		  billing_enabled INTEGER NOT NULL DEFAULT 0,
+		  format_base_urls_json TEXT NOT NULL DEFAULT '{}',
+		  headers_json TEXT NOT NULL DEFAULT '{}',
+		  models_json TEXT NOT NULL DEFAULT '[]',
+		  excluded_models_json TEXT NOT NULL DEFAULT '[]',
+		  updated_at_unix_ms INTEGER NOT NULL,
+		  platform_cookie TEXT NOT NULL DEFAULT '',
+		  curl_variables_json TEXT NOT NULL DEFAULT '{}'
+		)`,
+		`CREATE TABLE account_runtime_apply_state (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  revision INTEGER NOT NULL,
+		  status TEXT NOT NULL,
+		  last_error TEXT NOT NULL DEFAULT '',
+		  applied_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE openai_compatible_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  provider_name TEXT NOT NULL DEFAULT '',
+		  runtime_provider_key TEXT NOT NULL,
+		  base_url TEXT NOT NULL,
+		  prefix TEXT NOT NULL DEFAULT '',
+		  api_key_entries_json TEXT NOT NULL DEFAULT '[]',
+		  headers_json TEXT NOT NULL DEFAULT '{}',
+		  models_json TEXT NOT NULL DEFAULT '[]',
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE auth_file_accounts (
+		  account_key TEXT PRIMARY KEY REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  source_file_name TEXT NOT NULL DEFAULT '',
+		  auth_json TEXT NOT NULL,
+		  auth_fingerprint TEXT NOT NULL DEFAULT '',
+		  auth_type TEXT NOT NULL DEFAULT '',
+		  email TEXT NOT NULL DEFAULT '',
+		  plan_type TEXT NOT NULL DEFAULT '',
+		  status TEXT NOT NULL DEFAULT '',
+		  status_message TEXT NOT NULL DEFAULT '',
+		  modified_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  size_bytes INTEGER NOT NULL DEFAULT 0,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE account_runtime_identities (
+		  identity_key TEXT PRIMARY KEY,
+		  account_key TEXT NOT NULL REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  identity_kind TEXT NOT NULL,
+		  created_at_unix_ms INTEGER NOT NULL,
+		  updated_at_unix_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE account_migration_sources (
+		  id TEXT PRIMARY KEY,
+		  account_key TEXT NOT NULL REFERENCES account_cards(account_key) ON DELETE CASCADE,
+		  source_kind TEXT NOT NULL,
+		  source_path TEXT NOT NULL DEFAULT '',
+		  source_key TEXT NOT NULL DEFAULT '',
+		  source_fingerprint TEXT NOT NULL DEFAULT '',
+		  imported_at_unix_ms INTEGER NOT NULL,
+		  deleted_at_unix_ms INTEGER NOT NULL DEFAULT 0,
+		  backup_path TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT INTO account_cards (
+		  account_key, kind, title, provider, credential_source, priority, disabled, revision, metadata_json, created_at_unix_ms, updated_at_unix_ms, deleted_at_unix_ms
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 'codex-api-key', '公司 1', 'codex', 'legacy-gettokens-codex-api-key', 1, 0, 3, '{}', 1780107740986, 1781490144984, NULL
+		)`,
+		`INSERT INTO codex_api_key_accounts (
+		  account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms, platform_cookie, curl_variables_json
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 'sk-legacy-company-1', 'legacy-company-1', 'http://cpa.host.dxy/v1', '', '', 0, '', 0, '', 0, '{}', '{}', '[]', '[]', 1781490144984, '', '{}'
+		)`,
+		`INSERT INTO account_runtime_apply_state (
+		  account_key, revision, status, last_error, applied_at_unix_ms, updated_at_unix_ms
+		) VALUES (
+		  'acct_dd2172ea-9dd9-458a-88bd-590cc55a468c', 3, 'applied', '', 1781490144984, 1781490144984
+		)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec legacy schema statement failed: %v\nsql: %s", err, stmt)
+		}
+	}
+}
+
+func TestServiceReconcileAccountStoreRouteabilityRepairsMissingRegistryModels(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/accounts-v1.sqlite"
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Repair Models",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:     "sk-repair-models",
+			BaseURL:    "https://codex.example.com/v1",
+			ModelsJSON: `[]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	if err := service.refreshAccountStoreAuths(ctx); err != nil {
+		t.Fatalf("initial refresh account-store auths: %v", err)
+	}
+
+	var authID string
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == account.AccountKey {
+			authID = auth.ID
+			break
+		}
+	}
+	if authID == "" {
+		t.Fatalf("expected registered auth for %s", account.AccountKey)
+	}
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	GlobalModelRegistry().UnregisterClient(authID)
+
+	if err := service.reconcileAccountStoreRouteability(ctx); err != nil {
+		t.Fatalf("reconcileAccountStoreRouteability: %v", err)
+	}
+	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
+		t.Fatalf("expected bounded reconcile to restore registry models for %s", authID)
+	}
+	refreshed, err := store.GetAccount(ctx, account.AccountKey)
+	if err != nil {
+		t.Fatalf("get account after repair: %v", err)
+	}
+	if refreshed.RuntimeRouteabilityStatus != "registered_routeable" {
+		t.Fatalf("runtime routeability status = %q, want registered_routeable", refreshed.RuntimeRouteabilityStatus)
+	}
+	if refreshed.RuntimeRepairOutcome != "recovered" {
+		t.Fatalf("runtime repair outcome = %q, want recovered", refreshed.RuntimeRepairOutcome)
+	}
+	if refreshed.RuntimeRepairAction != "resynthesize_refresh" {
+		t.Fatalf("runtime repair action = %q, want resynthesize_refresh", refreshed.RuntimeRepairAction)
+	}
+	if refreshed.RuntimeRepairTriggerStatus != "applied_not_registered" {
+		t.Fatalf("runtime repair trigger status = %q, want applied_not_registered", refreshed.RuntimeRepairTriggerStatus)
+	}
+	if refreshed.RuntimeRepairTriggerClass != "runtime_models_missing" {
+		t.Fatalf("runtime repair trigger class = %q, want runtime_models_missing", refreshed.RuntimeRepairTriggerClass)
+	}
+	if refreshed.RuntimeFailureClass != "" {
+		t.Fatalf("runtime failure class = %q, want empty after recovery", refreshed.RuntimeFailureClass)
+	}
+	if refreshed.LastRuntimeRepairAtUnixMs == 0 {
+		t.Fatal("expected last runtime repair timestamp to be recorded")
+	}
+}
+
+func TestServiceReconcileAccountStoreRouteabilityRepairsDegradedRuntimeAuth(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/accounts-v1.sqlite"
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Repair Degraded",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:     "sk-repair-degraded",
+			BaseURL:    "https://codex.example.com/v1",
+			ModelsJSON: `[]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	if err := service.refreshAccountStoreAuths(ctx); err != nil {
+		t.Fatalf("initial refresh account-store auths: %v", err)
+	}
+
+	var authID string
+	var seeded *coreauth.Auth
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == account.AccountKey {
+			authID = auth.ID
+			seeded = auth.Clone()
+			break
+		}
+	}
+	if authID == "" || seeded == nil {
+		t.Fatalf("expected registered auth for %s", account.AccountKey)
+	}
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	seeded.Status = coreauth.StatusError
+	seeded.Unavailable = true
+	seeded.StatusMessage = "stale upstream error"
+	seeded.LastError = &coreauth.Error{Code: "upstream_error", Message: "stale upstream error"}
+	if _, err := service.coreManager.Update(ctx, seeded); err != nil {
+		t.Fatalf("seed degraded auth: %v", err)
+	}
+
+	if err := service.reconcileAccountStoreRouteability(ctx); err != nil {
+		t.Fatalf("reconcileAccountStoreRouteability: %v", err)
+	}
+	updated, ok := service.coreManager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected repaired auth to exist")
+	}
+	if updated.Status != coreauth.StatusActive || updated.Unavailable || updated.LastError != nil || updated.StatusMessage != "" {
+		t.Fatalf("updated auth state = status=%q unavailable=%v message=%q last_error=%v, want clean active", updated.Status, updated.Unavailable, updated.StatusMessage, updated.LastError)
+	}
+	refreshed, err := store.GetAccount(ctx, account.AccountKey)
+	if err != nil {
+		t.Fatalf("get account after repair: %v", err)
+	}
+	if refreshed.RuntimeRouteabilityStatus != "registered_routeable" {
+		t.Fatalf("runtime routeability status = %q, want registered_routeable", refreshed.RuntimeRouteabilityStatus)
+	}
+	if refreshed.RuntimeRepairOutcome != "recovered" {
+		t.Fatalf("runtime repair outcome = %q, want recovered", refreshed.RuntimeRepairOutcome)
+	}
+	if refreshed.RuntimeRepairAction != "resynthesize_refresh" {
+		t.Fatalf("runtime repair action = %q, want resynthesize_refresh", refreshed.RuntimeRepairAction)
+	}
+	if refreshed.RuntimeRepairTriggerStatus != "degraded" {
+		t.Fatalf("runtime repair trigger status = %q, want degraded", refreshed.RuntimeRepairTriggerStatus)
+	}
+	if refreshed.RuntimeRepairTriggerClass != "runtime_auth_unavailable" {
+		t.Fatalf("runtime repair trigger class = %q, want runtime_auth_unavailable", refreshed.RuntimeRepairTriggerClass)
+	}
+	if refreshed.RuntimeFailureClass != "" {
+		t.Fatalf("runtime failure class = %q, want empty after recovery", refreshed.RuntimeFailureClass)
+	}
+	if refreshed.LastRuntimeRepairAtUnixMs == 0 {
+		t.Fatal("expected last runtime repair timestamp to be recorded")
+	}
 }
 
 func TestServiceApplyCoreAuthAddOrUpdate_CredentialRefreshResetsStaleRuntimeState(t *testing.T) {
@@ -220,6 +575,53 @@ func TestServiceApplyCoreAuthAddOrUpdate_CredentialRefreshResetsStaleRuntimeStat
 	}
 	if len(updated.ModelStates) != 0 {
 		t.Fatalf("expected ModelStates to reset after credential refresh, got %d entries", len(updated.ModelStates))
+	}
+}
+
+func TestServiceApplyCoreAuthAddOrUpdate_HealthyAuthClearsTransientRouteGuards(t *testing.T) {
+	authID := "codex:apikey:3df2001c2d1b"
+	accountKey := "acct_dd2172ea-9dd9-458a-88bd-590cc55a468c"
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceAuthError)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamRateLimit)
+	gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamTransientErr)
+	t.Cleanup(func() {
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceAuthError)
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamRateLimit)
+		gettokenshooks.ClearAccountRouteGuardSource(gettokenshooks.AccountRouteGuardSourceUpstreamTransientErr)
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+
+	gettokenshooks.MarkAccountRouteGuardBlocked(gettokenshooks.AccountRouteGuardBlock{
+		Source:     gettokenshooks.AccountRouteGuardSourceAuthError,
+		AuthID:     authID,
+		AccountKey: accountKey,
+		Reason:     "stale auth error",
+	})
+	if got := gettokenshooks.DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         authID,
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != authID {
+		t.Fatalf("deny ids before healthy update = %#v, want stale auth blocked", got)
+	}
+
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	service.applyCoreAuthAddOrUpdate(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		AccountKey: accountKey,
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+	})
+
+	if got := gettokenshooks.DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         authID,
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 0 {
+		t.Fatalf("deny ids after healthy update = %#v, want transient route guards cleared", got)
 	}
 }
 

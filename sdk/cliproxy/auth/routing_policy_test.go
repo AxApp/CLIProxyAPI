@@ -52,7 +52,7 @@ func TestRewriteScheduledAuthsWithPoliciesCarriesCodexRequestContext(t *testing.
 		},
 	}
 
-	got, changed := rewriteScheduledAuthsWithPolicies(context.Background(), routeRequest{
+	got, _, changed := rewriteScheduledAuthsWithPolicies(context.Background(), routeRequest{
 		Provider: "codex",
 		Model:    "gpt-5.1",
 		Options: cliproxyexecutor.Options{Metadata: map[string]any{

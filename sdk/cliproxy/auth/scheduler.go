@@ -293,25 +293,35 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		Tried:    tried,
 		Now:      time.Now(),
 	}
-	if picked, active := shard.pickSessionAffinityLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity); active {
+	if picked, result, active := shard.pickSessionAffinityLocked(ctx, req, preferWebsocket, predicate, s.sessionAffinity); active {
 		if picked != nil {
 			s.sessionAffinity.bindRouteResult(req, picked)
+			recordRouteDecision(req, "scheduler-session-affinity", result, picked, nil)
 			return picked, nil
 		}
-		return nil, shard.unavailableErrorLocked(provider, model, predicate)
+		err := shard.unavailableErrorLocked(provider, model, predicate)
+		recordRouteDecision(req, "scheduler-session-affinity", result, nil, err)
+		return nil, err
 	}
-	if picked, active := shard.pickRoutingPolicyLocked(ctx, req, preferWebsocket, predicate); active {
+	if picked, result, active := shard.pickRoutingPolicyLocked(ctx, req, preferWebsocket, predicate); active {
 		if picked != nil {
 			s.sessionAffinity.bindRouteResult(req, picked)
+			recordRouteDecision(req, "scheduler-routing-policy", result, picked, nil)
 			return picked, nil
 		}
-		return nil, shard.unavailableErrorLocked(provider, model, predicate)
+		err := shard.unavailableErrorLocked(provider, model, predicate)
+		recordRouteDecision(req, "scheduler-routing-policy", result, nil, err)
+		return nil, err
 	}
+	defaultResult := routeResultFromScheduledEntries(shard.readyCandidatesLocked(preferWebsocket, predicate))
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		s.sessionAffinity.bindRouteResult(req, picked)
+		recordRouteDecision(req, "scheduler-default", defaultResult, picked, nil)
 		return picked, nil
 	}
-	return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	err := shard.unavailableErrorLocked(provider, model, predicate)
+	recordRouteDecision(req, "scheduler-default", defaultResult, nil, err)
+	return nil, err
 }
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
@@ -361,10 +371,28 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
+		defaultResult := routeResultFromScheduledEntries(shard.readyCandidatesLocked(false, predicate))
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+			recordRouteDecision(routeRequest{
+				Provider:  "mixed",
+				Providers: append([]string(nil), normalized...),
+				Model:     model,
+				Options:   opts,
+				Tried:     tried,
+				Now:       time.Now(),
+			}, "scheduler-mixed-pinned", defaultResult, picked, nil)
 			return picked, providerKey, nil
 		}
-		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
+		err := shard.unavailableErrorLocked("mixed", model, predicate)
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "scheduler-mixed-pinned", defaultResult, nil, err)
+		return nil, "", err
 	}
 
 	predicate := triedPredicate(tried)
@@ -391,14 +419,40 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			hasCandidate = true
 		}
 	}
-	if picked, providerKey, active := s.pickMixedRoutingPolicyLocked(ctx, normalized, model, opts, tried, candidateShards, predicate); active {
+	if picked, providerKey, result, active := s.pickMixedRoutingPolicyLocked(ctx, normalized, model, opts, tried, candidateShards, predicate); active {
 		if picked != nil {
+			recordRouteDecision(routeRequest{
+				Provider:  "mixed",
+				Providers: append([]string(nil), normalized...),
+				Model:     model,
+				Options:   opts,
+				Tried:     tried,
+				Now:       time.Now(),
+			}, "scheduler-mixed-routing-policy", result, picked, nil)
 			return picked, providerKey, nil
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		err := s.mixedUnavailableErrorLocked(normalized, model, tried)
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "scheduler-mixed-routing-policy", result, nil, err)
+		return nil, "", err
 	}
 	if !hasCandidate {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		err := s.mixedUnavailableErrorLocked(normalized, model, tried)
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "scheduler-mixed-default", getMixedDefaultRouteResult(candidateShards, normalized, tried), nil, err)
+		return nil, "", err
 	}
 
 	if s.strategy == schedulerStrategyFillFirst {
@@ -417,10 +471,27 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 					Tried:     tried,
 					Now:       time.Now(),
 				}, picked)
+				recordRouteDecision(routeRequest{
+					Provider:  "mixed",
+					Providers: append([]string(nil), normalized...),
+					Model:     model,
+					Options:   opts,
+					Tried:     tried,
+					Now:       time.Now(),
+				}, "scheduler-mixed-default", getMixedDefaultRouteResult(candidateShards, normalized, tried), picked, nil)
 				return picked, providerKey, nil
 			}
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		err := s.mixedUnavailableErrorLocked(normalized, model, tried)
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "scheduler-mixed-default", getMixedDefaultRouteResult(candidateShards, normalized, tried), nil, err)
+		return nil, "", err
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
@@ -482,9 +553,26 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			Tried:     tried,
 			Now:       time.Now(),
 		}, picked)
+		recordRouteDecision(routeRequest{
+			Provider:  "mixed",
+			Providers: append([]string(nil), normalized...),
+			Model:     model,
+			Options:   opts,
+			Tried:     tried,
+			Now:       time.Now(),
+		}, "scheduler-mixed-default", getMixedDefaultRouteResult(candidateShards, normalized, tried), picked, nil)
 		return picked, providerKey, nil
 	}
-	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	err := s.mixedUnavailableErrorLocked(normalized, model, tried)
+	recordRouteDecision(routeRequest{
+		Provider:  "mixed",
+		Providers: append([]string(nil), normalized...),
+		Model:     model,
+		Options:   opts,
+		Tried:     tried,
+		Now:       time.Now(),
+	}, "scheduler-mixed-default", getMixedDefaultRouteResult(candidateShards, normalized, tried), nil, err)
+	return nil, "", err
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
@@ -522,9 +610,9 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	return &Error{Code: "auth_unavailable", Message: "no auth available"}
 }
 
-func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, shards []*modelScheduler, predicate func(*scheduledAuth) bool) (*Auth, string, bool) {
+func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, shards []*modelScheduler, predicate func(*scheduledAuth) bool) (*Auth, string, gettokensrouting.RouteResult, bool) {
 	if s == nil || len(shards) == 0 {
-		return nil, "", false
+		return nil, "", gettokensrouting.RouteResult{}, false
 	}
 	entries := make([]*scheduledAuth, 0)
 	providerByAuthID := make(map[string]string)
@@ -549,15 +637,15 @@ func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, provid
 		Tried:     tried,
 		Now:       time.Now(),
 	}
-	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{s.sessionAffinity.routingPolicy()})
+	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{s.sessionAffinity.routingPolicy()})
 	if !active {
-		return nil, "", false
+		return nil, "", result, false
 	}
 	if len(rewritten) == 0 || rewritten[0] == nil || rewritten[0].auth == nil {
-		return nil, "", true
+		return nil, "", result, true
 	}
 	s.sessionAffinity.bindRouteResult(req, rewritten[0].auth)
-	return rewritten[0].auth, providerByAuthID[rewritten[0].auth.ID], true
+	return rewritten[0].auth, providerByAuthID[rewritten[0].auth.ID], result, true
 }
 
 // triedPredicate builds a filter that excludes auths already attempted for the current request.
@@ -854,19 +942,19 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 	}
 }
 
-func (m *modelScheduler) pickSessionAffinityLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, selector *SessionAffinitySelector) (*Auth, bool) {
+func (m *modelScheduler) pickSessionAffinityLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, selector *SessionAffinitySelector) (*Auth, gettokensrouting.RouteResult, bool) {
 	if m == nil || selector == nil || selector.cache == nil {
-		return nil, false
+		return nil, gettokensrouting.RouteResult{}, false
 	}
 	entries := m.sessionAffinityCandidatesLocked(preferWebsocket, predicate)
-	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{selector.routingPolicy()})
+	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{selector.routingPolicy()})
 	if !active {
-		return nil, false
+		return nil, result, false
 	}
 	if len(rewritten) == 0 || rewritten[0] == nil {
-		return nil, true
+		return nil, result, true
 	}
-	return rewritten[0].auth, true
+	return rewritten[0].auth, result, true
 }
 
 func (m *modelScheduler) sessionAffinityCandidatesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []*scheduledAuth {
@@ -922,19 +1010,30 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
 }
 
-func (m *modelScheduler) pickRoutingPolicyLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, extraPolicies ...gettokensrouting.Policy) (*Auth, bool) {
+func (m *modelScheduler) pickRoutingPolicyLocked(ctx context.Context, req routeRequest, preferWebsocket bool, predicate func(*scheduledAuth) bool, extraPolicies ...gettokensrouting.Policy) (*Auth, gettokensrouting.RouteResult, bool) {
 	if m == nil {
-		return nil, false
+		return nil, gettokensrouting.RouteResult{}, false
 	}
 	entries := m.readyCandidatesLocked(preferWebsocket, predicate)
-	rewritten, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, extraPolicies)
+	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, extraPolicies)
 	if !active {
-		return nil, false
+		return nil, result, false
 	}
 	if len(rewritten) == 0 || rewritten[0] == nil {
-		return nil, true
+		return nil, result, true
 	}
-	return rewritten[0].auth, true
+	return rewritten[0].auth, result, true
+}
+
+func getMixedDefaultRouteResult(shards []*modelScheduler, providers []string, tried map[string]struct{}) gettokensrouting.RouteResult {
+	entries := make([]*scheduledAuth, 0)
+	for index, shard := range shards {
+		if shard == nil || index >= len(providers) {
+			continue
+		}
+		entries = append(entries, shard.readyCandidatesLocked(false, triedPredicate(tried))...)
+	}
+	return routeResultFromScheduledEntries(entries)
 }
 
 func (m *modelScheduler) readyCandidatesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []*scheduledAuth {

@@ -99,6 +99,9 @@ func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, 
 		return nil, false
 	}
 	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		return nil, false
+	}
 	accounts, err := store.ListAccounts(context.Background())
 	if err != nil {
 		return nil, false

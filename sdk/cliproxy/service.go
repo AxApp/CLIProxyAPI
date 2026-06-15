@@ -195,13 +195,23 @@ func (s *Service) refreshAccountStoreAuths(ctx context.Context) error {
 	}
 	if s.watcher != nil {
 		s.watcher.RefreshAuthState(true)
-		return nil
+		return s.reconcileAccountStoreRouteability(ctx)
 	}
 	if s.coreManager != nil && s.cfg != nil {
 		s.coreManager.SetConfig(s.cfg)
 		s.refreshAccountStoreAuthsWithoutWatcher(ctx)
 	}
-	return nil
+	return s.reconcileAccountStoreRouteability(ctx)
+}
+
+func (s *Service) initializeAccountStoreRuntime(ctx context.Context) error {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	if strings.TrimSpace(s.cfg.AccountStoreDB) == "" {
+		return nil
+	}
+	return s.refreshAccountStoreAuths(ctx)
 }
 
 func (s *Service) refreshAccountStoreAuthsWithoutWatcher(ctx context.Context) {
@@ -236,6 +246,244 @@ func (s *Service) refreshAccountStoreAuthsWithoutWatcher(ctx context.Context) {
 		}
 		s.applyCoreAuthRemoval(ctx, auth.ID)
 	}
+}
+
+func (s *Service) reconcileAccountStoreRouteability(ctx context.Context) error {
+	if s == nil || s.cfg == nil || s.coreManager == nil {
+		return nil
+	}
+	dbPath := strings.TrimSpace(s.cfg.AccountStoreDB)
+	if dbPath == "" {
+		return nil
+	}
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open account store for routeability reconcile: %w", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("ensure account store schema for routeability reconcile: %w", err)
+	}
+	repairAttempted := false
+	repairAction := accountStoreRouteabilityRepairAction(s.watcher != nil)
+	repairTriggers := make(map[string]accountStoreRouteabilityRepairTrigger)
+	for {
+		accounts, err := store.ListAccounts(ctx)
+		if err != nil {
+			return fmt.Errorf("list account store accounts for routeability reconcile: %w", err)
+		}
+		needsRepair := false
+		for _, account := range accounts {
+			if strings.TrimSpace(account.RuntimeApplyStatus) == "pending" {
+				if err := store.MarkRuntimeApplyResult(ctx, account.AccountKey, account.Revision, "applied", ""); err != nil {
+					return err
+				}
+				refreshed, refreshErr := store.GetAccount(ctx, account.AccountKey)
+				if refreshErr == nil {
+					account = refreshed
+				}
+			}
+			status, reason, failureClass, registeredModelsCount := s.evaluateAccountStoreRouteabilityWithWait(ctx, account)
+			if !repairAttempted && shouldAttemptAccountStoreRouteabilityRepair(status) {
+				needsRepair = true
+				repairTriggers[account.AccountKey] = accountStoreRouteabilityRepairTrigger{
+					Status: status,
+					Class:  failureClass,
+					Reason: reason,
+				}
+				continue
+			}
+			if repairAttempted {
+				reason = annotateAccountStoreRouteabilityReasonAfterRepair(status, reason)
+			}
+			if err := store.MarkRuntimeRouteability(ctx, account.AccountKey, account.Revision, status, reason, failureClass, registeredModelsCount); err != nil {
+				return err
+			}
+			if trigger, ok := repairTriggers[account.AccountKey]; ok {
+				if err := store.MarkRuntimeRepairResult(
+					ctx,
+					account.AccountKey,
+					account.Revision,
+					accountStoreRouteabilityRepairOutcome(status),
+					repairAction,
+					trigger.Status,
+					trigger.Class,
+					trigger.Reason,
+				); err != nil {
+					return err
+				}
+			}
+		}
+		if needsRepair {
+			repairAttempted = true
+			s.runBoundedAccountStoreRouteabilityRepair(ctx)
+			continue
+		}
+		break
+	}
+	return nil
+}
+
+type accountStoreRouteabilityRepairTrigger struct {
+	Status string
+	Class  string
+	Reason string
+}
+
+func (s *Service) evaluateAccountStoreRouteabilityWithWait(ctx context.Context, account accountstore.AccountRecord) (string, string, string, int) {
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for {
+		status, reason, failureClass, registeredModelsCount := s.evaluateAccountStoreRouteability(account)
+		if accountStoreRouteabilitySettled(status) || time.Now().After(deadline) {
+			return status, reason, failureClass, registeredModelsCount
+		}
+		select {
+		case <-ctx.Done():
+			return status, reason, failureClass, registeredModelsCount
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func accountStoreRouteabilitySettled(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "applied_not_registered":
+		return false
+	default:
+		return true
+	}
+}
+
+func shouldAttemptAccountStoreRouteabilityRepair(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "applied_not_registered", "degraded":
+		return true
+	default:
+		return false
+	}
+}
+
+func accountStoreRouteabilityRepairAction(hasWatcher bool) string {
+	if hasWatcher {
+		return "watcher_refresh"
+	}
+	return "resynthesize_refresh"
+}
+
+func accountStoreRouteabilityRepairOutcome(status string) string {
+	if strings.TrimSpace(status) == "registered_routeable" {
+		return "recovered"
+	}
+	return "failed"
+}
+
+func annotateAccountStoreRouteabilityReasonAfterRepair(status string, reason string) string {
+	reason = strings.TrimSpace(reason)
+	switch strings.TrimSpace(status) {
+	case "applied_not_registered":
+		if reason == "" {
+			return "bounded reconcile did not restore runtime registration"
+		}
+		return reason + " after bounded reconcile"
+	case "degraded":
+		if reason == "" {
+			return "bounded reconcile did not clear degraded runtime state"
+		}
+		return reason + " after bounded reconcile"
+	default:
+		return reason
+	}
+}
+
+func (s *Service) runBoundedAccountStoreRouteabilityRepair(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.watcher != nil {
+		s.watcher.RefreshAuthState(true)
+	} else if s.coreManager != nil && s.cfg != nil {
+		s.coreManager.SetConfig(s.cfg)
+		s.refreshAccountStoreAuthsWithoutWatcher(ctx)
+	}
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Service) evaluateAccountStoreRouteability(account accountstore.AccountRecord) (string, string, string, int) {
+	if strings.TrimSpace(account.RuntimeApplyStatus) != "applied" {
+		if strings.TrimSpace(account.RuntimeApplyStatus) == "failed" {
+			return "degraded", strings.TrimSpace(account.RuntimeApplyError), "runtime_apply_failed", 0
+		}
+		return "pending", "", "", 0
+	}
+	if account.Disabled {
+		return "pending", "", "", 0
+	}
+	auth := s.findAccountStoreRuntimeAuth(account.AccountKey)
+	if auth == nil {
+		return "applied_not_registered", "runtime auth missing from registry", "runtime_auth_missing", 0
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return "applied_not_registered", "runtime auth disabled", "runtime_auth_disabled", 0
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	registeredModelsCount := len(models)
+	if registeredModelsCount == 0 {
+		return "applied_not_registered", "runtime auth registered without models", "runtime_models_missing", 0
+	}
+	if auth.Unavailable {
+		return "degraded", firstNonEmpty(strings.TrimSpace(auth.StatusMessage), coreAuthErrorMessage(auth.LastError), "runtime auth unavailable"), "runtime_auth_unavailable", registeredModelsCount
+	}
+	if auth.Status == coreauth.StatusError {
+		return "degraded", firstNonEmpty(strings.TrimSpace(auth.StatusMessage), coreAuthErrorMessage(auth.LastError), "runtime auth error"), "runtime_auth_error", registeredModelsCount
+	}
+	return "registered_routeable", "", "", registeredModelsCount
+}
+
+func (s *Service) findAccountStoreRuntimeAuth(accountKey string) *coreauth.Auth {
+	if s == nil || s.coreManager == nil || strings.TrimSpace(accountKey) == "" {
+		return nil
+	}
+	for _, auth := range s.coreManager.List() {
+		if auth == nil {
+			continue
+		}
+		if auth.AccountKey == accountKey {
+			return auth
+		}
+	}
+	return nil
+}
+
+func coreAuthErrorMessage(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	if message := strings.TrimSpace(err.Message); message != "" {
+		return message
+	}
+	if code := strings.TrimSpace(err.Code); code != "" {
+		return code
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func isAccountStoreRuntimeAuth(auth *coreauth.Auth) bool {
@@ -388,6 +636,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth = current
 	}
 	s.applyRouteGuardForAuthUpdate(auth, wasRouteable)
+	s.clearTransientRouteGuardsForHealthyAuth(auth)
 
 	// Register models after auth is updated in coreManager.
 	// This operation may block on network calls, but the auth configuration
@@ -400,6 +649,22 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+}
+
+func (s *Service) clearTransientRouteGuardsForHealthyAuth(auth *coreauth.Auth) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled || auth.Unavailable || auth.Status == coreauth.StatusError {
+		return
+	}
+	for _, source := range []string{
+		gettokenshooks.AccountRouteGuardSourceAuthError,
+		gettokenshooks.AccountRouteGuardSourceUpstreamRateLimit,
+		gettokenshooks.AccountRouteGuardSourceUpstreamTransientErr,
+	} {
+		gettokenshooks.ClearAccountRouteGuardAuth(source, auth.ID)
+	}
 }
 
 func resetCoreAuthRuntimeStateAfterCredentialChange(auth *coreauth.Auth) {
@@ -1160,6 +1425,12 @@ func (s *Service) Run(ctx context.Context) error {
 			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}
 		log.Info("file watcher started for config and auth directory changes")
+	}
+
+	if !homeEnabled {
+		if err := s.initializeAccountStoreRuntime(ctx); err != nil {
+			return fmt.Errorf("cliproxy: initial account-store refresh failed: %w", err)
+		}
 	}
 
 	// Prefer core auth manager auto refresh if available.

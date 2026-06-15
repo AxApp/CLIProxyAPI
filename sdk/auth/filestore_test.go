@@ -50,6 +50,32 @@ func TestFileTokenStoreListCodexKeepsExplicitWebsocketsInMetadata(t *testing.T) 
 	}
 }
 
+func TestFileTokenStoreListSkipsNonAuthJSONWithoutType(t *testing.T) {
+	baseDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(baseDir, "channel-routing"), 0o700); err != nil {
+		t.Fatalf("failed to create channel-routing dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(baseDir, "channel-routing", "config.json"), []byte(`{"channel":"codex","runtimeStates":{"auth-id:foo":{"accountID":"auth-id:foo"}}}`), 0o600); err != nil {
+		t.Fatalf("failed to write non-auth json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(baseDir, "codex.json"), []byte(`{"type":"codex","email":"codex@example.com"}`), 0o600); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	if auths[0].ID != "codex.json" {
+		t.Fatalf("auth id = %q, want only codex.json", auths[0].ID)
+	}
+}
+
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
 

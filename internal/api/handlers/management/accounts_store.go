@@ -15,7 +15,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type accountWriteRequest struct {
@@ -594,6 +596,7 @@ func (h *Handler) applyAccountStoreRuntime(ctx context.Context, store *accountst
 		return account
 	}
 	_ = store.MarkRuntimeApplyResult(ctx, account.AccountKey, account.Revision, "applied", "")
+	_ = h.reconcileAccountStoreRouteability(ctx, store, account)
 	if refreshed, err := store.GetAccount(ctx, account.AccountKey); err == nil {
 		return refreshed
 	}
@@ -622,7 +625,22 @@ func (h *Handler) applyPendingAccountStoreRuntime(ctx context.Context, store *ac
 		_ = store.MarkPendingRuntimeApplyResults(ctx, "failed", err.Error())
 		return err
 	}
-	return store.MarkPendingRuntimeApplyResults(ctx, "applied", "")
+	if err := store.MarkPendingRuntimeApplyResults(ctx, "applied", ""); err != nil {
+		return err
+	}
+	accounts, err := store.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, account := range accounts {
+		if strings.TrimSpace(account.RuntimeApplyStatus) != "applied" {
+			continue
+		}
+		if err := h.reconcileAccountStoreRouteability(ctx, store, account); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func hasPendingAccountStoreRuntime(accounts []accountstore.AccountRecord) bool {
@@ -632,6 +650,97 @@ func hasPendingAccountStoreRuntime(accounts []accountstore.AccountRecord) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) reconcileAccountStoreRouteability(ctx context.Context, store *accountstore.Store, account accountstore.AccountRecord) error {
+	if h == nil || store == nil || account.AccountKey == "" || account.Revision == 0 {
+		return nil
+	}
+	if refreshed, err := store.GetAccount(ctx, account.AccountKey); err == nil {
+		account = refreshed
+	}
+	status, reason, failureClass, registeredModelsCount := h.evaluateAccountStoreRouteabilityWithWait(ctx, account)
+	return store.MarkRuntimeRouteability(ctx, account.AccountKey, account.Revision, status, reason, failureClass, registeredModelsCount)
+}
+
+func (h *Handler) evaluateAccountStoreRouteabilityWithWait(ctx context.Context, account accountstore.AccountRecord) (string, string, string, int) {
+	if strings.TrimSpace(account.RuntimeApplyStatus) != "applied" {
+		if strings.TrimSpace(account.RuntimeApplyStatus) == "failed" {
+			return "degraded", strings.TrimSpace(account.RuntimeApplyError), "runtime_apply_failed", 0
+		}
+		return "pending", "", "", 0
+	}
+	if account.Disabled {
+		return "pending", "", "", 0
+	}
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for {
+		status, reason, failureClass, registeredModelsCount, settled := h.evaluateAccountStoreRouteability(account)
+		if settled || time.Now().After(deadline) {
+			return status, reason, failureClass, registeredModelsCount
+		}
+		select {
+		case <-ctx.Done():
+			return status, reason, failureClass, registeredModelsCount
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func (h *Handler) evaluateAccountStoreRouteability(account accountstore.AccountRecord) (string, string, string, int, bool) {
+	auth := h.findAccountStoreRuntimeAuth(account.AccountKey)
+	if auth == nil {
+		return "applied_not_registered", "runtime auth missing from registry", "runtime_auth_missing", 0, false
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return "applied_not_registered", "runtime auth disabled", "runtime_auth_disabled", 0, true
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	registeredModelsCount := len(models)
+	if registeredModelsCount == 0 {
+		return "applied_not_registered", "runtime auth registered without models", "runtime_models_missing", 0, false
+	}
+	if auth.Unavailable {
+		return "degraded", firstNonEmptyValue(strings.TrimSpace(auth.StatusMessage), coreAuthRouteabilityMessage(auth.LastError), "runtime auth unavailable"), "runtime_auth_unavailable", registeredModelsCount, true
+	}
+	if auth.Status == coreauth.StatusError {
+		return "degraded", firstNonEmptyValue(strings.TrimSpace(auth.StatusMessage), coreAuthRouteabilityMessage(auth.LastError), "runtime auth error"), "runtime_auth_error", registeredModelsCount, true
+	}
+	return "registered_routeable", "", "", registeredModelsCount, true
+}
+
+func (h *Handler) findAccountStoreRuntimeAuth(accountKey string) *coreauth.Auth {
+	if h == nil || strings.TrimSpace(accountKey) == "" {
+		return nil
+	}
+	h.mu.Lock()
+	manager := h.authManager
+	h.mu.Unlock()
+	if manager == nil {
+		return nil
+	}
+	for _, auth := range manager.List() {
+		if auth == nil {
+			continue
+		}
+		if auth.AccountKey == accountKey {
+			return auth
+		}
+	}
+	return nil
+}
+
+func coreAuthRouteabilityMessage(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	if message := strings.TrimSpace(err.Message); message != "" {
+		return message
+	}
+	if code := strings.TrimSpace(err.Code); code != "" {
+		return code
+	}
+	return ""
 }
 
 func (h *Handler) buildAccountMigrationReport(ctx context.Context, req accountMigrationRequest) (*accountstore.MigrationReport, error) {

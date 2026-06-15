@@ -199,7 +199,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
-		provider = "unknown"
+		return nil, nil
 	}
 	if provider == "antigravity" || provider == "gemini" {
 		projectID := ""

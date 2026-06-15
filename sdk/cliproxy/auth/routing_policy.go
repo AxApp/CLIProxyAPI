@@ -19,9 +19,9 @@ type routeRequest struct {
 	Now       time.Time
 }
 
-func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, entries []*scheduledAuth, extraPolicies []gettokensrouting.Policy) ([]*scheduledAuth, bool) {
+func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, entries []*scheduledAuth, extraPolicies []gettokensrouting.Policy) ([]*scheduledAuth, gettokensrouting.RouteResult, bool) {
 	if len(entries) == 0 {
-		return entries, false
+		return entries, gettokensrouting.RouteResult{Candidates: []gettokensrouting.RouteCandidate{}, Trace: []gettokensrouting.DecisionStep{}}, false
 	}
 	policies := gettokensrouting.PolicySnapshot()
 	for _, policy := range extraPolicies {
@@ -30,13 +30,13 @@ func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, en
 		}
 	}
 	if len(policies) == 0 {
-		return entries, false
+		return entries, routeResultFromScheduledEntries(entries), false
 	}
 	result := gettokensrouting.NewEngine(policies...).Route(ctx, routeContextFromRouteRequest(req, routeCandidatesFromScheduled(entries)))
 	if !routeResultActive(result) {
-		return entries, false
+		return entries, result, false
 	}
-	return scheduledFromRouteCandidates(result.Candidates, entries), true
+	return scheduledFromRouteCandidates(result.Candidates, entries), result, true
 }
 
 func routeResultActive(result gettokensrouting.RouteResult) bool {
@@ -118,19 +118,19 @@ func sessionAffinityCacheKey(provider, sessionID, model string) string {
 	return sessionAffinityProviderKey(provider) + "::" + strings.TrimSpace(sessionID) + "::" + strings.TrimSpace(model)
 }
 
-func rewriteAuthCandidates(ctx context.Context, req routeRequest, auths []*Auth) ([]*Auth, bool) {
+func rewriteAuthCandidates(ctx context.Context, req routeRequest, auths []*Auth) ([]*Auth, gettokensrouting.RouteResult, bool) {
 	if len(auths) == 0 {
-		return auths, false
+		return auths, gettokensrouting.RouteResult{Candidates: []gettokensrouting.RouteCandidate{}, Trace: []gettokensrouting.DecisionStep{}}, false
 	}
 	policies := gettokensrouting.PolicySnapshot()
 	if len(policies) == 0 {
-		return auths, false
+		return auths, routeResultFromAuths(auths), false
 	}
 	result := gettokensrouting.NewEngine(policies...).Route(ctx, routeContextFromRouteRequest(req, routeCandidatesFromAuths(auths)))
 	if !routeResultActive(result) {
-		return auths, false
+		return auths, result, false
 	}
-	return authsFromRouteCandidates(result.Candidates, auths), true
+	return authsFromRouteCandidates(result.Candidates, auths), result, true
 }
 
 func routeCandidatesFromScheduled(entries []*scheduledAuth) []gettokensrouting.RouteCandidate {
@@ -159,6 +159,20 @@ func routeCandidatesFromAuths(auths []*Auth) []gettokensrouting.RouteCandidate {
 		})
 	}
 	return out
+}
+
+func routeResultFromScheduledEntries(entries []*scheduledAuth) gettokensrouting.RouteResult {
+	return gettokensrouting.RouteResult{
+		Candidates: routeCandidatesFromScheduled(entries),
+		Trace:      []gettokensrouting.DecisionStep{},
+	}
+}
+
+func routeResultFromAuths(auths []*Auth) gettokensrouting.RouteResult {
+	return gettokensrouting.RouteResult{
+		Candidates: routeCandidatesFromAuths(auths),
+		Trace:      []gettokensrouting.DecisionStep{},
+	}
 }
 
 func scheduledFromRouteCandidates(candidates []gettokensrouting.RouteCandidate, entries []*scheduledAuth) []*scheduledAuth {

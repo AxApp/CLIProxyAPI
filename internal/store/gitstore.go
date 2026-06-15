@@ -473,7 +473,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
-		provider = "unknown"
+		return nil, nil
 	}
 	info, err := os.Stat(path)
 	if err != nil {

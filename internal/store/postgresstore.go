@@ -299,7 +299,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		}
 		provider := strings.TrimSpace(valueAsString(metadata["type"]))
 		if provider == "" {
-			provider = "unknown"
+			continue
 		}
 		attr := map[string]string{"path": path}
 		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
