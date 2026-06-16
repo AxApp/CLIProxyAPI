@@ -1832,19 +1832,19 @@ func xiaomiMiMoItemHasUsage(item xiaomiMiMoUsageItem) bool {
 }
 
 func xiaomiMiMoUsedPercent(item xiaomiMiMoUsageItem, group xiaomiMiMoUsageGroup) *float64 {
-	if percent := quotaNumberValue(item.Percent); percent != nil && *percent > 0 {
+	if percent := quotaRatioOrPercentValue(item.Percent); percent != nil {
 		return percent
 	}
-	if percent := quotaNumberValue(group.Percent); percent != nil && *percent > 0 {
+	if percent := quotaRatioOrPercentValue(group.Percent); percent != nil {
 		return percent
 	}
 	used := quotaNumberValue(item.Used)
 	limit := quotaNumberValue(item.Limit)
 	if used == nil || limit == nil || *limit <= 0 {
-		if percent := quotaNumberValue(item.Percent); percent != nil {
+		if percent := quotaRatioOrPercentValue(item.Percent); percent != nil {
 			return percent
 		}
-		if percent := quotaNumberValue(group.Percent); percent != nil {
+		if percent := quotaRatioOrPercentValue(group.Percent); percent != nil {
 			return percent
 		}
 		return nil
@@ -1853,7 +1853,22 @@ func xiaomiMiMoUsedPercent(item xiaomiMiMoUsageItem, group xiaomiMiMoUsageGroup)
 	return &calculated
 }
 
+func quotaRatioOrPercentValue(value interface{}) *float64 {
+	percent := quotaNumberValue(value)
+	if percent == nil {
+		return nil
+	}
+	if *percent >= 0 && *percent <= 1 {
+		normalized := *percent * 100
+		return &normalized
+	}
+	return percent
+}
+
 func tryParseQuotaBillingResponse(body []byte) *gettokenshooks.QuotaRuntimeBilling {
+	if billing := tryBuildNestedBalanceBilling(body); billing != nil {
+		return billing
+	}
 	if billing := tryBuildDeepSeekBilling(body); billing != nil {
 		return billing
 	}
@@ -1925,6 +1940,83 @@ func tryParseQuotaBillingResponse(body []byte) *gettokenshooks.QuotaRuntimeBilli
 		}
 	}
 	return nil
+}
+
+func tryBuildNestedBalanceBilling(body []byte) *gettokenshooks.QuotaRuntimeBilling {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	data, ok := payload["data"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	currency := quotaFirstNonEmpty(
+		quotaMapStringValue(data, "currency"),
+		quotaMapStringValue(data, "currency_code"),
+		quotaMapStringValue(data, "currencyCode"),
+	)
+	total := quotaFirstNonEmpty(
+		quotaBalanceStringValue(data, "total_balance"),
+		quotaBalanceStringValue(data, "totalBalance"),
+		quotaBalanceStringValue(data, "balance"),
+		quotaBalanceStringValue(data, "remaining_credits"),
+		quotaBalanceStringValue(data, "remainingCredits"),
+	)
+	granted := quotaFirstNonEmpty(
+		quotaBalanceStringValue(data, "granted_balance"),
+		quotaBalanceStringValue(data, "grantedBalance"),
+		quotaBalanceStringValue(data, "gift_balance"),
+		quotaBalanceStringValue(data, "giftBalance"),
+	)
+	toppedUp := quotaFirstNonEmpty(
+		quotaBalanceStringValue(data, "topped_up_balance"),
+		quotaBalanceStringValue(data, "toppedUpBalance"),
+		quotaBalanceStringValue(data, "cash_balance"),
+		quotaBalanceStringValue(data, "cashBalance"),
+	)
+	if currency == "" && total == "" && granted == "" && toppedUp == "" {
+		return nil
+	}
+	if currency == "" {
+		currency = "CNY"
+	}
+	return &gettokenshooks.QuotaRuntimeBilling{
+		IsAvailable: true,
+		BalanceInfos: []gettokenshooks.QuotaRuntimeBalanceInfo{{
+			Currency:        currency,
+			TotalBalance:    total,
+			GrantedBalance:  granted,
+			ToppedUpBalance: toppedUp,
+		}},
+	}
+}
+
+func quotaMapStringValue(root map[string]interface{}, key string) string {
+	if root == nil {
+		return ""
+	}
+	value, ok := root[key]
+	if !ok {
+		return ""
+	}
+	typed, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(typed)
+}
+
+func quotaBalanceStringValue(root map[string]interface{}, key string) string {
+	if value := quotaMapStringValue(root, key); value != "" {
+		return value
+	}
+	if value, ok := root[key]; ok {
+		if parsed := quotaNumberValue(value); parsed != nil {
+			return fmt.Sprintf("%.2f", *parsed)
+		}
+	}
+	return ""
 }
 
 func tryBuildDeepSeekBilling(body []byte) *gettokenshooks.QuotaRuntimeBilling {
