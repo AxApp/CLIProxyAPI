@@ -581,6 +581,11 @@ func TestAccountsCRUDEndpointsPreserveAccountKeyOnPatch(t *testing.T) {
 		applyCalls++
 		return nil
 	})
+	var deleteHookKeys []string
+	h.SetAccountStoreDeleteHook(func(_ context.Context, accountKeys []string) error {
+		deleteHookKeys = append(deleteHookKeys, accountKeys...)
+		return nil
+	})
 	statusCalls := 0
 	var statusHookDisabled bool
 	h.SetAccountStoreStatusHook(func(_ context.Context, account accountstore.AccountRecord) error {
@@ -717,6 +722,9 @@ func TestAccountsCRUDEndpointsPreserveAccountKeyOnPatch(t *testing.T) {
 	if deleteRecorder.Code != http.StatusOK {
 		t.Fatalf("delete status = %d body=%s", deleteRecorder.Code, deleteRecorder.Body.String())
 	}
+	if strings.Join(deleteHookKeys, ",") != created.AccountKey {
+		t.Fatalf("delete hook keys = %v, want %s", deleteHookKeys, created.AccountKey)
+	}
 
 	getRecorder := httptest.NewRecorder()
 	router.ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts/"+created.AccountKey, nil))
@@ -734,6 +742,11 @@ func TestAccountsBatchDeleteEndpointDeletesMultipleAccountsWithOneApply(t *testi
 	applyCalls := 0
 	h.SetAccountStoreApplyHook(func(context.Context) error {
 		applyCalls++
+		return nil
+	})
+	var deleteHookKeys []string
+	h.SetAccountStoreDeleteHook(func(_ context.Context, accountKeys []string) error {
+		deleteHookKeys = append(deleteHookKeys, accountKeys...)
 		return nil
 	})
 
@@ -782,6 +795,9 @@ func TestAccountsBatchDeleteEndpointDeletesMultipleAccountsWithOneApply(t *testi
 	}
 	if applyCalls != 1 {
 		t.Fatalf("apply calls = %d, want one batch apply", applyCalls)
+	}
+	if strings.Join(deleteHookKeys, ",") != firstKey+","+secondKey {
+		t.Fatalf("delete hook keys = %v, want %s,%s", deleteHookKeys, firstKey, secondKey)
 	}
 
 	listRecorder := httptest.NewRecorder()

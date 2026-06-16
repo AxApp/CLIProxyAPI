@@ -92,18 +92,25 @@ func accountStoreAccounts(ctx *SynthesisContext) ([]accountstore.AccountRecord, 
 	}
 	path = expandAccountStorePath(path)
 	if _, err := os.Stat(path); err != nil && os.IsNotExist(err) {
+		ctx.AccountStoreLoadErrorf("account store %s does not exist: %w", path, err)
+		return nil, false
+	} else if err != nil {
+		ctx.AccountStoreLoadErrorf("stat account store %s: %w", path, err)
 		return nil, false
 	}
 	store, err := accountstore.Open(path)
 	if err != nil {
+		ctx.AccountStoreLoadErrorf("open account store %s: %w", path, err)
 		return nil, false
 	}
 	defer store.Close()
 	if err := store.EnsureSchema(context.Background()); err != nil {
+		ctx.AccountStoreLoadErrorf("ensure account store schema %s: %w", path, err)
 		return nil, false
 	}
 	accounts, err := store.ListAccounts(context.Background())
 	if err != nil {
+		ctx.AccountStoreLoadErrorf("list account store accounts %s: %w", path, err)
 		return nil, false
 	}
 	ctx.AccountStoreAccounts = accounts

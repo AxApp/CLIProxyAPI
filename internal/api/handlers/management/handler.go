@@ -53,6 +53,7 @@ type Handler struct {
 	accountStore                    *accountstore.Store
 	accountStoreDBPath              string
 	accountStoreApply               func(context.Context) error
+	accountStoreDelete              func(context.Context, []string) error
 	accountStoreStatus              func(context.Context, accountstore.AccountRecord) error
 	accountStoreReadRecoveryCount   int
 	accountStoreLastReadEndpoint    string
@@ -183,6 +184,13 @@ func (h *Handler) SetAccountStoreApplyHook(hook func(context.Context) error) {
 		return
 	}
 	h.accountStoreApply = hook
+}
+
+func (h *Handler) SetAccountStoreDeleteHook(hook func(context.Context, []string) error) {
+	if h == nil {
+		return
+	}
+	h.accountStoreDelete = hook
 }
 
 func (h *Handler) SetAccountStoreStatusHook(hook func(context.Context, accountstore.AccountRecord) error) {

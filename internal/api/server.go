@@ -357,6 +357,13 @@ func (s *Server) SetAccountStoreApplyHook(hook func(context.Context) error) {
 	s.mgmt.SetAccountStoreApplyHook(hook)
 }
 
+func (s *Server) SetAccountStoreDeleteHook(hook func(context.Context, []string) error) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetAccountStoreDeleteHook(hook)
+}
+
 func (s *Server) SetAccountStoreStatusHook(hook func(context.Context, accountstore.AccountRecord) error) {
 	if s == nil || s.mgmt == nil {
 		return

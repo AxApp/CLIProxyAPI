@@ -219,14 +219,19 @@ func (s *Service) refreshAccountStoreAuthsWithoutWatcher(ctx context.Context) {
 		return
 	}
 	synth := synthesizer.NewConfigSynthesizer()
-	auths, err := synth.Synthesize(&synthesizer.SynthesisContext{
+	synthCtx := &synthesizer.SynthesisContext{
 		Config:      s.cfg,
 		AuthDir:     s.cfg.AuthDir,
 		Now:         time.Now(),
 		IDGenerator: synthesizer.NewStableIDGenerator(),
-	})
+	}
+	auths, err := synth.Synthesize(synthCtx)
 	if err != nil {
 		log.Warnf("failed to synthesize account-store auths without watcher: %v", err)
+		return
+	}
+	if synthCtx.AccountStoreLoadError != nil {
+		log.Warnf("skip account-store runtime pruning because account store could not be read: %v", synthCtx.AccountStoreLoadError)
 		return
 	}
 	desired := make(map[string]*coreauth.Auth)
@@ -813,6 +818,34 @@ func (s *Service) applyRouteGuardForAuthUpdate(auth *coreauth.Auth, wasRouteable
 	}
 }
 
+func (s *Service) applyAccountStoreDelete(ctx context.Context, accountKeys []string) error {
+	if s == nil || s.coreManager == nil || len(accountKeys) == 0 {
+		return nil
+	}
+	targets := make(map[string]struct{}, len(accountKeys))
+	for _, accountKey := range accountKeys {
+		accountKey = strings.TrimSpace(accountKey)
+		if accountKey == "" {
+			continue
+		}
+		targets[accountKey] = struct{}{}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	s.coreManager.BumpSessionAffinityPoolEpoch()
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || !isAccountStoreRuntimeAuth(auth) {
+			continue
+		}
+		if _, ok := targets[strings.TrimSpace(auth.AccountKey)]; !ok {
+			continue
+		}
+		s.applyCoreAuthRemoval(ctx, auth.ID)
+	}
+	return nil
+}
+
 func (s *Service) applyAccountStoreStatusChange(_ context.Context, account accountstore.AccountRecord) error {
 	if s == nil || s.coreManager == nil || strings.TrimSpace(account.AccountKey) == "" {
 		return nil
@@ -1303,6 +1336,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.server != nil {
 		s.server.SetAccountStoreApplyHook(func(ctx context.Context) error {
 			return s.refreshAccountStoreAuths(ctx)
+		})
+		s.server.SetAccountStoreDeleteHook(func(ctx context.Context, accountKeys []string) error {
+			return s.applyAccountStoreDelete(ctx, accountKeys)
 		})
 		s.server.SetAccountStoreStatusHook(func(ctx context.Context, account accountstore.AccountRecord) error {
 			return s.applyAccountStoreStatusChange(ctx, account)

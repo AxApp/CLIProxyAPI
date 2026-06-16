@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -23,6 +24,24 @@ type SynthesisContext struct {
 	// AccountStoreActive records whether the sidecar account store exists and
 	// was readable for this synthesis pass, even when it has zero active rows.
 	AccountStoreActive bool
+	// AccountStoreLoadError records why a configured account store could not be
+	// read. Callers that reconcile hot runtime state must not treat this as an
+	// authoritative empty account store.
+	AccountStoreLoadError error
 	// AccountStoreAccounts caches sidecar-owned accounts for one synthesis pass.
 	AccountStoreAccounts []accountstore.AccountRecord
+}
+
+func (c *SynthesisContext) SetAccountStoreLoadError(err error) {
+	if c == nil || err == nil {
+		return
+	}
+	c.AccountStoreLoadError = err
+}
+
+func (c *SynthesisContext) AccountStoreLoadErrorf(format string, args ...any) {
+	if c == nil {
+		return
+	}
+	c.SetAccountStoreLoadError(fmt.Errorf(format, args...))
 }

@@ -168,6 +168,143 @@ func TestServiceRefreshAccountStoreAuthsWithoutWatcherRegistersCodexAPIKeyModels
 	}
 }
 
+func TestServiceRefreshAccountStoreAuthsWithoutWatcherPreservesRuntimeOnStoreReadError(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	account, err := store.CreateAccount(ctx, accountstore.AccountWrite{
+		Kind:             accountstore.KindCodexAPIKey,
+		Title:            "Runtime Preserve",
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		CodexAPIKey: &accountstore.CodexAPIKeyCredential{
+			APIKey:     "sk-runtime-preserve",
+			BaseURL:    "https://codex.example.com/v1",
+			ModelsJSON: `[]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close account store: %v", err)
+	}
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	if err := service.refreshAccountStoreAuths(ctx); err != nil {
+		t.Fatalf("initial refresh account-store auths: %v", err)
+	}
+
+	var authID string
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == account.AccountKey {
+			authID = auth.ID
+			break
+		}
+	}
+	if authID == "" {
+		t.Fatalf("expected account-store codex auth for %s to be registered", account.AccountKey)
+	}
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(authID)
+	})
+	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
+		t.Fatalf("account-store codex auth %s should support default Codex model gpt-5.5 before read error", authID)
+	}
+
+	service.cfg.AccountStoreDB = t.TempDir()
+	if err := service.refreshAccountStoreAuths(ctx); err == nil {
+		t.Fatalf("refreshAccountStoreAuths should report account-store read error")
+	}
+
+	auth, ok := service.coreManager.GetByID(authID)
+	if !ok || auth == nil {
+		t.Fatalf("expected runtime auth %s to survive account-store read error", authID)
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		t.Fatalf("runtime auth should not be disabled by account-store read error: disabled=%v status=%q", auth.Disabled, auth.Status)
+	}
+	if !GlobalModelRegistry().ClientSupportsModel(authID, "gpt-5.5") {
+		t.Fatalf("runtime auth %s should keep registered Codex models after account-store read error", authID)
+	}
+}
+
+func TestServiceApplyAccountStoreDeleteRemovesOnlyTargetAccounts(t *testing.T) {
+	ctx := context.Background()
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	deletedAuth := &coreauth.Auth{
+		ID:         "codex-delete-target",
+		AccountKey: "acct_delete_target",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{
+			"source":      "account-store:codex[target]",
+			"auth_kind":   "apikey",
+			"account_key": "acct_delete_target",
+		},
+	}
+	keptAuth := &coreauth.Auth{
+		ID:         "codex-delete-kept",
+		AccountKey: "acct_delete_kept",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{
+			"source":      "account-store:codex[kept]",
+			"auth_kind":   "apikey",
+			"account_key": "acct_delete_kept",
+		},
+	}
+	service.applyCoreAuthAddOrUpdate(ctx, deletedAuth)
+	service.applyCoreAuthAddOrUpdate(ctx, keptAuth)
+	t.Cleanup(func() {
+		GlobalModelRegistry().UnregisterClient(deletedAuth.ID)
+		GlobalModelRegistry().UnregisterClient(keptAuth.ID)
+	})
+	if !GlobalModelRegistry().ClientSupportsModel(deletedAuth.ID, "gpt-5.5") {
+		t.Fatalf("expected deleted setup auth to support gpt-5.5 before targeted delete")
+	}
+	if !GlobalModelRegistry().ClientSupportsModel(keptAuth.ID, "gpt-5.5") {
+		t.Fatalf("expected kept setup auth to support gpt-5.5 before targeted delete")
+	}
+
+	if err := service.applyAccountStoreDelete(ctx, []string{deletedAuth.AccountKey}); err != nil {
+		t.Fatalf("applyAccountStoreDelete: %v", err)
+	}
+
+	deleted, ok := service.coreManager.GetByID(deletedAuth.ID)
+	if !ok || deleted == nil {
+		t.Fatalf("expected deleted auth to remain as disabled tombstone")
+	}
+	if !deleted.Disabled || deleted.Status != coreauth.StatusDisabled {
+		t.Fatalf("deleted auth state = disabled=%v status=%q, want disabled tombstone", deleted.Disabled, deleted.Status)
+	}
+	if GlobalModelRegistry().ClientSupportsModel(deletedAuth.ID, "gpt-5.5") {
+		t.Fatalf("deleted auth should no longer support gpt-5.5 after targeted delete")
+	}
+	kept, ok := service.coreManager.GetByID(keptAuth.ID)
+	if !ok || kept == nil {
+		t.Fatalf("expected kept auth to remain present")
+	}
+	if kept.Disabled || kept.Status == coreauth.StatusDisabled {
+		t.Fatalf("kept auth should remain active, got disabled=%v status=%q", kept.Disabled, kept.Status)
+	}
+	if !GlobalModelRegistry().ClientSupportsModel(keptAuth.ID, "gpt-5.5") {
+		t.Fatalf("kept auth should keep gpt-5.5 after targeted delete")
+	}
+}
+
 func TestServiceInitializeAccountStoreRuntimeMigratesLegacySchemaAndRegistersRuntimeAuths(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

@@ -130,6 +130,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		return
 	}
 	_ = h.cancelQuotaRefreshBatchJobsForAccountKeys([]string{accountKey}, "quota refresh job canceled because account was deleted", time.Now().UTC())
+	_ = h.triggerAccountStoreDelete(c.Request.Context(), []string{accountKey})
 	_ = h.triggerAccountStoreApply(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -157,6 +158,7 @@ func (h *Handler) DeleteAccountsBatch(c *gin.Context) {
 	}
 	if len(deleted) > 0 {
 		_ = h.cancelQuotaRefreshBatchJobsForAccountKeys(deleted, "quota refresh job canceled because account was deleted", time.Now().UTC())
+		_ = h.triggerAccountStoreDelete(c.Request.Context(), deleted)
 		_ = h.triggerAccountStoreApply(c.Request.Context())
 	}
 	c.JSON(http.StatusOK, accountBatchDeleteResponse{
@@ -615,6 +617,13 @@ func (h *Handler) triggerAccountStoreApply(ctx context.Context) error {
 		return nil
 	}
 	return h.accountStoreApply(ctx)
+}
+
+func (h *Handler) triggerAccountStoreDelete(ctx context.Context, accountKeys []string) error {
+	if h == nil || h.accountStoreDelete == nil || len(accountKeys) == 0 {
+		return nil
+	}
+	return h.accountStoreDelete(ctx, append([]string(nil), accountKeys...))
 }
 
 func (h *Handler) applyPendingAccountStoreRuntime(ctx context.Context, store *accountstore.Store) error {
