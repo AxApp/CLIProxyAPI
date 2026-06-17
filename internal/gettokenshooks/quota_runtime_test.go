@@ -37,6 +37,12 @@ func TestQuotaRuntimeStoreUpsertFeedsQuotaEmptyGuard(t *testing.T) {
 	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceQuotaEmpty {
 		t.Fatalf("state = %#v, want quota-empty blocked source", state)
 	}
+	if state.Fact == nil || state.Fact.State != "no_quota" || state.Fact.Risk != "blocking" {
+		t.Fatalf("fact = %#v, want no_quota blocking fact", state.Fact)
+	}
+	if state.Fact.ExpiresAt == "" {
+		t.Fatalf("fact = %#v, want reset expiry", state.Fact)
+	}
 	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
 		ID:         "codex-auth-1",
 		AccountKey: state.AccountKey,
@@ -165,6 +171,9 @@ func TestQuotaRuntimeStoreStaleStateDoesNotClearFreshQuotaEmptyGuard(t *testing.
 	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceQuotaEmpty {
 		t.Fatalf("state = %#v, want stale state to preserve existing quota-empty until reset", state)
 	}
+	if state.Fact == nil || state.Fact.State != "stale" || state.Fact.Freshness != "stale" {
+		t.Fatalf("fact = %#v, want stale cached fact", state.Fact)
+	}
 }
 
 func TestQuotaRuntimeRoutesPutAndGetStatus(t *testing.T) {
@@ -204,6 +213,161 @@ func TestQuotaRuntimeRoutesPutAndGetStatus(t *testing.T) {
 	}
 	if getState.AccountKey != putState.AccountKey || !getState.Blocked {
 		t.Fatalf("GET state = %#v, want stored blocked quota state", getState)
+	}
+	if getState.Fact == nil || getState.Fact.State != "no_quota" || getState.Fact.Source != "quota-curl" {
+		t.Fatalf("GET fact = %#v, want no_quota quota-curl fact", getState.Fact)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(get.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw GET state: %v", err)
+	}
+	if _, ok := raw["quotaFact"]; !ok {
+		t.Fatalf("raw GET state keys = %#v, want explicit quotaFact", raw)
+	}
+	var quotaFact QuotaRuntimeFact
+	if err := json.Unmarshal(raw["quotaFact"], &quotaFact); err != nil {
+		t.Fatalf("decode quotaFact: %v", err)
+	}
+	if quotaFact.State != "no_quota" || quotaFact.Source != "quota-curl" {
+		t.Fatalf("quotaFact = %#v, want copied runtime fact", quotaFact)
+	}
+}
+
+func TestQuotaRuntimeFactBuilderClassifiesRuntimeStates(t *testing.T) {
+	now := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	remainingZero := 0
+	remainingHealthy := 34
+
+	tests := []struct {
+		name      string
+		state     QuotaRuntimeState
+		wantState string
+		wantFresh string
+		wantRisk  string
+	}{
+		{
+			name: "fresh exhausted known window",
+			state: QuotaRuntimeState{
+				AccountKey: "acct_00000000-0000-4000-8000-000000000301",
+				Status:     QuotaRuntimeStatusSuccess,
+				Source:     "quota-curl",
+				Windows: []QuotaRuntimeWindow{{
+					ID:               "five-hour",
+					RemainingPercent: &remainingZero,
+					ResetAtUnix:      now.Add(time.Hour).Unix(),
+				}},
+			},
+			wantState: "no_quota",
+			wantFresh: "fresh",
+			wantRisk:  "blocking",
+		},
+		{
+			name: "fresh positive window",
+			state: QuotaRuntimeState{
+				AccountKey: "acct_00000000-0000-4000-8000-000000000302",
+				Status:     QuotaRuntimeStatusSuccess,
+				Source:     "quota-curl",
+				Windows: []QuotaRuntimeWindow{{
+					ID:               "five-hour",
+					RemainingPercent: &remainingHealthy,
+					ResetAtUnix:      now.Add(time.Hour).Unix(),
+				}},
+			},
+			wantState: "available",
+			wantFresh: "fresh",
+			wantRisk:  "none",
+		},
+		{
+			name: "missing window evidence",
+			state: QuotaRuntimeState{
+				AccountKey: "acct_00000000-0000-4000-8000-000000000303",
+				Status:     QuotaRuntimeStatusSuccess,
+				Source:     "quota-runtime",
+				Windows:    []QuotaRuntimeWindow{},
+			},
+			wantState: "unknown",
+			wantFresh: "unknown",
+			wantRisk:  "unknown",
+		},
+		{
+			name: "degraded cache",
+			state: QuotaRuntimeState{
+				AccountKey:     "acct_00000000-0000-4000-8000-000000000304",
+				Status:         QuotaRuntimeStatusDegraded,
+				Source:         "quota-curl",
+				Stale:          true,
+				DegradedReason: "quota refresh failed",
+				Windows: []QuotaRuntimeWindow{{
+					ID:               "five-hour",
+					RemainingPercent: &remainingHealthy,
+				}},
+			},
+			wantState: "stale",
+			wantFresh: "stale",
+			wantRisk:  "warning",
+		},
+		{
+			name: "provider denied",
+			state: QuotaRuntimeState{
+				AccountKey:     "acct_00000000-0000-4000-8000-000000000305",
+				Status:         QuotaRuntimeStatusError,
+				Source:         "quota-curl",
+				DegradedReason: "quota request failed with status 403",
+				Windows:        []QuotaRuntimeWindow{},
+			},
+			wantState: "denied",
+			wantFresh: "fresh",
+			wantRisk:  "denied",
+		},
+		{
+			name: "unsupported quota probe",
+			state: QuotaRuntimeState{
+				AccountKey:     "acct_00000000-0000-4000-8000-000000000307",
+				Status:         QuotaRuntimeStatusError,
+				Source:         "quota-curl",
+				DegradedReason: "account kind does not support quota refresh",
+				Windows:        []QuotaRuntimeWindow{},
+			},
+			wantState: "unsupported",
+			wantFresh: "unknown",
+			wantRisk:  "unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fact := BuildQuotaRuntimeFact(tt.state, now)
+			if fact.State != tt.wantState || fact.Freshness != tt.wantFresh || fact.Risk != tt.wantRisk {
+				t.Fatalf("fact = %#v, want state=%s freshness=%s risk=%s", fact, tt.wantState, tt.wantFresh, tt.wantRisk)
+			}
+			if fact.ObservedAt == "" || fact.Explanation == "" {
+				t.Fatalf("fact = %#v, want observed_at and explanation", fact)
+			}
+		})
+	}
+}
+
+func TestQuotaRuntimePreservesProvidedFact(t *testing.T) {
+	store := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	now := time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC)
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: "acct_00000000-0000-4000-8000-000000000306",
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows:    []QuotaRuntimeWindow{},
+		Fact: &QuotaRuntimeFact{
+			State:       "unsupported",
+			Source:      "provider-quota-curl",
+			Freshness:   "unknown",
+			Confidence:  "none",
+			Risk:        "unknown",
+			Explanation: "quota probe is not configured",
+		},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if state.Fact == nil || state.Fact.State != "unsupported" || state.Fact.Explanation != "quota probe is not configured" {
+		t.Fatalf("fact = %#v, want provided fact preserved", state.Fact)
 	}
 }
 
@@ -248,6 +412,9 @@ func TestQuotaRuntimeRoutesGetStatusesByKeys(t *testing.T) {
 	}
 	if response.Items[1].AccountKey != "acct_missing" || response.Items[1].Status != QuotaRuntimeStatusStale {
 		t.Fatalf("missing item = %#v, want stale missing state", response.Items[1])
+	}
+	if response.Items[1].Fact == nil || response.Items[1].Fact.State != "unknown" {
+		t.Fatalf("missing fact = %#v, want unknown fact", response.Items[1].Fact)
 	}
 	if response.Items[2].AccountKey != keys[0] || response.Items[2].PlanType != "plan-0" {
 		t.Fatalf("third item = %#v, want first requested key", response.Items[2])

@@ -37,6 +37,7 @@ type ChannelRoutingDecisionSnapshot struct {
 	UnavailableCode      string                            `json:"unavailableCode,omitempty"`
 	UnavailableMessage   string                            `json:"unavailableMessage,omitempty"`
 	Trace                []ChannelRoutingDecisionStep      `json:"trace"`
+	DroppedReasons       []ChannelRoutingDroppedReason     `json:"droppedReasons,omitempty"`
 }
 
 type ChannelRoutingDecisionCandidate struct {
@@ -107,6 +108,7 @@ func mapChannelRoutingDecisionSnapshot(item coreauth.RouteDecisionSnapshot) Chan
 		UnavailableCode:      item.UnavailableCode,
 		UnavailableMessage:   item.UnavailableMessage,
 		Trace:                make([]ChannelRoutingDecisionStep, 0, len(item.Trace)),
+		DroppedReasons:       make([]ChannelRoutingDroppedReason, 0, len(item.DroppedReasons)),
 	}
 	for _, candidate := range item.Candidates {
 		out.Candidates = append(out.Candidates, ChannelRoutingDecisionCandidate{
@@ -132,6 +134,28 @@ func mapChannelRoutingDecisionSnapshot(item coreauth.RouteDecisionSnapshot) Chan
 			cloned.Fallback = &value
 		}
 		out.Trace = append(out.Trace, cloned)
+	}
+	for _, reason := range item.DroppedReasons {
+		out.DroppedReasons = append(out.DroppedReasons, mapChannelRoutingDecisionDroppedReason(reason))
+	}
+	return out
+}
+
+func mapChannelRoutingDecisionDroppedReason(item coreauth.RouteDecisionDroppedReasonSnapshot) ChannelRoutingDroppedReason {
+	out := ChannelRoutingDroppedReason{
+		AccountID:     strings.TrimSpace(item.AccountKey),
+		AuthID:        strings.TrimSpace(item.AuthID),
+		Source:        strings.TrimSpace(item.Source),
+		Scope:         normalizeRouteResilienceScope(RouteResilienceScope(item.Scope), item.Source),
+		Reason:        strings.TrimSpace(item.Reason),
+		Model:         strings.TrimSpace(item.Model),
+		RouteBlocking: item.RouteBlocking,
+	}
+	if !item.ExpiresAt.IsZero() {
+		out.ExpiresAt = item.ExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	if !item.UpdatedAt.IsZero() {
+		out.UpdatedAt = item.UpdatedAt.UTC().Format(time.RFC3339Nano)
 	}
 	return out
 }

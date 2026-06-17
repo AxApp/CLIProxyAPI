@@ -877,14 +877,14 @@ func (h *Handler) testBillingCurl(ctx context.Context, req quotaCurlTestRequest)
 	if err != nil {
 		return gettokenshooks.QuotaRuntimeState{}, err
 	}
-	return gettokenshooks.QuotaRuntimeState{
+	return gettokenshooks.EnsureQuotaRuntimeFact(gettokenshooks.QuotaRuntimeState{
 		AccountKey: strings.TrimSpace(req.AccountKey),
 		Source:     quotaBillingDraftTestSource,
 		Status:     gettokenshooks.QuotaRuntimeStatusSuccess,
 		Windows:    []gettokenshooks.QuotaRuntimeWindow{},
 		Billing:    billing,
 		Sources:    []gettokenshooks.QuotaRuntimeSourceState{},
-	}, nil
+	}, time.Now().UTC()), nil
 }
 
 func quotaCurlInputFromTestRequest(req quotaCurlTestRequest, curl string) (quotaCurlInput, error) {
@@ -1059,6 +1059,7 @@ func degradedQuotaRuntimeState(accountKey string, cause error) (gettokenshooks.Q
 	state.Sources = []gettokenshooks.QuotaRuntimeSourceState{}
 	state.Blocked = false
 	state.BlockReason = ""
+	state.Fact = nil
 	next, err := store.Upsert(state, time.Now().UTC())
 	if err != nil {
 		return state, true
@@ -1073,7 +1074,7 @@ func quotaRuntimeStateHasDisplayData(state gettokenshooks.QuotaRuntimeState) boo
 }
 
 func quotaRuntimeStateFromParsed(accountKey string, source string, status string, quota quotaParsedResponse) gettokenshooks.QuotaRuntimeState {
-	return gettokenshooks.QuotaRuntimeState{
+	return gettokenshooks.EnsureQuotaRuntimeFact(gettokenshooks.QuotaRuntimeState{
 		AccountKey: strings.TrimSpace(accountKey),
 		Source:     strings.TrimSpace(source),
 		Status:     strings.TrimSpace(status),
@@ -1081,7 +1082,7 @@ func quotaRuntimeStateFromParsed(accountKey string, source string, status string
 		Windows:    append([]gettokenshooks.QuotaRuntimeWindow(nil), quota.Windows...),
 		Billing:    cloneQuotaRuntimeBilling(quota.Billing),
 		Sources:    []gettokenshooks.QuotaRuntimeSourceState{},
-	}
+	}, time.Now().UTC())
 }
 
 func cloneQuotaRuntimeBilling(billing *gettokenshooks.QuotaRuntimeBilling) *gettokenshooks.QuotaRuntimeBilling {

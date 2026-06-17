@@ -22,6 +22,16 @@ func TestConfigureChannelRoutingDecisionRoutesListsRecentSnapshots(t *testing.T)
 		SelectedAuthID:     "auth-b",
 		SelectedAccountKey: "acct_b",
 		SelectedProvider:   "codex",
+		DroppedReasons: []coreauth.RouteDecisionDroppedReasonSnapshot{{
+			AuthID:        "auth-a",
+			AccountKey:    "acct_a",
+			Source:        AccountRouteGuardSourceRateLimit,
+			Scope:         string(RouteResilienceScopeAccount),
+			Reason:        "cooldown",
+			Model:         "decision-endpoint-model",
+			UpdatedAt:     time.Now().UTC(),
+			RouteBlocking: true,
+		}},
 		Candidates: []coreauth.RouteDecisionCandidateSnapshot{{
 			AuthID:     "auth-b",
 			AccountKey: "acct_b",
@@ -60,5 +70,15 @@ func TestConfigureChannelRoutingDecisionRoutesListsRecentSnapshots(t *testing.T)
 	}
 	if payload.Items[0].SelectedAccountID != "acct_b" || payload.Items[0].Trace[0].Reason != "prefer auth-b for endpoint test" {
 		t.Fatalf("payload item = %#v", payload.Items[0])
+	}
+	if len(payload.Items[0].DroppedReasons) != 1 {
+		t.Fatalf("droppedReasons = %#v, want one", payload.Items[0].DroppedReasons)
+	}
+	dropped := payload.Items[0].DroppedReasons[0]
+	if dropped.AccountID != "acct_a" || dropped.AuthID != "auth-a" {
+		t.Fatalf("dropped account/auth = %#v, want acct_a/auth-a", dropped)
+	}
+	if dropped.Source != AccountRouteGuardSourceRateLimit || dropped.Scope != RouteResilienceScopeAccount || dropped.Reason != "cooldown" {
+		t.Fatalf("dropped = %#v, want rate-limit/account/cooldown", dropped)
 	}
 }

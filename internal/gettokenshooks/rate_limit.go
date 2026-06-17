@@ -1789,7 +1789,9 @@ func ConfigureGetTokensManagementRoutes(group *gin.RouterGroup, handler *handler
 	ConfigureProjectCandidatePoolRoutes(group, handler, cfg)
 	ConfigureChannelRoutingExplainRoutes(group, handler, cfg)
 	ConfigureChannelRoutingDecisionRoutes(group, handler, cfg)
+	ConfigureRouteResilienceActionRoutes(group, nil)
 	ConfigureLiveSessionRoutes(group, handler, cfg)
+	ConfigureDoctorDiagnosticsRoutes(group, handler, cfg)
 }
 
 func currentRateLimitRuntime(c *gin.Context) (*rateLimitStore, *RateLimitEvaluator, bool) {

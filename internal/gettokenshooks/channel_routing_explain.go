@@ -53,8 +53,9 @@ type ChannelRoutingExplainCandidate struct {
 }
 
 type ChannelRoutingExplainFilteredAccount struct {
-	ID     string `json:"id"`
-	Reason string `json:"reason"`
+	ID             string                        `json:"id"`
+	Reason         string                        `json:"reason"`
+	DroppedReasons []ChannelRoutingDroppedReason `json:"droppedReasons,omitempty"`
 }
 
 type ChannelRoutingExplainProjectCandidate struct {
@@ -239,6 +240,8 @@ func buildChannelRoutingRuntimePool(auths []*coreauth.Auth, cfg channelRoutingPo
 		}
 		blockedByAuthID[id] = append(blockedByAuthID[id], blocks...)
 	}
+	blockedByAuthID = filterAccountRouteGuardBlocksForRequestedModel(blockedByAuthID, input.RequestedModel)
+	droppedByAccountID := map[string][]ChannelRoutingDroppedReason{}
 	accountMap := map[string]*explainRuntimeCandidate{}
 	order := orderedIDRank(cfg.OrderedAccountIDs)
 	tried := idSet(input.TriedAccountIDs)
@@ -256,6 +259,9 @@ func buildChannelRoutingRuntimePool(auths []*coreauth.Auth, cfg channelRoutingPo
 		}
 		if accountID == "" {
 			continue
+		}
+		if blocks := blockedByAuthID[strings.TrimSpace(auth.ID)]; len(blocks) > 0 {
+			droppedByAccountID[accountID] = append(droppedByAccountID[accountID], channelRoutingDroppedReasonsFromBlocks(accountID, blocks)...)
 		}
 		item := accountMap[accountID]
 		if item == nil {
@@ -336,7 +342,7 @@ func buildChannelRoutingRuntimePool(auths []*coreauth.Auth, cfg channelRoutingPo
 			},
 		})
 	}
-	return out, mapRuntimeExplainFiltered(filtered)
+	return out, mapRuntimeExplainFiltered(filtered, droppedByAccountID)
 }
 
 func applyRequestedModelRuntimeExplain(candidates []explainRuntimeCandidate, filtered []ChannelRoutingExplainFilteredAccount, requestedModel string) ([]explainRuntimeCandidate, []ChannelRoutingExplainFilteredAccount) {
@@ -438,12 +444,15 @@ func mapRuntimeExplainCandidates(candidates []explainRuntimeCandidate) []Channel
 	return out
 }
 
-func mapRuntimeExplainFiltered(items []gettokensrouting.FilteredAccount) []ChannelRoutingExplainFilteredAccount {
+func mapRuntimeExplainFiltered(items []gettokensrouting.FilteredAccount, droppedByAccountID map[string][]ChannelRoutingDroppedReason) []ChannelRoutingExplainFilteredAccount {
 	out := make([]ChannelRoutingExplainFilteredAccount, 0, len(items))
 	for _, item := range items {
+		accountID := strings.TrimSpace(item.AccountID)
 		out = append(out, ChannelRoutingExplainFilteredAccount{
-			ID:     strings.TrimSpace(item.AccountID),
+			ID:     accountID,
 			Reason: strings.TrimSpace(item.Reason),
+			DroppedReasons: append([]ChannelRoutingDroppedReason(nil),
+				droppedByAccountID[accountID]...),
 		})
 	}
 	return out

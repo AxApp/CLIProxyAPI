@@ -20,6 +20,7 @@ type persistedChannelAccountRuntimeState struct {
 
 type persistedChannelRuntimeStateSource struct {
 	Source    string `json:"source"`
+	Scope     string `json:"scope,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 	Model     string `json:"model,omitempty"`
 	ExpiresAt string `json:"expiresAt,omitempty"`
@@ -100,11 +101,13 @@ func accountRouteGuardBlocksFromPersistedState(key string, state persistedChanne
 			updatedAt = now
 		}
 		block := AccountRouteGuardBlock{
-			Source:     source.Source,
-			Reason:     strings.TrimSpace(source.Reason),
-			ExpiresAt:  expiresAt,
-			UpdatedAt:  updatedAt,
-			LookupKeys: []string{accountID},
+			Source:       source.Source,
+			FailureScope: normalizeRouteResilienceScope(RouteResilienceScope(source.Scope), source.Source),
+			Model:        strings.TrimSpace(source.Model),
+			Reason:       strings.TrimSpace(source.Reason),
+			ExpiresAt:    expiresAt,
+			UpdatedAt:    updatedAt,
+			LookupKeys:   []string{accountID},
 		}
 		if strings.HasPrefix(accountID, "auth-id:") {
 			block.AuthID = strings.TrimPrefix(accountID, "auth-id:")
@@ -337,7 +340,9 @@ func persistedRuntimeSourceFromRouteGuardBlock(block AccountRouteGuardBlock) per
 	}
 	source := persistedChannelRuntimeStateSource{
 		Source:    strings.TrimSpace(block.Source),
+		Scope:     string(normalizeRouteResilienceScope(block.FailureScope, block.Source)),
 		Reason:    strings.TrimSpace(block.Reason),
+		Model:     strings.TrimSpace(block.Model),
 		UpdatedAt: updatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if !block.ExpiresAt.IsZero() {

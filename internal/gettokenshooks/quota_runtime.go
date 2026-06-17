@@ -1,8 +1,10 @@
 package gettokenshooks
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +22,36 @@ const (
 	QuotaRuntimeStatusError    = "error"
 	QuotaRuntimeStatusStale    = "stale"
 	QuotaRuntimeStatusDegraded = "degraded"
+)
+
+const (
+	QuotaFactStateAvailable   = "available"
+	QuotaFactStateNoQuota     = "no_quota"
+	QuotaFactStateUnknown     = "unknown"
+	QuotaFactStateStale       = "stale"
+	QuotaFactStateDenied      = "denied"
+	QuotaFactStateUnsupported = "unsupported"
+
+	QuotaFactFreshnessFresh   = "fresh"
+	QuotaFactFreshnessStale   = "stale"
+	QuotaFactFreshnessUnknown = "unknown"
+
+	QuotaFactConfidenceHigh   = "high"
+	QuotaFactConfidenceMedium = "medium"
+	QuotaFactConfidenceLow    = "low"
+	QuotaFactConfidenceNone   = "none"
+
+	QuotaFactRiskNone     = "none"
+	QuotaFactRiskWarning  = "warning"
+	QuotaFactRiskBlocking = "blocking"
+	QuotaFactRiskDenied   = "denied"
+	QuotaFactRiskUnknown  = "unknown"
+)
+
+var (
+	quotaFactBearerSecretPattern = regexp.MustCompile(`(?i)bearer\s+[^\s,;]+`)
+	quotaFactAPIKeySecretPattern = regexp.MustCompile(`(?i)(api[_ -]?key|authorization|cookie|token)\s*[:=]\s*[^\s,;]+`)
+	quotaFactSKSecretPattern     = regexp.MustCompile(`sk-[A-Za-z0-9][A-Za-z0-9_-]{4,}`)
 )
 
 type QuotaRuntimeWindow struct {
@@ -52,6 +84,18 @@ type QuotaRuntimeSourceState struct {
 	NextReset string `json:"next_reset,omitempty"`
 }
 
+type QuotaRuntimeFact struct {
+	State        string   `json:"state"`
+	Source       string   `json:"source"`
+	Freshness    string   `json:"freshness"`
+	Confidence   string   `json:"confidence"`
+	Risk         string   `json:"risk"`
+	Explanation  string   `json:"explanation"`
+	ObservedAt   string   `json:"observed_at,omitempty"`
+	ExpiresAt    string   `json:"expires_at,omitempty"`
+	EvidenceRefs []string `json:"evidence_refs"`
+}
+
 type QuotaRuntimeState struct {
 	AccountKey      string                    `json:"account_key"`
 	Source          string                    `json:"source,omitempty"`
@@ -66,6 +110,18 @@ type QuotaRuntimeState struct {
 	Blocked         bool                      `json:"blocked"`
 	BlockReason     string                    `json:"block_reason,omitempty"`
 	Sources         []QuotaRuntimeSourceState `json:"sources"`
+	Fact            *QuotaRuntimeFact         `json:"fact,omitempty"`
+}
+
+func (state QuotaRuntimeState) MarshalJSON() ([]byte, error) {
+	type quotaRuntimeStateJSON QuotaRuntimeState
+	return json.Marshal(struct {
+		quotaRuntimeStateJSON
+		QuotaFact *QuotaRuntimeFact `json:"quotaFact,omitempty"`
+	}{
+		quotaRuntimeStateJSON: quotaRuntimeStateJSON(state),
+		QuotaFact:             cloneQuotaRuntimeFact(state.Fact),
+	})
 }
 
 type QuotaRuntimeStore struct {
@@ -129,6 +185,7 @@ func (s *QuotaRuntimeStore) StatesForAccounts(accountKeys []string) []QuotaRunti
 	if s == nil {
 		return nil
 	}
+	now := time.Now().UTC()
 	states := make([]QuotaRuntimeState, 0, len(accountKeys))
 	s.mu.RLock()
 	for _, accountKey := range accountKeys {
@@ -140,12 +197,12 @@ func (s *QuotaRuntimeStore) StatesForAccounts(accountKeys []string) []QuotaRunti
 			states = append(states, cloneQuotaRuntimeState(state))
 			continue
 		}
-		states = append(states, QuotaRuntimeState{
+		states = append(states, quotaRuntimeStateWithFact(QuotaRuntimeState{
 			AccountKey: accountKey,
 			Status:     QuotaRuntimeStatusStale,
 			Windows:    []QuotaRuntimeWindow{},
 			Sources:    []QuotaRuntimeSourceState{},
-		})
+		}, now))
 	}
 	s.mu.RUnlock()
 	for index := range states {
@@ -192,7 +249,7 @@ func (s *QuotaRuntimeStore) withGuardState(state QuotaRuntimeState) QuotaRuntime
 	state.Blocked = false
 	state.BlockReason = ""
 	if s == nil || s.guard == nil || strings.TrimSpace(state.AccountKey) == "" {
-		return state
+		return quotaRuntimeStateWithExistingFact(state, time.Now().UTC())
 	}
 	blocks := s.guard.ActiveBlocksForAuth(accountRouteGuardAuthForAccountKey(state.AccountKey))
 	for _, block := range blocks {
@@ -216,7 +273,7 @@ func (s *QuotaRuntimeStore) withGuardState(state QuotaRuntimeState) QuotaRuntime
 		}
 		state.BlockReason = strings.Join(reasons, "; ")
 	}
-	return state
+	return quotaRuntimeStateWithExistingFact(state, time.Now().UTC())
 }
 
 func quotaRuntimeRouteGuardBlocks(state QuotaRuntimeState, now time.Time) []AccountRouteGuardBlock {
@@ -282,6 +339,7 @@ func normalizeQuotaRuntimeState(input QuotaRuntimeState, now time.Time) (QuotaRu
 	state.Sources = []QuotaRuntimeSourceState{}
 	state.Blocked = false
 	state.BlockReason = ""
+	state = quotaRuntimeStateWithFact(state, now)
 	return state, nil
 }
 
@@ -338,6 +396,321 @@ func firstNonEmptyQuotaRuntimeString(values ...string) string {
 	return ""
 }
 
+func EnsureQuotaRuntimeFact(state QuotaRuntimeState, now time.Time) QuotaRuntimeState {
+	return quotaRuntimeStateWithFact(state, now)
+}
+
+func BuildQuotaRuntimeFact(state QuotaRuntimeState, now time.Time) QuotaRuntimeFact {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	source := firstNonEmptyQuotaRuntimeString(state.Source, "quota-runtime")
+	observedAt := quotaRuntimeFactObservedAt(state, now)
+	evidenceRefs := quotaRuntimeFactEvidenceRefs(state, source)
+	base := QuotaRuntimeFact{
+		Source:       source,
+		ObservedAt:   observedAt.UTC().Format(time.RFC3339),
+		EvidenceRefs: evidenceRefs,
+	}
+
+	reason := quotaRuntimeFactReason(state)
+	if quotaRuntimeFactUnsupported(reason) {
+		base.State = QuotaFactStateUnsupported
+		base.Freshness = QuotaFactFreshnessUnknown
+		base.Confidence = QuotaFactConfidenceNone
+		base.Risk = QuotaFactRiskUnknown
+		base.Explanation = quotaRuntimeFactExplanation("Quota check is unsupported or not configured", reason)
+		return base
+	}
+	if quotaRuntimeFactDenied(state, reason) {
+		base.State = QuotaFactStateDenied
+		base.Freshness = quotaRuntimeFactFreshnessForDenied(state)
+		base.Confidence = QuotaFactConfidenceHigh
+		base.Risk = QuotaFactRiskDenied
+		base.Explanation = quotaRuntimeFactExplanation("Provider denied quota check", reason)
+		return base
+	}
+	if quotaRuntimeStateIsStaleFact(state) {
+		if !quotaRuntimeFactHasDisplayData(state) {
+			base.State = QuotaFactStateUnknown
+			base.Freshness = QuotaFactFreshnessUnknown
+			base.Confidence = QuotaFactConfidenceNone
+			base.Risk = QuotaFactRiskUnknown
+			base.Explanation = "Quota runtime has no current quota evidence."
+			return base
+		}
+		base.State = QuotaFactStateStale
+		base.Freshness = QuotaFactFreshnessStale
+		base.Confidence = QuotaFactConfidenceLow
+		base.Risk = QuotaFactRiskWarning
+		base.Explanation = quotaRuntimeFactExplanation("Quota runtime is using stale or degraded cached quota", reason)
+		if expiresAt := latestQuotaRuntimeWindowReset(state.Windows, now); !expiresAt.IsZero() {
+			base.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+		}
+		return base
+	}
+
+	windowFacts := quotaRuntimeWindowFacts(state.Windows, now)
+	if windowFacts.known > 0 && windowFacts.exhausted == windowFacts.known && !windowFacts.latestExhaustedReset.IsZero() {
+		base.State = QuotaFactStateNoQuota
+		base.Freshness = QuotaFactFreshnessFresh
+		base.Confidence = QuotaFactConfidenceHigh
+		base.Risk = QuotaFactRiskBlocking
+		base.ExpiresAt = windowFacts.latestExhaustedReset.UTC().Format(time.RFC3339)
+		base.Explanation = "Known quota windows are exhausted until " + base.ExpiresAt + "."
+		return base
+	}
+	if windowFacts.positive > 0 || quotaRuntimeBillingHasEvidence(state.Billing) {
+		base.State = QuotaFactStateAvailable
+		base.Freshness = QuotaFactFreshnessFresh
+		base.Confidence = QuotaFactConfidenceHigh
+		base.Risk = QuotaFactRiskNone
+		base.Explanation = "Quota runtime has fresh available quota evidence."
+		if expiresAt := latestQuotaRuntimeWindowReset(state.Windows, now); !expiresAt.IsZero() {
+			base.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+		}
+		return base
+	}
+
+	base.State = QuotaFactStateUnknown
+	base.Freshness = QuotaFactFreshnessUnknown
+	base.Confidence = QuotaFactConfidenceNone
+	base.Risk = QuotaFactRiskUnknown
+	base.Explanation = "Quota runtime has no current quota evidence."
+	return base
+}
+
+type quotaRuntimeWindowFactSummary struct {
+	known                int
+	positive             int
+	exhausted            int
+	latestExhaustedReset time.Time
+}
+
+func quotaRuntimeStateWithFact(state QuotaRuntimeState, now time.Time) QuotaRuntimeState {
+	if state.Fact != nil {
+		state.Fact = normalizeProvidedQuotaRuntimeFact(state.Fact, state, now)
+		return state
+	}
+	fact := BuildQuotaRuntimeFact(state, now)
+	state.Fact = &fact
+	return state
+}
+
+func quotaRuntimeStateWithExistingFact(state QuotaRuntimeState, now time.Time) QuotaRuntimeState {
+	if state.Fact == nil {
+		return state
+	}
+	state.Fact = normalizeProvidedQuotaRuntimeFact(state.Fact, state, now)
+	return state
+}
+
+func normalizeProvidedQuotaRuntimeFact(input *QuotaRuntimeFact, state QuotaRuntimeState, now time.Time) *QuotaRuntimeFact {
+	if input == nil {
+		return nil
+	}
+	fact := *input
+	fact.State = strings.TrimSpace(fact.State)
+	fact.Source = strings.TrimSpace(fact.Source)
+	if fact.Source == "" {
+		fact.Source = firstNonEmptyQuotaRuntimeString(state.Source, "quota-runtime")
+	}
+	fact.Freshness = strings.TrimSpace(fact.Freshness)
+	fact.Confidence = strings.TrimSpace(fact.Confidence)
+	fact.Risk = strings.TrimSpace(fact.Risk)
+	fact.Explanation = sanitizeQuotaRuntimeFactExplanation(fact.Explanation)
+	fact.ObservedAt = strings.TrimSpace(fact.ObservedAt)
+	if fact.ObservedAt == "" {
+		if now.IsZero() {
+			now = time.Now()
+		}
+		fact.ObservedAt = quotaRuntimeFactObservedAt(state, now.UTC()).Format(time.RFC3339)
+	}
+	fact.ExpiresAt = strings.TrimSpace(fact.ExpiresAt)
+	fact.EvidenceRefs = uniqueQuotaRuntimeFactRefs(fact.EvidenceRefs)
+	if fact.EvidenceRefs == nil {
+		fact.EvidenceRefs = []string{}
+	}
+	return &fact
+}
+
+func quotaRuntimeFactObservedAt(state QuotaRuntimeState, now time.Time) time.Time {
+	if parsed := parseQuotaRuntimeTimestamp(state.LastEvaluatedAt, time.Time{}); !parsed.IsZero() {
+		return parsed.UTC()
+	}
+	if parsed := parseQuotaRuntimeTimestamp(state.UpdatedAt, time.Time{}); !parsed.IsZero() {
+		return parsed.UTC()
+	}
+	if now.IsZero() {
+		return time.Now().UTC()
+	}
+	return now.UTC()
+}
+
+func quotaRuntimeFactReason(state QuotaRuntimeState) string {
+	return firstNonEmptyQuotaRuntimeString(state.DegradedReason, state.BlockReason, state.Status)
+}
+
+func quotaRuntimeFactUnsupported(reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(reason))
+	return strings.Contains(text, "unsupported") ||
+		strings.Contains(text, "does not support quota") ||
+		strings.Contains(text, "quota curl is not configured") ||
+		strings.Contains(text, "quota refresh is not configured") ||
+		strings.Contains(text, "account kind does not support")
+}
+
+func quotaRuntimeFactDenied(state QuotaRuntimeState, reason string) bool {
+	text := strings.ToLower(strings.TrimSpace(state.Status + " " + reason))
+	return strings.Contains(text, "status 401") ||
+		strings.Contains(text, "status 402") ||
+		strings.Contains(text, "status 403") ||
+		strings.Contains(text, "unauthorized") ||
+		strings.Contains(text, "forbidden") ||
+		strings.Contains(text, "permission denied") ||
+		strings.Contains(text, "access denied") ||
+		strings.Contains(text, "not authorized") ||
+		strings.Contains(text, "invalid_grant") ||
+		strings.Contains(text, "invalid auth") ||
+		strings.Contains(text, "token_invalidated") ||
+		strings.Contains(text, "deactivated_workspace")
+}
+
+func quotaRuntimeFactFreshnessForDenied(state QuotaRuntimeState) string {
+	if state.Stale && quotaRuntimeFactHasDisplayData(state) {
+		return QuotaFactFreshnessStale
+	}
+	return QuotaFactFreshnessFresh
+}
+
+func quotaRuntimeStateIsStaleFact(state QuotaRuntimeState) bool {
+	return state.Stale ||
+		strings.EqualFold(state.Status, QuotaRuntimeStatusStale) ||
+		strings.EqualFold(state.Status, QuotaRuntimeStatusDegraded) ||
+		quotaRuntimeStateIsDegraded(state)
+}
+
+func quotaRuntimeWindowFacts(windows []QuotaRuntimeWindow, now time.Time) quotaRuntimeWindowFactSummary {
+	summary := quotaRuntimeWindowFactSummary{}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	for _, window := range windows {
+		remaining, ok := quotaRuntimeWindowRemaining(window)
+		if !ok {
+			continue
+		}
+		summary.known++
+		if remaining > 0 {
+			summary.positive++
+			continue
+		}
+		summary.exhausted++
+		resetAt := quotaRuntimeWindowResetAt(window)
+		if resetAt.IsZero() || !resetAt.After(now) {
+			continue
+		}
+		if summary.latestExhaustedReset.IsZero() || resetAt.After(summary.latestExhaustedReset) {
+			summary.latestExhaustedReset = resetAt.UTC()
+		}
+	}
+	return summary
+}
+
+func quotaRuntimeFactHasDisplayData(state QuotaRuntimeState) bool {
+	return strings.TrimSpace(state.PlanType) != "" ||
+		len(state.Windows) > 0 ||
+		quotaRuntimeBillingHasEvidence(state.Billing)
+}
+
+func quotaRuntimeBillingHasEvidence(billing *QuotaRuntimeBilling) bool {
+	return billing != nil && (billing.IsAvailable || len(billing.BalanceInfos) > 0)
+}
+
+func latestQuotaRuntimeWindowReset(windows []QuotaRuntimeWindow, now time.Time) time.Time {
+	latest := time.Time{}
+	for _, window := range windows {
+		resetAt := quotaRuntimeWindowResetAt(window)
+		if resetAt.IsZero() || !resetAt.After(now) {
+			continue
+		}
+		if latest.IsZero() || resetAt.After(latest) {
+			latest = resetAt.UTC()
+		}
+	}
+	return latest
+}
+
+func quotaRuntimeFactEvidenceRefs(state QuotaRuntimeState, source string) []string {
+	refs := []string{}
+	add := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			return
+		}
+		for _, existing := range refs {
+			if existing == ref {
+				return
+			}
+		}
+		refs = append(refs, ref)
+	}
+	if source != "" {
+		add("source:" + source)
+	}
+	for _, window := range state.Windows {
+		add("quota.window:" + quotaRuntimeWindowKey(window))
+	}
+	if quotaRuntimeBillingHasEvidence(state.Billing) {
+		add("billing:available")
+	}
+	for _, sourceState := range state.Sources {
+		if sourceState.Source != "" {
+			add("route_guard:" + sourceState.Source)
+		}
+	}
+	sort.Strings(refs)
+	return refs
+}
+
+func uniqueQuotaRuntimeFactRefs(values []string) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		ref := strings.TrimSpace(value)
+		if ref == "" {
+			continue
+		}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func quotaRuntimeFactExplanation(prefix string, reason string) string {
+	reason = sanitizeQuotaRuntimeFactExplanation(reason)
+	if reason == "" {
+		return prefix + "."
+	}
+	return prefix + ": " + reason
+}
+
+func sanitizeQuotaRuntimeFactExplanation(value string) string {
+	text := strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	text = quotaFactBearerSecretPattern.ReplaceAllString(text, "Bearer [redacted]")
+	text = quotaFactAPIKeySecretPattern.ReplaceAllString(text, "$1=[redacted]")
+	text = quotaFactSKSecretPattern.ReplaceAllString(text, "sk-[redacted]")
+	if len(text) > 240 {
+		text = strings.TrimSpace(text[:240]) + "..."
+	}
+	return text
+}
+
 func cloneQuotaRuntimeState(state QuotaRuntimeState) QuotaRuntimeState {
 	state.Windows = append([]QuotaRuntimeWindow(nil), state.Windows...)
 	if state.Billing != nil {
@@ -346,7 +719,19 @@ func cloneQuotaRuntimeState(state QuotaRuntimeState) QuotaRuntimeState {
 		state.Billing = &billing
 	}
 	state.Sources = append([]QuotaRuntimeSourceState(nil), state.Sources...)
+	if state.Fact != nil {
+		state.Fact = cloneQuotaRuntimeFact(state.Fact)
+	}
 	return state
+}
+
+func cloneQuotaRuntimeFact(input *QuotaRuntimeFact) *QuotaRuntimeFact {
+	if input == nil {
+		return nil
+	}
+	fact := *input
+	fact.EvidenceRefs = append([]string(nil), input.EvidenceRefs...)
+	return &fact
 }
 
 func ConfigureQuotaRuntimeRoutes(group *gin.RouterGroup, _ *handlers.BaseAPIHandler, _ *config.Config) {
@@ -373,7 +758,7 @@ func configureQuotaRuntimeRoutes(group *gin.RouterGroup, store *QuotaRuntimeStor
 				c.JSON(http.StatusOK, state)
 				return
 			}
-			c.JSON(http.StatusOK, QuotaRuntimeState{AccountKey: accountKey, Status: QuotaRuntimeStatusStale, Windows: []QuotaRuntimeWindow{}, Sources: []QuotaRuntimeSourceState{}})
+			c.JSON(http.StatusOK, quotaRuntimeStateWithFact(QuotaRuntimeState{AccountKey: accountKey, Status: QuotaRuntimeStatusStale, Windows: []QuotaRuntimeWindow{}, Sources: []QuotaRuntimeSourceState{}}, time.Now().UTC()))
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"items": store.States()})

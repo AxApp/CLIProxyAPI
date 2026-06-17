@@ -19,6 +19,18 @@ type RouteDecisionCandidateSnapshot struct {
 	Provider   string
 }
 
+type RouteDecisionDroppedReasonSnapshot struct {
+	AuthID        string
+	AccountKey    string
+	Source        string
+	Scope         string
+	Reason        string
+	Model         string
+	ExpiresAt     time.Time
+	UpdatedAt     time.Time
+	RouteBlocking bool
+}
+
 type RouteDecisionSnapshot struct {
 	ID                   string
 	RecordedAt           time.Time
@@ -39,6 +51,7 @@ type RouteDecisionSnapshot struct {
 	UnavailableCode      string
 	UnavailableMessage   string
 	Trace                []gettokensrouting.DecisionStep
+	DroppedReasons       []RouteDecisionDroppedReasonSnapshot
 }
 
 var routeDecisionHistory = struct {
@@ -52,9 +65,10 @@ func recordRouteDecision(req routeRequest, source string, result gettokensroutin
 	defer routeDecisionHistory.Unlock()
 
 	routeDecisionHistory.nextID++
+	recordedAt := time.Now().UTC()
 	snapshot := RouteDecisionSnapshot{
 		ID:                 "route-decision-" + intString(routeDecisionHistory.nextID),
-		RecordedAt:         time.Now().UTC(),
+		RecordedAt:         recordedAt,
 		Provider:           strings.TrimSpace(strings.ToLower(req.Provider)),
 		Providers:          append([]string(nil), req.Providers...),
 		Model:              strings.TrimSpace(req.Model),
@@ -68,6 +82,7 @@ func recordRouteDecision(req routeRequest, source string, result gettokensroutin
 		UnavailableCode:    routeDecisionErrorCode(err),
 		UnavailableMessage: routeDecisionErrorMessage(err),
 		ProjectMatchKeys:   []string{},
+		DroppedReasons:     routeDecisionDroppedReasonsFromTrace(result.Trace, result.Candidates, req.Model, recordedAt),
 	}
 	if codexCtx := gettokenscodex.RequestContextFromMetadata(req.Options.Metadata); codexCtx != nil {
 		snapshot.ProjectKey = strings.TrimSpace(codexCtx.ProjectKey)
@@ -134,6 +149,7 @@ func cloneRouteDecisionSnapshot(item RouteDecisionSnapshot) RouteDecisionSnapsho
 	cloned.ProjectMatchKeys = append([]string(nil), item.ProjectMatchKeys...)
 	cloned.Candidates = append([]RouteDecisionCandidateSnapshot(nil), item.Candidates...)
 	cloned.Trace = cloneRouteDecisionTrace(item.Trace)
+	cloned.DroppedReasons = append([]RouteDecisionDroppedReasonSnapshot(nil), item.DroppedReasons...)
 	return cloned
 }
 
@@ -173,6 +189,121 @@ func routeDecisionCandidatesFromRouteResult(result gettokensrouting.RouteResult)
 		out = append(out, item)
 	}
 	return out
+}
+
+func routeDecisionDroppedReasonsFromTrace(trace []gettokensrouting.DecisionStep, candidates []gettokensrouting.RouteCandidate, model string, recordedAt time.Time) []RouteDecisionDroppedReasonSnapshot {
+	if len(trace) == 0 {
+		return []RouteDecisionDroppedReasonSnapshot{}
+	}
+	accountByAuthID := routeDecisionAccountKeysByAuthID(candidates)
+	model = strings.TrimSpace(model)
+	out := []RouteDecisionDroppedReasonSnapshot{}
+	seen := map[string]struct{}{}
+	for _, step := range trace {
+		if len(step.DenyIDs) == 0 {
+			continue
+		}
+		sources := routeDecisionDroppedSourcesFromStep(step)
+		if len(sources) == 0 {
+			continue
+		}
+		for _, authID := range step.DenyIDs {
+			authID = strings.TrimSpace(authID)
+			if authID == "" {
+				continue
+			}
+			for _, source := range sources {
+				if strings.TrimSpace(source.source) == "" {
+					continue
+				}
+				item := RouteDecisionDroppedReasonSnapshot{
+					AuthID:        authID,
+					AccountKey:    accountByAuthID[authID],
+					Source:        strings.TrimSpace(source.source),
+					Scope:         routeDecisionFailureScopeForSource(source.source),
+					Reason:        strings.TrimSpace(source.reason),
+					Model:         model,
+					UpdatedAt:     recordedAt,
+					RouteBlocking: true,
+				}
+				key := strings.Join([]string{item.AuthID, item.AccountKey, item.Source, item.Scope, item.Reason, item.Model}, "\x00")
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, item)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return []RouteDecisionDroppedReasonSnapshot{}
+	}
+	return out
+}
+
+func routeDecisionAccountKeysByAuthID(candidates []gettokensrouting.RouteCandidate) map[string]string {
+	out := map[string]string{}
+	for _, candidate := range candidates {
+		authID := strings.TrimSpace(candidate.ID)
+		if authID == "" {
+			continue
+		}
+		if auth, ok := candidate.Value.(*Auth); ok && auth != nil {
+			out[authID] = strings.TrimSpace(auth.AccountKey)
+			if auth.ID != "" {
+				out[strings.TrimSpace(auth.ID)] = strings.TrimSpace(auth.AccountKey)
+			}
+		}
+	}
+	return out
+}
+
+type routeDecisionDroppedSource struct {
+	source string
+	reason string
+}
+
+func routeDecisionDroppedSourcesFromStep(step gettokensrouting.DecisionStep) []routeDecisionDroppedSource {
+	policy := strings.TrimSpace(step.Policy)
+	reason := strings.TrimSpace(step.Reason)
+	if policy != "account-route-guard" && !strings.HasPrefix(reason, "gettokens account route guard") {
+		return nil
+	}
+	payload := ""
+	if index := strings.Index(reason, ":"); index >= 0 {
+		payload = strings.TrimSpace(reason[index+1:])
+	}
+	if payload == "" {
+		return nil
+	}
+	out := []routeDecisionDroppedSource{}
+	for _, part := range strings.Split(payload, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		source, detail, found := strings.Cut(part, "=")
+		source = strings.TrimSpace(source)
+		if source == "" {
+			continue
+		}
+		if !found {
+			detail = ""
+		}
+		out = append(out, routeDecisionDroppedSource{source: source, reason: strings.TrimSpace(detail)})
+	}
+	return out
+}
+
+func routeDecisionFailureScopeForSource(source string) string {
+	switch strings.TrimSpace(source) {
+	case "model-lockout", "model-cooldown", "model-unavailable":
+		return "model"
+	case "provider-lockout", "provider-cooldown", "provider-unavailable":
+		return "provider"
+	default:
+		return "account"
+	}
 }
 
 func routeDecisionSelectedAuthID(selected *Auth) string {

@@ -102,6 +102,92 @@ func TestAccountRouteGuardActiveBlocksForAuthReturnsSourceDetails(t *testing.T) 
 	}
 }
 
+func TestRouteResilienceStateDefaultsRouteGuardSourcesToAccountScope(t *testing.T) {
+	sources := []string{
+		AccountRouteGuardSourceManualDisabled,
+		AccountRouteGuardSourceRateLimit,
+		AccountRouteGuardSourceQuotaEmpty,
+		AccountRouteGuardSourceAuthError,
+		AccountRouteGuardSourceUpstreamRateLimit,
+		AccountRouteGuardSourceUpstreamTransientErr,
+	}
+	for _, source := range sources {
+		t.Run(source, func(t *testing.T) {
+			state, ok := routeResilienceStateFromBlock(AccountRouteGuardBlock{
+				Source: source,
+				AuthID: "auth-a",
+				Reason: "blocked",
+			})
+			if !ok {
+				t.Fatalf("routeResilienceStateFromBlock ok = false")
+			}
+			if state.Scope != RouteResilienceScopeAccount {
+				t.Fatalf("Scope = %q, want account", state.Scope)
+			}
+			if !state.RouteBlocking {
+				t.Fatalf("RouteBlocking = false, want true")
+			}
+		})
+	}
+}
+
+func TestRouteResilienceStatePreservesExplicitModelScope(t *testing.T) {
+	state, ok := routeResilienceStateFromBlock(AccountRouteGuardBlock{
+		Source:       AccountRouteGuardSourceUpstreamTransientErr,
+		FailureScope: RouteResilienceScopeModel,
+		AuthID:       "auth-a",
+		AccountKey:   "acct_00000000-0000-4000-8000-000000000001",
+		Model:        "gpt-5",
+		Reason:       "model capacity",
+	})
+	if !ok {
+		t.Fatalf("routeResilienceStateFromBlock ok = false")
+	}
+	if state.Scope != RouteResilienceScopeModel {
+		t.Fatalf("Scope = %q, want model", state.Scope)
+	}
+	if state.Model != "gpt-5" {
+		t.Fatalf("Model = %q, want gpt-5", state.Model)
+	}
+}
+
+func TestRouteResilienceModelScopedGuardDoesNotDenyOtherModels(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	auth := &coreauth.Auth{
+		ID:         "auth-model-specific",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000003",
+		Provider:   "codex",
+	}
+	store.MarkBlocked(AccountRouteGuardBlock{
+		Source:       AccountRouteGuardSourceUpstreamTransientErr,
+		FailureScope: RouteResilienceScopeModel,
+		AuthID:       auth.ID,
+		AccountKey:   auth.AccountKey,
+		Model:        "gpt-5",
+		Reason:       "model capacity",
+	})
+
+	otherModelDecision := accountRouteGuardPolicy{store: store}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Model: "gpt-5-mini",
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: auth.ID, Value: auth},
+		},
+	})
+	if len(otherModelDecision.DenyIDs) != 0 {
+		t.Fatalf("other model DenyIDs = %#v, want no deny for model-scoped block", otherModelDecision.DenyIDs)
+	}
+
+	blockedModelDecision := accountRouteGuardPolicy{store: store}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Model: "gpt-5",
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: auth.ID, Value: auth},
+		},
+	})
+	if len(blockedModelDecision.DenyIDs) != 1 || blockedModelDecision.DenyIDs[0] != auth.ID {
+		t.Fatalf("blocked model DenyIDs = %#v, want auth denied", blockedModelDecision.DenyIDs)
+	}
+}
+
 func TestAccountRouteGuardPolicyReasonIncludesActiveSources(t *testing.T) {
 	store := NewAccountRouteGuardStore()
 	authA := &coreauth.Auth{ID: "auth-a", AccountKey: "acct_00000000-0000-4000-8000-000000000001", Provider: "codex"}
@@ -130,6 +216,50 @@ func TestAccountRouteGuardPolicyReasonIncludesActiveSources(t *testing.T) {
 	}
 	if !strings.Contains(decision.Reason, AccountRouteGuardSourceManualDisabled) || !strings.Contains(decision.Reason, AccountRouteGuardSourceRateLimit) {
 		t.Fatalf("Reason = %q, want active guard sources", decision.Reason)
+	}
+}
+
+func TestRouteResilienceStatesFromPersistedRuntimeState(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": [],
+      "channelGroupStates": {}
+    }
+  },
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "auth-error": {
+          "source": "auth-error",
+          "reason": "token expired",
+          "model": "gpt-5",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	blocksByAuthID := activePersistedChannelRuntimeBlocksForCandidates([]*coreauth.Auth{{
+		ID:         "auth-a",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Provider:   "codex",
+	}})
+	states := routeResilienceStatesFromBlocks(blocksByAuthID["auth-a"])
+	if len(states) != 1 {
+		t.Fatalf("states = %#v, want one persisted route resilience state", states)
+	}
+	if states[0].Scope != RouteResilienceScopeAccount || states[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("state = %#v, want account-scoped auth-error", states[0])
+	}
+	if states[0].Model != "gpt-5" || states[0].Reason != "token expired" {
+		t.Fatalf("state = %#v, want model and reason preserved", states[0])
 	}
 }
 
@@ -347,6 +477,7 @@ func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *tes
 		Source:     AccountRouteGuardSourceAuthError,
 		AuthID:     "auth-a",
 		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Model:      "gpt-5",
 		Reason:     "token expired",
 	})
 
@@ -360,6 +491,12 @@ func TestAccountRouteGuardStorePersistsRuntimeStateToChannelRoutingConfig(t *tes
 	}
 	if source := state.Sources[AccountRouteGuardSourceAuthError]; source.Reason != "token expired" {
 		t.Fatalf("persisted reason = %q, want token expired", source.Reason)
+	}
+	if source := state.Sources[AccountRouteGuardSourceAuthError]; source.Scope != string(RouteResilienceScopeAccount) {
+		t.Fatalf("persisted scope = %q, want account", source.Scope)
+	}
+	if source := state.Sources[AccountRouteGuardSourceAuthError]; source.Model != "gpt-5" {
+		t.Fatalf("persisted model = %q, want gpt-5", source.Model)
 	}
 	if source := state.Sources[AccountRouteGuardSourceRateLimit]; source.Reason != "cooldown" {
 		t.Fatalf("existing persisted rate-limit source = %#v, want preserved cooldown", source)
@@ -454,7 +591,9 @@ type routeGuardPersistedRuntimeState struct {
 
 type routeGuardPersistedRuntimeSource struct {
 	Source string `json:"source"`
+	Scope  string `json:"scope"`
 	Reason string `json:"reason"`
+	Model  string `json:"model"`
 }
 
 func writeRouteGuardChannelRoutingConfig(t *testing.T, body string) string {

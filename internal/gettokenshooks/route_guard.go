@@ -29,13 +29,15 @@ var accountRouteGuardResultTransientSources = []string{
 }
 
 type AccountRouteGuardBlock struct {
-	Source     string
-	AuthID     string
-	AccountKey string
-	LookupKeys []string
-	Reason     string
-	ExpiresAt  time.Time
-	UpdatedAt  time.Time
+	Source       string
+	FailureScope RouteResilienceScope
+	AuthID       string
+	AccountKey   string
+	LookupKeys   []string
+	Model        string
+	Reason       string
+	ExpiresAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type AccountRouteGuardStore struct {
@@ -325,6 +327,31 @@ func (s *AccountRouteGuardStore) ActiveBlocksForCandidates(candidates []*coreaut
 	return out
 }
 
+func filterAccountRouteGuardBlocksForRequestedModel(blocksByID map[string][]AccountRouteGuardBlock, requestedModel string) map[string][]AccountRouteGuardBlock {
+	if len(blocksByID) == 0 {
+		return blocksByID
+	}
+	requestedModel = strings.TrimSpace(requestedModel)
+	filtered := map[string][]AccountRouteGuardBlock{}
+	for id, blocks := range blocksByID {
+		kept := make([]AccountRouteGuardBlock, 0, len(blocks))
+		for _, block := range blocks {
+			block = normalizeAccountRouteGuardBlock(block)
+			if block.FailureScope == RouteResilienceScopeModel && requestedModel != "" && block.Model != "" && block.Model != requestedModel {
+				continue
+			}
+			kept = append(kept, block)
+		}
+		if len(kept) > 0 {
+			filtered[id] = kept
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
 func AccountRouteGuardBlocksAuth(auth *coreauth.Auth) bool {
 	return defaultAccountRouteGuardStore.IsAuthBlocked(auth)
 }
@@ -431,6 +458,7 @@ func (p accountRouteGuardPolicy) RewriteCandidates(ctx context.Context, req gett
 	candidates := authCandidatesFromRouteContext(req)
 	blocksByID := store.ActiveBlocksForCandidates(candidates)
 	blocksByID = mergeAccountRouteGuardBlocks(blocksByID, activePersistedChannelRuntimeBlocksForCandidates(candidates))
+	blocksByID = filterAccountRouteGuardBlocksForRequestedModel(blocksByID, req.Model)
 	if len(blocksByID) == 0 {
 		return gettokensrouting.PolicyDecision{}
 	}
@@ -495,8 +523,10 @@ func mergeAccountRouteGuardBlocks(target map[string][]AccountRouteGuardBlock, ex
 
 func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteGuardBlock {
 	block.Source = strings.TrimSpace(block.Source)
+	block.FailureScope = normalizeRouteResilienceScope(block.FailureScope, block.Source)
 	block.AuthID = strings.TrimSpace(block.AuthID)
 	block.AccountKey = strings.TrimSpace(block.AccountKey)
+	block.Model = strings.TrimSpace(block.Model)
 	block.Reason = strings.TrimSpace(block.Reason)
 	if block.UpdatedAt.IsZero() {
 		block.UpdatedAt = time.Now().UTC()
@@ -561,10 +591,12 @@ func accountRouteGuardBlockForResult(result coreauth.Result) (AccountRouteGuardB
 		cooldown = *result.RetryAfter
 	}
 	block := AccountRouteGuardBlock{
-		Source:     source,
-		AuthID:     authID,
-		AccountKey: "auth-id:" + authID,
-		Reason:     reason,
+		Source:       source,
+		FailureScope: routeResilienceScopeForRouteGuardSource(source),
+		AuthID:       authID,
+		AccountKey:   "auth-id:" + authID,
+		Model:        strings.TrimSpace(result.Model),
+		Reason:       reason,
 	}
 	if cooldown > 0 {
 		block.ExpiresAt = time.Now().UTC().Add(cooldown)

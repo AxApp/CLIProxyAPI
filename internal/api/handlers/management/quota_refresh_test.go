@@ -86,6 +86,9 @@ func TestQuotaRefreshCodexAPIKeyAccountWritesRuntimeGuard(t *testing.T) {
 	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != gettokenshooks.AccountRouteGuardSourceQuotaEmpty {
 		t.Fatalf("guard state = blocked:%v sources:%#v, want quota-empty", state.Blocked, state.Sources)
 	}
+	if state.Fact == nil || state.Fact.State != "no_quota" || state.Fact.Risk != "blocking" {
+		t.Fatalf("fact = %#v, want no_quota blocking fact", state.Fact)
+	}
 	if state.Sources[0].ExpiresAt == "" || state.Sources[0].NextReset == "" {
 		t.Fatalf("quota-empty source missing reset fields: %#v", state.Sources[0])
 	}
@@ -166,6 +169,65 @@ func TestQuotaRefreshOpenAICompatibleAccountWritesBillingRuntime(t *testing.T) {
 	}
 	if state.Billing.BalanceInfos[0].TotalBalance != "42.00" {
 		t.Fatalf("balance = %#v, want total 42.00", state.Billing.BalanceInfos[0])
+	}
+	if state.Fact == nil || state.Fact.State != "available" || state.Fact.Source != "openai-compatible-quota-curl" {
+		t.Fatalf("fact = %#v, want available openai-compatible fact", state.Fact)
+	}
+}
+
+func TestQuotaRefreshDegradedFallbackReturnsSanitizedFact(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	resetAt := time.Now().UTC().Add(time.Hour).Unix()
+	denyRefresh := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if denyRefresh {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"Bearer sk-secret should not leak"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"plan_type":"pro",
+			"rate_limit":{
+				"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_at":` + jsonInt(resetAt) + `}
+			}
+		}`))
+	}))
+	defer upstream.Close()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(filepath.Join(t.TempDir(), "accounts-v1.sqlite"))
+
+	router := gin.New()
+	router.POST("/v0/management/accounts", h.CreateAccount)
+	router.POST("/v0/management/gettokens/quota-refresh/:account_key", h.RefreshAccountQuota)
+
+	accountKey := createQuotaRefreshTestAccount(t, router, "degraded-fact", upstream.URL)
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-refresh/"+accountKey, bytes.NewReader([]byte(`{"include_billing":false}`))))
+	if first.Code != http.StatusOK {
+		t.Fatalf("initial refresh status = %d body=%s", first.Code, first.Body.String())
+	}
+
+	denyRefresh = true
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-refresh/"+accountKey, bytes.NewReader([]byte(`{"include_billing":false}`))))
+	if second.Code != http.StatusOK {
+		t.Fatalf("degraded refresh status = %d body=%s", second.Code, second.Body.String())
+	}
+	var state gettokenshooks.QuotaRuntimeState
+	if err := json.Unmarshal(second.Body.Bytes(), &state); err != nil {
+		t.Fatalf("unmarshal degraded refresh: %v", err)
+	}
+	if state.Status != gettokenshooks.QuotaRuntimeStatusDegraded || !state.Stale {
+		t.Fatalf("state status/stale = %#v, want degraded stale cache", state)
+	}
+	if state.Fact == nil || state.Fact.State != "denied" || state.Fact.Risk != "denied" {
+		t.Fatalf("fact = %#v, want denied fact", state.Fact)
+	}
+	if bytes.Contains([]byte(state.Fact.Explanation), []byte("sk-secret")) || bytes.Contains([]byte(state.Fact.Explanation), []byte("Bearer ")) {
+		t.Fatalf("fact explanation leaked secret: %q", state.Fact.Explanation)
 	}
 }
 
@@ -757,6 +819,9 @@ func TestBillingDraftParsesOpenRouterWithoutRuntimeWrite(t *testing.T) {
 	}
 	if state.Billing == nil || !state.Billing.IsAvailable || len(state.Billing.BalanceInfos) != 1 {
 		t.Fatalf("billing = %#v, want one available balance", state.Billing)
+	}
+	if state.Fact == nil || state.Fact.State != "available" || state.Fact.Source != quotaBillingDraftTestSource {
+		t.Fatalf("fact = %#v, want billing-test available fact", state.Fact)
 	}
 	balance := state.Billing.BalanceInfos[0]
 	if balance.Currency != "USD" || balance.TotalBalance != "12.50" || balance.GrantedBalance != "8.25" || balance.ToppedUpBalance != "12.50" {
