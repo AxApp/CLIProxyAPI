@@ -665,6 +665,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/gettokens/quota-refresh-batch", s.mgmt.RefreshAccountQuotaBatch)
 		mgmt.POST("/gettokens/quota-refresh-batch/jobs", s.mgmt.StartAccountQuotaBatchRefreshJob)
 		mgmt.GET("/gettokens/quota-refresh-batch/jobs/:job_id", s.mgmt.GetAccountQuotaBatchRefreshJob)
+		mgmt.GET("/gettokens/openai-quota-reset/:account_key", s.mgmt.GetOpenAIQuotaResetCredit)
+		mgmt.POST("/gettokens/openai-quota-reset/:account_key/consume", s.mgmt.ConsumeOpenAIQuotaResetCredit)
 		mgmt.POST("/gettokens/quota-test", s.mgmt.TestQuotaCurl)
 		mgmt.POST("/gettokens/billing-test", s.mgmt.TestBillingCurl)
 
