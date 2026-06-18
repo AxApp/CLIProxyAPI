@@ -52,25 +52,39 @@ type DoctorDiagnosticCheck struct {
 }
 
 type DoctorDiagnosticEvidence struct {
-	Kind          string                       `json:"kind"`
-	AccountKey    string                       `json:"accountKey,omitempty"`
-	AuthID        string                       `json:"authId,omitempty"`
-	Source        string                       `json:"source,omitempty"`
-	Scope         string                       `json:"scope,omitempty"`
-	Reason        string                       `json:"reason,omitempty"`
-	Model         string                       `json:"model,omitempty"`
-	ExpiresAt     string                       `json:"expiresAt,omitempty"`
-	UpdatedAt     string                       `json:"updatedAt,omitempty"`
-	RouteBlocking bool                         `json:"routeBlocking,omitempty"`
-	State         string                       `json:"state,omitempty"`
-	Freshness     string                       `json:"freshness,omitempty"`
-	Confidence    string                       `json:"confidence,omitempty"`
-	Risk          string                       `json:"risk,omitempty"`
-	Explanation   string                       `json:"explanation,omitempty"`
-	ObservedAt    string                       `json:"observedAt,omitempty"`
-	EvidenceRefs  []string                     `json:"evidenceRefs,omitempty"`
-	DroppedReason *ChannelRoutingDroppedReason `json:"droppedReason,omitempty"`
-	QuotaFact     *QuotaRuntimeFact            `json:"quotaFact,omitempty"`
+	Kind          string                         `json:"kind"`
+	AccountKey    string                         `json:"accountKey,omitempty"`
+	AccountID     string                         `json:"accountId,omitempty"`
+	AuthID        string                         `json:"authId,omitempty"`
+	Source        string                         `json:"source,omitempty"`
+	Scope         string                         `json:"scope,omitempty"`
+	Reason        string                         `json:"reason,omitempty"`
+	Model         string                         `json:"model,omitempty"`
+	ExpiresAt     string                         `json:"expiresAt,omitempty"`
+	UpdatedAt     string                         `json:"updatedAt,omitempty"`
+	RouteBlocking bool                           `json:"routeBlocking,omitempty"`
+	State         string                         `json:"state,omitempty"`
+	Freshness     string                         `json:"freshness,omitempty"`
+	Confidence    string                         `json:"confidence,omitempty"`
+	Risk          string                         `json:"risk,omitempty"`
+	Explanation   string                         `json:"explanation,omitempty"`
+	ObservedAt    string                         `json:"observedAt,omitempty"`
+	EvidenceRefs  []string                       `json:"evidenceRefs,omitempty"`
+	DroppedReason *DoctorDiagnosticDroppedReason `json:"droppedReason,omitempty"`
+	QuotaFact     *QuotaRuntimeFact              `json:"quotaFact,omitempty"`
+}
+
+type DoctorDiagnosticDroppedReason struct {
+	AccountKey    string               `json:"accountKey,omitempty"`
+	AccountID     string               `json:"accountId,omitempty"`
+	AuthID        string               `json:"authId,omitempty"`
+	Source        string               `json:"source"`
+	Scope         RouteResilienceScope `json:"scope"`
+	Reason        string               `json:"reason,omitempty"`
+	Model         string               `json:"model,omitempty"`
+	ExpiresAt     string               `json:"expiresAt,omitempty"`
+	UpdatedAt     string               `json:"updatedAt,omitempty"`
+	RouteBlocking bool                 `json:"routeBlocking"`
 }
 
 type DoctorDiagnosticsOptions struct {
@@ -253,17 +267,30 @@ func doctorDiagnosticsTargets(options DoctorDiagnosticsOptions) []doctorDiagnost
 }
 
 func doctorDiagnosticsEvidenceFromDroppedReason(reason ChannelRoutingDroppedReason) DoctorDiagnosticEvidence {
-	dropped := reason
-	return DoctorDiagnosticEvidence{
-		Kind:          DoctorDiagnosticEvidenceRouteDroppedReason,
-		AccountKey:    strings.TrimSpace(reason.AccountID),
+	accountID := strings.TrimSpace(reason.AccountID)
+	dropped := DoctorDiagnosticDroppedReason{
+		AccountKey:    accountID,
+		AccountID:     accountID,
 		AuthID:        strings.TrimSpace(reason.AuthID),
 		Source:        strings.TrimSpace(reason.Source),
-		Scope:         strings.TrimSpace(string(reason.Scope)),
+		Scope:         normalizeRouteResilienceScope(reason.Scope, reason.Source),
 		Reason:        strings.TrimSpace(reason.Reason),
 		Model:         strings.TrimSpace(reason.Model),
 		ExpiresAt:     strings.TrimSpace(reason.ExpiresAt),
 		UpdatedAt:     strings.TrimSpace(reason.UpdatedAt),
+		RouteBlocking: reason.RouteBlocking,
+	}
+	return DoctorDiagnosticEvidence{
+		Kind:          DoctorDiagnosticEvidenceRouteDroppedReason,
+		AccountKey:    dropped.AccountKey,
+		AccountID:     dropped.AccountID,
+		AuthID:        dropped.AuthID,
+		Source:        dropped.Source,
+		Scope:         strings.TrimSpace(string(dropped.Scope)),
+		Reason:        dropped.Reason,
+		Model:         dropped.Model,
+		ExpiresAt:     dropped.ExpiresAt,
+		UpdatedAt:     dropped.UpdatedAt,
 		RouteBlocking: reason.RouteBlocking,
 		DroppedReason: &dropped,
 	}
@@ -271,7 +298,8 @@ func doctorDiagnosticsEvidenceFromDroppedReason(reason ChannelRoutingDroppedReas
 
 func doctorDiagnosticsEvidenceFromQuotaState(state QuotaRuntimeState) DoctorDiagnosticEvidence {
 	fact := *state.Fact
-	fact.EvidenceRefs = append([]string(nil), state.Fact.EvidenceRefs...)
+	fact.Explanation = sanitizeQuotaRuntimeFactExplanation(fact.Explanation)
+	fact.EvidenceRefs = uniqueQuotaRuntimeFactRefs(state.Fact.EvidenceRefs)
 	return DoctorDiagnosticEvidence{
 		Kind:         DoctorDiagnosticEvidenceQuotaFact,
 		AccountKey:   strings.TrimSpace(state.AccountKey),

@@ -1,0 +1,126 @@
+{
+  "deterministicSourceMetadata": {
+    "branch": "gettokens/sidecar",
+    "commitFull": "91dd8d8ebd4806dbb7cf46049fe67f771d2a4abc",
+    "commitShort": "91dd8d8e",
+    "dirty": true,
+    "dirtyStatus": [
+      " M internal/gettokenshooks/doctor_diagnostics.go",
+      "?? SIDECAR_BUILD_SMOKE.md",
+      "?? fixtures/sidecar-smoke/cli-proxy-api-round26-smoke-manifest.fixture.json",
+      "?? scripts/check-sidecar-smoke-manifest.mjs"
+    ],
+    "goModule": "github.com/router-for-me/CLIProxyAPI",
+    "sourcePath": "/Users/linhey/Desktop/linhay-open-sources/GetTokens/docs-linhay/references/CLIProxyAPI",
+    "sourceStateHash": "391453c57dfa6a4f7763beb05590ce9f26217c866fe378bacc879b3642cf849c"
+  },
+  "sourceState": {
+    "artifactClass": "volatile-test-binary",
+    "classification": "dirty-source",
+    "clean": false,
+    "comparisonRole": "primary",
+    "dirty": true,
+    "dirtyStatusEvidenceOnly": true
+  },
+  "sourceStateComparison": {
+    "cleanBinarySha256": "8f241aa9a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef012345678",
+    "cleanClassification": "clean-source",
+    "cleanCommitFull": "91dd8d8ebd4806dbb7cf46049fe67f771d2a4abc",
+    "cleanComparisonAvailable": true,
+    "cleanManifestPath": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke-clean-comparison-manifest.json",
+    "cleanSourcePath": "/private/tmp/gettokens-cliproxy-clean.fixture/src",
+    "cleanSourceStateHash": "2f241aa9a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef012345679",
+    "dirtyBinarySha256": "43fcbea176cd349ea112035b64957b0c7b16cbd4a1ddd5ba9396db39505ab792",
+    "dirtyManifestPath": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke-manifest.json",
+    "dirtySourcePath": "/Users/linhey/Desktop/linhay-open-sources/GetTokens/docs-linhay/references/CLIProxyAPI",
+    "dirtySourceStateHash": "391453c57dfa6a4f7763beb05590ce9f26217c866fe378bacc879b3642cf849c",
+    "mode": "dirty-with-clean-comparison",
+    "primaryRole": "primary",
+    "result": "clean-source-recorded",
+    "sameCommit": true
+  },
+  "legacyRound25Mapping": {
+    "artifact": "volatileBuildMetadata",
+    "commands": "volatileBuildMetadata.commands",
+    "environment": "volatileBuildMetadata.environment",
+    "source": "deterministicSourceMetadata"
+  },
+  "manifestVersion": 2,
+  "notReleaseArtifact": true,
+  "purpose": "GetTokens CLIProxyAPI sidecar rebuild smoke reproducibility evidence for test use only.",
+  "releaseBoundary": {
+    "dirtyStatusEvidenceOnly": true,
+    "mayCopyIntoAppBundle": false,
+    "mayPublish": false,
+    "mayTouchApplicationsGetTokens": false,
+    "requiredBeforeReleasePipeline": [
+      "build from a clean maintained gettokens/sidecar commit",
+      "record deterministic source metadata without dirtyStatus entries",
+      "run the release pipeline sidecar rebuild path instead of this smoke script",
+      "complete the release packaging and signing/notarization gates"
+    ]
+  },
+  "releasePipelineEligible": false,
+  "reproducibilityBoundary": {
+    "binaryDeterministic": false,
+    "binarySha256Volatile": true,
+    "binaryVolatilityCauses": [
+      "main.BuildDate is set from the current UTC timestamp for every smoke run",
+      "binaryPath, sha256File, helpLogPath, outputDir, GOCACHE, and local Go toolchain/cache state are run-local evidence",
+      "binarySha256 fingerprints this exact temporary smoke binary only and is expected to change when volatile build metadata changes"
+    ],
+    "deterministicClaim": "For a fixed source checkout state, deterministicSourceMetadata and sourceStateHash identify the audited source inputs. They do not claim the compiled binary is deterministic.",
+    "deterministicSourceFields": [
+      "deterministicSourceMetadata.sourcePath",
+      "deterministicSourceMetadata.branch",
+      "deterministicSourceMetadata.commitShort",
+      "deterministicSourceMetadata.commitFull",
+      "deterministicSourceMetadata.dirty",
+      "deterministicSourceMetadata.dirtyStatus",
+      "deterministicSourceMetadata.goModule",
+      "deterministicSourceMetadata.sourceStateHash"
+    ],
+    "volatileBuildFields": [
+      "volatileBuildMetadata.timestampUTC",
+      "volatileBuildMetadata.buildDateUTC",
+      "volatileBuildMetadata.outputDir",
+      "volatileBuildMetadata.binaryPath",
+      "volatileBuildMetadata.binarySha256",
+      "volatileBuildMetadata.sha256File",
+      "volatileBuildMetadata.helpLogPath",
+      "volatileBuildMetadata.version",
+      "volatileBuildMetadata.ldflagsCommit",
+      "volatileBuildMetadata.commands.test",
+      "volatileBuildMetadata.commands.build",
+      "volatileBuildMetadata.commands.help",
+      "volatileBuildMetadata.commands.sha256",
+      "volatileBuildMetadata.environment.GOCACHE",
+      "volatileBuildMetadata.environment.GOPROXY",
+      "volatileBuildMetadata.environment.goVersion"
+    ]
+  },
+  "schema": "gettokens-sidecar-smoke-manifest.v2",
+  "testOnly": true,
+  "volatileBuildMetadata": {
+    "binaryPath": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke",
+    "binarySha256": "43fcbea176cd349ea112035b64957b0c7b16cbd4a1ddd5ba9396db39505ab792",
+    "buildDateUTC": "2026-06-18T11:49:32Z",
+    "commands": {
+      "build": "go build -trimpath -ldflags \"-X main.Version=round26-smoke -X main.Commit=91dd8d8e+dirty -X main.BuildDate=2026-06-18T11:49:32Z\" -o \"/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke\" ./cmd/server",
+      "help": "\"/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke\" -h >\"/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke-help.txt\" 2>&1",
+      "sha256": "shasum -a 256 \"/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke\"",
+      "test": "go test ./internal/gettokenshooks -run '^(TestDoctorDiagnosticsRegisteredOnGetTokensManagementRoutes|TestRouteResilienceActionRegisteredOnGetTokensManagementRoutes)$' -count=1"
+    },
+    "environment": {
+      "GOCACHE": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/gocache",
+      "GOPROXY": "off",
+      "goVersion": "go version go1.25.0 darwin/arm64"
+    },
+    "helpLogPath": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke-help.txt",
+    "ldflagsCommit": "91dd8d8e+dirty",
+    "outputDir": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke",
+    "sha256File": "/private/tmp/gettokens-cliproxyapi-sidecar-smoke/cli-proxy-api-round26-smoke.sha256",
+    "timestampUTC": "2026-06-18T11:49:32Z",
+    "version": "round26-smoke"
+  }
+}

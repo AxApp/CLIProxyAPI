@@ -5,6 +5,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 var installRoutingPoliciesOnce sync.Once
@@ -17,6 +18,9 @@ func InstallRoutingPolicies() {
 func InstallRoutingPoliciesWithConfigPath(configPath string) {
 	SetChannelRoutingPolicyConfigPathFromConfig(configPath)
 	SetProjectCandidatePoolPolicyConfigPathFromConfig(configPath)
+	if err := SetRouteResilienceActionLedgerPathFromConfig(configPath); err != nil {
+		log.WithError(err).Warn("gettokenshooks: configure route resilience action ledger path failed")
+	}
 	installRoutingPoliciesOnce.Do(func() {
 		gettokensrouting.RegisterPolicy(requestRouteHeaderPolicy())
 		gettokensrouting.RegisterPolicy(channelRoutingPolicy())

@@ -53,13 +53,15 @@ func TestDoctorDiagnosticsIncludesRouteDroppedReasonEvidence(t *testing.T) {
 		t.Fatalf("Register auth: %v", err)
 	}
 	now := time.Now().UTC()
+	expiresAt := now.Add(time.Hour)
 	guard.MarkBlocked(AccountRouteGuardBlock{
 		Source:       AccountRouteGuardSourceUpstreamRateLimit,
 		FailureScope: RouteResilienceScopeAccount,
 		AuthID:       auth.ID,
 		AccountKey:   auth.AccountKey,
 		Reason:       "upstream 429 active cooldown",
-		ExpiresAt:    now.Add(time.Hour),
+		Model:        "gpt-5",
+		ExpiresAt:    expiresAt,
 		UpdatedAt:    now,
 	})
 
@@ -83,13 +85,54 @@ func TestDoctorDiagnosticsIncludesRouteDroppedReasonEvidence(t *testing.T) {
 	evidence := check.Evidence[0]
 	if evidence.Kind != DoctorDiagnosticEvidenceRouteDroppedReason ||
 		evidence.AccountKey != auth.AccountKey ||
+		evidence.AccountID != auth.AccountKey ||
 		evidence.AuthID != auth.ID ||
 		evidence.Source != AccountRouteGuardSourceUpstreamRateLimit ||
-		evidence.Reason != "upstream 429 active cooldown" {
+		evidence.Scope != string(RouteResilienceScopeAccount) ||
+		evidence.Reason != "upstream 429 active cooldown" ||
+		evidence.Model != "gpt-5" ||
+		evidence.ExpiresAt != expiresAt.Format(time.RFC3339Nano) ||
+		evidence.UpdatedAt != now.Format(time.RFC3339Nano) ||
+		!evidence.RouteBlocking {
 		t.Fatalf("route evidence = %#v, want seeded dropped reason", evidence)
 	}
-	if evidence.DroppedReason == nil || evidence.DroppedReason.Source != AccountRouteGuardSourceUpstreamRateLimit {
+	if evidence.DroppedReason == nil ||
+		evidence.DroppedReason.AccountKey != auth.AccountKey ||
+		evidence.DroppedReason.AccountID != auth.AccountKey ||
+		evidence.DroppedReason.AuthID != auth.ID ||
+		evidence.DroppedReason.Source != AccountRouteGuardSourceUpstreamRateLimit ||
+		evidence.DroppedReason.Scope != RouteResilienceScopeAccount ||
+		evidence.DroppedReason.Reason != "upstream 429 active cooldown" ||
+		evidence.DroppedReason.Model != "gpt-5" ||
+		evidence.DroppedReason.ExpiresAt != expiresAt.Format(time.RFC3339Nano) ||
+		evidence.DroppedReason.UpdatedAt != now.Format(time.RFC3339Nano) ||
+		!evidence.DroppedReason.RouteBlocking {
 		t.Fatalf("dropped reason = %#v, want embedded channel routing dropped reason", evidence.DroppedReason)
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatalf("json.Marshal evidence: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("json.Unmarshal evidence: %v", err)
+	}
+	for _, key := range []string{"accountKey", "accountId", "authId", "source", "scope", "reason", "model", "expiresAt", "updatedAt", "routeBlocking", "droppedReason"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("route evidence json = %s, want top-level %s", encoded, key)
+		}
+	}
+	nested, ok := payload["droppedReason"].(map[string]any)
+	if !ok {
+		t.Fatalf("route evidence json = %s, want droppedReason object", encoded)
+	}
+	for _, key := range []string{"accountKey", "accountId", "authId", "source", "scope", "reason", "model", "expiresAt", "updatedAt", "routeBlocking"} {
+		if _, ok := nested[key]; !ok {
+			t.Fatalf("droppedReason json = %#v, want %s", nested, key)
+		}
+	}
+	if response.Summary.Evidence != 1 || response.Summary.Warning != 1 || response.Summary.NotReady != 1 {
+		t.Fatalf("summary = %#v, want one route evidence and one not-ready quota check", response.Summary)
 	}
 }
 
@@ -157,6 +200,63 @@ func TestDoctorDiagnosticsIncludesQuotaFactEvidence(t *testing.T) {
 	evidence.QuotaFact.EvidenceRefs[0] = "mutated"
 	if state, ok := store.StateForAccount(accountKey); !ok || state.Fact == nil || state.Fact.EvidenceRefs[0] == "mutated" {
 		t.Fatalf("quota fact copy mutated store state: %#v", state.Fact)
+	}
+}
+
+func TestDoctorDiagnosticsQuotaFactEvidenceIsDefensivelyCopiedAndRedacted(t *testing.T) {
+	accountKey := "acct_00000000-0000-4000-8000-000000000404"
+	store := &QuotaRuntimeStore{
+		states: map[string]QuotaRuntimeState{
+			accountKey: {
+				AccountKey: accountKey,
+				Source:     "quota-curl",
+				Status:     QuotaRuntimeStatusError,
+				Windows:    []QuotaRuntimeWindow{},
+				Fact: &QuotaRuntimeFact{
+					State:        QuotaFactStateDenied,
+					Source:       "quota-curl",
+					Freshness:    QuotaFactFreshnessFresh,
+					Confidence:   QuotaFactConfidenceHigh,
+					Risk:         QuotaFactRiskDenied,
+					Explanation:  "Authorization: Bearer sk-direct-secret and OPENAI_API_KEY=sk-another-secret",
+					ObservedAt:   "2026-06-16T08:00:00Z",
+					EvidenceRefs: []string{" quota-status:" + accountKey + " ", "quota-source:quota-curl", "quota-source:quota-curl"},
+				},
+			},
+		},
+	}
+
+	response := BuildDoctorDiagnosticsSnapshot(DoctorDiagnosticsOptions{
+		QuotaStore: store,
+		GuardStore: NewAccountRouteGuardStore(),
+		Now:        time.Date(2026, 6, 16, 8, 0, 0, 0, time.UTC),
+	})
+
+	check := findDoctorDiagnosticCheck(response, DoctorDiagnosticCheckQuotaFacts)
+	if check == nil || len(check.Evidence) != 1 {
+		t.Fatalf("quota check = %#v, want one explicit fact", check)
+	}
+	evidence := check.Evidence[0]
+	if strings.Contains(evidence.Explanation, "sk-direct-secret") ||
+		strings.Contains(evidence.Explanation, "sk-another-secret") ||
+		strings.Contains(evidence.Explanation, "Bearer sk-") ||
+		!strings.Contains(evidence.Explanation, "[redacted]") ||
+		!strings.Contains(evidence.Explanation, "OPENAI_API_KEY=[redacted]") {
+		t.Fatalf("quota evidence explanation = %q, want defensive redaction", evidence.Explanation)
+	}
+	if evidence.QuotaFact == nil || evidence.QuotaFact.Explanation != evidence.Explanation {
+		t.Fatalf("quota fact = %#v, want nested redacted fact", evidence.QuotaFact)
+	}
+	if len(evidence.EvidenceRefs) != 2 ||
+		!doctorDiagnosticsTestHasRef(evidence.EvidenceRefs, "quota-status:"+accountKey) ||
+		!doctorDiagnosticsTestHasRef(evidence.EvidenceRefs, "quota-source:quota-curl") {
+		t.Fatalf("evidence refs = %#v, want trimmed unique refs", evidence.EvidenceRefs)
+	}
+	evidence.EvidenceRefs[0] = "mutated-top-level"
+	evidence.QuotaFact.EvidenceRefs[0] = "mutated-nested"
+	stored := store.states[accountKey].Fact
+	if stored.EvidenceRefs[0] == "mutated-top-level" || stored.EvidenceRefs[0] == "mutated-nested" {
+		t.Fatalf("store fact refs mutated through evidence: %#v", stored.EvidenceRefs)
 	}
 }
 
