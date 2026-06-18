@@ -32,6 +32,9 @@ type ConvertCodexResponseToClaudeParams struct {
 	ThinkingStopPending       bool
 	ThinkingSignature         string
 	ThinkingSummarySeen       bool
+	WebSearchToolUseIDs       map[string]struct{}
+	WebSearchToolResultIDs    map[string]struct{}
+	LastWebSearchToolUseID    string
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -117,6 +120,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		params.BlockIndex++
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+	} else if typeStr == "response.web_search_call.searching" || typeStr == "response.web_search_call.completed" || typeStr == "response.web_search_call.in_progress" {
+		// Wait for populated web_search_call items on output_item.done.
 	} else if typeStr == "response.completed" || typeStr == "response.incomplete" {
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		responseData := rootResult.Get("response")
@@ -159,6 +164,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		} else if itemType == "reasoning" {
 			params.ThinkingSummarySeen = false
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
+		} else if itemType == "web_search_call" {
+			// Defer server_tool_use until output_item.done carries action/query.
 		}
 	} else if typeStr == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
@@ -222,6 +229,8 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			}
 			params.ThinkingSignature = ""
 			params.ThinkingSummarySeen = false
+		} else if itemType == "web_search_call" {
+			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
 		}
 	} else if typeStr == "response.function_call_arguments.delta" {
 		params.HasReceivedArgumentsDelta = true
@@ -274,6 +283,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	}
 
 	hasToolCall := false
+	webSearchSeen := make(map[string]struct{})
 
 	if output := responseData.Get("output"); output.Exists() && output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
@@ -342,6 +352,8 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 						}
 					}
 				}
+			case "web_search_call":
+				out = appendCodexWebSearchNonStreamContent(out, item, webSearchSeen)
 			case "function_call":
 				hasToolCall = true
 				name := item.Get("name").String()
