@@ -22,9 +22,11 @@ import (
 
 // convertCliResponseToOpenAIChatParams holds parameters for response conversion.
 type convertCliResponseToOpenAIChatParams struct {
-	UnixTimestamp    int64
-	FunctionIndex    int
-	SanitizedNameMap map[string]string
+	UnixTimestamp        int64
+	FunctionIndex        int
+	SawToolCall          bool
+	UpstreamFinishReason string
+	SanitizedNameMap     map[string]string
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -84,16 +86,12 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 		template, _ = sjson.SetBytes(template, "id", responseIDResult.String())
 	}
 
-	finishReason := ""
-	if stopReasonResult := gjson.GetBytes(rawJSON, "response.stop_reason"); stopReasonResult.Exists() {
-		finishReason = stopReasonResult.String()
+	params := (*param).(*convertCliResponseToOpenAIChatParams)
+	if stopReasonResult := gjson.GetBytes(rawJSON, "response.stop_reason"); stopReasonResult.Exists() && stopReasonResult.String() != "" {
+		params.UpstreamFinishReason = strings.ToUpper(stopReasonResult.String())
+	} else if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
+		params.UpstreamFinishReason = strings.ToUpper(finishReasonResult.String())
 	}
-	if finishReason == "" {
-		if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
-			finishReason = finishReasonResult.String()
-		}
-	}
-	finishReason = strings.ToLower(finishReason)
 
 	// Extract and set usage metadata (token counts).
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
@@ -122,7 +120,6 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 
 	// Process the main content part of the response.
 	partsResult := gjson.GetBytes(rawJSON, "response.candidates.0.content.parts")
-	hasFunctionCall := false
 	if partsResult.IsArray() {
 		partResults := partsResult.Array()
 		for i := 0; i < len(partResults); i++ {
@@ -158,7 +155,7 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 			} else if functionCallResult.Exists() {
 				// Handle function call content.
-				hasFunctionCall = true
+				params.SawToolCall = true
 				toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
 				functionCallIndex := (*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex
 				(*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex++
@@ -205,15 +202,17 @@ func ConvertCliResponseToOpenAI(_ context.Context, _ string, originalRequestRawJ
 		}
 	}
 
-	if hasFunctionCall {
-		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "tool_calls")
-		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "tool_calls")
-	} else if finishReason != "" && (*param).(*convertCliResponseToOpenAIChatParams).FunctionIndex == 0 {
-		// Only pass through specific finish reasons
-		if finishReason == "max_tokens" || finishReason == "stop" {
-			template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
-			template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", finishReason)
+	upstreamFinishReason := params.UpstreamFinishReason
+	usageExists := gjson.GetBytes(rawJSON, "response.usageMetadata").Exists()
+	if upstreamFinishReason != "" && usageExists {
+		finishReason := "stop"
+		if params.SawToolCall {
+			finishReason = "tool_calls"
+		} else if upstreamFinishReason == "MAX_TOKENS" {
+			finishReason = "max_tokens"
 		}
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", finishReason)
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", strings.ToLower(upstreamFinishReason))
 	}
 
 	return [][]byte{template}
