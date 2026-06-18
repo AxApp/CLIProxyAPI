@@ -80,7 +80,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	typeStr := typeResult.String()
 	var template []byte
 
-	if typeStr == "response.created" {
+	if typeStr == "error" {
+		output = append(output, codexStreamErrorToClaudeError(rootResult)...)
+	} else if typeStr == "response.created" {
 		template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
 		template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
 		template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
@@ -252,6 +254,38 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	}
 
 	return [][]byte{output}
+}
+
+func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {
+	errorResult := rootResult.Get("error")
+	errType := strings.TrimSpace(errorResult.Get("type").String())
+	if errType == "" {
+		errType = strings.TrimSpace(rootResult.Get("error_type").String())
+	}
+	if errType == "" {
+		errType = "api_error"
+	}
+
+	code := strings.TrimSpace(errorResult.Get("code").String())
+	message := strings.TrimSpace(errorResult.Get("message").String())
+	if message == "" {
+		message = strings.TrimSpace(rootResult.Get("message").String())
+	}
+	if message == "" {
+		message = code
+	}
+	if message == "" {
+		message = errType
+	}
+
+	if code == "cyber_policy" || errType == "invalid_request" {
+		errType = "invalid_request_error"
+	}
+
+	out := []byte(`{"type":"error","error":{"type":"api_error","message":""}}`)
+	out, _ = sjson.SetBytes(out, "error.type", errType)
+	out, _ = sjson.SetBytes(out, "error.message", message)
+	return translatorcommon.AppendSSEEventBytes(nil, "error", out, 2)
 }
 
 // ConvertCodexResponseToClaudeNonStream converts a non-streaming Codex response to a non-streaming Claude Code response.
