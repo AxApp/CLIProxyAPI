@@ -81,6 +81,32 @@ var oauthToolsToRemove = map[string]bool{}
 // omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
 
+// sanitizeClaudeWebSearchDomains removes empty allowed_domains/blocked_domains
+// arrays from built-in web_search tools. Some compatible clients emit an empty
+// array instead of omitting the field, and Anthropic treats that as ambiguous.
+func sanitizeClaudeWebSearchDomains(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body
+	}
+	tools.ForEach(func(index, tool gjson.Result) bool {
+		if !strings.HasPrefix(tool.Get("type").String(), "web_search_") {
+			return true
+		}
+		for _, field := range []string{"allowed_domains", "blocked_domains"} {
+			value := tool.Get(field)
+			if value.Exists() && value.IsArray() && len(value.Array()) == 0 {
+				path := fmt.Sprintf("tools.%d.%s", index.Int(), field)
+				if updated, err := sjson.DeleteBytes(body, path); err == nil {
+					body = updated
+				}
+			}
+		}
+		return true
+	})
+	return body
+}
+
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
@@ -200,6 +226,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	bodyForUpstream = sanitizeClaudeWebSearchDomains(bodyForUpstream)
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -376,6 +403,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	bodyForUpstream = sanitizeClaudeWebSearchDomains(bodyForUpstream)
 	reporter.SetTranslatedReasoningEffort(bodyForUpstream, to.String())
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
