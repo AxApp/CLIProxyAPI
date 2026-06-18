@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,6 +44,86 @@ type orderedWebsocketSelector struct {
 	mu     sync.Mutex
 	order  []string
 	cursor int
+}
+
+type singleConnListener struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	closed chan struct{}
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{conn: conn, closed: make(chan struct{})}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if l.conn != nil {
+		conn := l.conn
+		l.conn = nil
+		l.mu.Unlock()
+		return conn, nil
+	}
+	l.mu.Unlock()
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *singleConnListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
+	return nil
+}
+
+func (l *singleConnListener) Addr() net.Addr {
+	return pipeAddr("responses-websocket-test")
+}
+
+type pipeAddr string
+
+func (a pipeAddr) Network() string { return "pipe" }
+func (a pipeAddr) String() string  { return string(a) }
+
+func dialResponsesWebsocketPipe(t *testing.T, handler http.Handler) (*websocket.Conn, func()) {
+	t.Helper()
+
+	serverConn, clientConn := net.Pipe()
+	listener := newSingleConnListener(serverConn)
+	server := &http.Server{Handler: handler}
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			serverErrCh <- err
+			return
+		}
+		serverErrCh <- nil
+	}()
+
+	dialer := websocket.Dialer{
+		NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+			return clientConn, nil
+		},
+	}
+	conn, _, err := dialer.Dial("ws://responses-websocket-test/v1/responses/ws", nil)
+	if err != nil {
+		_ = listener.Close()
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+		t.Fatalf("dial websocket pipe: %v", err)
+	}
+
+	cleanup := func() {
+		_ = conn.Close()
+		_ = server.Close()
+		_ = listener.Close()
+		if errServer := <-serverErrCh; errServer != nil {
+			t.Fatalf("websocket pipe server: %v", errServer)
+		}
+	}
+	return conn, cleanup
 }
 
 func (s *orderedWebsocketSelector) Pick(_ context.Context, _ string, _ string, _ coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
@@ -998,6 +1079,145 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 	}
 	if strings.Contains(string(payload), "response.done") {
 		t.Fatalf("payload unexpectedly rewrote completed event: %s", payload)
+	}
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestForwardResponsesWebsocketTreatsResponseDoneAsTerminalWithoutRewriting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	serverErrCh := make(chan error, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() {
+			errClose := conn.Close()
+			if errClose != nil {
+				serverErrCh <- errClose
+			}
+		}()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte(`{"type":"response.done","response":{"id":"resp-1","output":[{"type":"message","id":"out-1"}]}}`)
+		close(data)
+		close(errCh)
+
+		timelineLog := newInMemoryWebsocketTimelineLog()
+		completedOutput, errMsg, err := h.forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			timelineLog,
+			"session-1",
+		)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		if errMsg != nil {
+			serverErrCh <- fmt.Errorf("unexpected websocket error message: %v", errMsg.Error)
+			return
+		}
+		if gjson.GetBytes(completedOutput, "0.id").String() != "out-1" {
+			serverErrCh <- errors.New("done output not captured")
+			return
+		}
+		serverErrCh <- nil
+	})
+
+	conn, cleanup := dialResponsesWebsocketPipe(t, handler)
+	defer cleanup()
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != "response.done" {
+		t.Fatalf("payload type = %s, want response.done; payload=%s", got, payload)
+	}
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestForwardResponsesWebsocketTreatsErrorPayloadAsTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	serverErrCh := make(chan error, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() {
+			errClose := conn.Close()
+			if errClose != nil {
+				serverErrCh <- errClose
+			}
+		}()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte(`{"type":"error","status":429,"error":{"message":"upstream failed"}}`)
+		close(data)
+		close(errCh)
+
+		_, errMsg, err := h.forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			newInMemoryWebsocketTimelineLog(),
+			"session-1",
+		)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		if errMsg == nil {
+			serverErrCh <- errors.New("expected websocket error message")
+			return
+		}
+		if errMsg.StatusCode != http.StatusTooManyRequests {
+			serverErrCh <- fmt.Errorf("websocket error status = %d, want %d", errMsg.StatusCode, http.StatusTooManyRequests)
+			return
+		}
+		if errMsg.Error == nil || !strings.Contains(errMsg.Error.Error(), "upstream failed") {
+			serverErrCh <- fmt.Errorf("websocket error = %v, want upstream failed", errMsg.Error)
+			return
+		}
+		serverErrCh <- nil
+	})
+
+	conn, cleanup := dialResponsesWebsocketPipe(t, handler)
+	defer cleanup()
+
+	_, payload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeError {
+		t.Fatalf("payload type = %s, want %s; payload=%s", got, wsEventTypeError, payload)
 	}
 
 	if errServer := <-serverErrCh; errServer != nil {

@@ -32,6 +32,7 @@ const (
 	wsRequestTypeAppend  = "response.append"
 	wsEventTypeError     = "error"
 	wsEventTypeCompleted = "response.completed"
+	wsEventTypeDone      = "response.done"
 	wsDoneMarker         = "[DONE]"
 	wsTurnStateHeader    = "x-codex-turn-state"
 	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
@@ -1428,7 +1429,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 			for i := range payloads {
 				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
-				if eventType == wsEventTypeCompleted {
+				var payloadErrMsg *interfaces.ErrorMessage
+				if eventType == wsEventTypeError {
+					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
+					if h != nil {
+						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
+					}
+				} else if isResponsesWebsocketCompletionEvent(eventType) {
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
 				}
@@ -1450,6 +1457,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 					)
 					cancel(errWrite)
 					return responsesWebsocketForwardResult{completedOutput: completedOutput, err: errWrite}
+				}
+				if payloadErrMsg != nil {
+					cancel(payloadErrMsg.Error)
+					return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: payloadErrMsg}
 				}
 			}
 		}
@@ -1480,6 +1491,32 @@ func responseCompletedOutputFromPayload(payload []byte) []byte {
 		return bytes.Clone([]byte(output.Raw))
 	}
 	return []byte("[]")
+}
+
+func isResponsesWebsocketCompletionEvent(eventType string) bool {
+	return eventType == wsEventTypeCompleted || eventType == wsEventTypeDone
+}
+
+func responsesWebsocketErrorMessageFromPayload(payload []byte) *interfaces.ErrorMessage {
+	status := int(gjson.GetBytes(payload, "status").Int())
+	if status <= 0 {
+		status = int(gjson.GetBytes(payload, "status_code").Int())
+	}
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+
+	errText := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
+	if errText == "" {
+		errText = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+	}
+	if errText == "" {
+		errText = strings.TrimSpace(string(payload))
+	}
+	if errText == "" {
+		errText = http.StatusText(status)
+	}
+	return &interfaces.ErrorMessage{StatusCode: status, Error: fmt.Errorf("%s", errText)}
 }
 
 func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
