@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -271,6 +272,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
+	lastResponseID := ""
+	var lastResponsePendingToolCallIDs []string
 	pinnedAuthID := ""
 	sessionAuthByID := func(authID string) (*coreauth.Auth, bool) {
 		if h == nil || h.AuthManager == nil {
@@ -357,10 +360,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
-		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
+		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithIncrementalState(
 			payload,
 			lastRequest,
 			lastResponseOutput,
+			lastResponseID,
+			lastResponsePendingToolCallIDs,
 			allowIncrementalInputWithPreviousResponseID,
 			allowCompactionReplayBypass,
 		)
@@ -395,6 +400,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			lastRequest = updatedLastRequest
 			lastResponseOutput = []byte("[]")
+			lastResponseID = ""
+			lastResponsePendingToolCallIDs = nil
 			if errWrite := writeResponsesWebsocketSyntheticPrewarm(c, conn, requestJSON, wsTimelineLog, passthroughSessionID); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
@@ -406,6 +413,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		updatedLastRequest = bytes.Clone(requestJSON)
 		previousLastRequest := bytes.Clone(lastRequest)
 		previousLastResponseOutput := bytes.Clone(lastResponseOutput)
+		previousLastResponseID := lastResponseID
+		previousLastResponsePendingToolCallIDs := append([]string(nil), lastResponsePendingToolCallIDs...)
 		forcedTranscriptReplay := forceTranscriptReplayNextRequest
 		lastRequest = updatedLastRequest
 		if forcedTranscriptReplay {
@@ -519,9 +528,13 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			forceTranscriptReplayNextRequest = true
 			lastRequest = previousLastRequest
 			lastResponseOutput = previousLastResponseOutput
+			lastResponseID = previousLastResponseID
+			lastResponsePendingToolCallIDs = previousLastResponsePendingToolCallIDs
 			continue
 		}
 		lastResponseOutput = completedOutput
+		lastResponseID = strings.TrimSpace(forwardResult.completedResponseID)
+		lastResponsePendingToolCallIDs = append([]string(nil), forwardResult.pendingToolCallIDs...)
 	}
 }
 
@@ -627,6 +640,14 @@ func normalizeResponsesWebsocketRequest(rawJSON []byte, lastRequest []byte, last
 }
 
 func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	return normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON, lastRequest, lastResponseOutput, "", allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+}
+
+func normalizeResponsesWebsocketRequestWithLastResponseID(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	return normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON, lastRequest, lastResponseOutput, lastResponseID, nil, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+}
+
+func normalizeResponsesWebsocketRequestWithIncrementalState(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	switch requestType {
 	case wsRequestTypeCreate:
@@ -634,10 +655,10 @@ func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []by
 		if len(lastRequest) == 0 {
 			return normalizeResponseCreateRequest(rawJSON)
 		}
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
 	case wsRequestTypeAppend:
 		// log.Infof("responses websocket: response.append request")
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, lastResponseID, lastResponsePendingToolCallIDs, allowIncrementalInputWithPreviousResponseID, allowCompactionReplayBypass)
 	default:
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -667,7 +688,7 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 	return normalized, bytes.Clone(normalized), nil
 }
 
-func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, lastResponseID string, lastResponsePendingToolCallIDs []string, allowIncrementalInputWithPreviousResponseID bool, allowCompactionReplayBypass bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	if len(lastRequest) == 0 {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -695,11 +716,20 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
 	// Do not expand it into a full input transcript; upstream expects the incremental payload.
 	if allowIncrementalInputWithPreviousResponseID {
-		if prev := strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()); prev != "" {
+		prev := strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String())
+		if prev == "" {
+			if !inputSatisfiesPendingToolCalls(nextInput, lastResponsePendingToolCallIDs) {
+				normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
+				return normalized, bytes.Clone(normalized), nil
+			}
+			prev = strings.TrimSpace(lastResponseID)
+		}
+		if prev != "" {
 			normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
 			if errDelete != nil {
 				normalized = bytes.Clone(rawJSON)
 			}
+			normalized, _ = sjson.SetBytes(normalized, "previous_response_id", prev)
 			if !gjson.GetBytes(normalized, "model").Exists() {
 				modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 				if modelName != "" {
@@ -814,6 +844,35 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 	}
 
 	return false
+}
+
+func inputSatisfiesPendingToolCalls(input gjson.Result, pendingCallIDs []string) bool {
+	if len(pendingCallIDs) == 0 {
+		return true
+	}
+	if !input.IsArray() {
+		return false
+	}
+	outputs := make(map[string]struct{}, len(pendingCallIDs))
+	for _, item := range input.Array() {
+		switch strings.TrimSpace(item.Get("type").String()) {
+		case "function_call_output", "custom_tool_call_output":
+			callID := strings.TrimSpace(item.Get("call_id").String())
+			if callID != "" {
+				outputs[callID] = struct{}{}
+			}
+		}
+	}
+	for _, callID := range pendingCallIDs {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			continue
+		}
+		if _, ok := outputs[callID]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) []byte {
@@ -1322,6 +1381,8 @@ type responsesWebsocketForwardOptions struct {
 
 type responsesWebsocketForwardResult struct {
 	completedOutput          []byte
+	completedResponseID      string
+	pendingToolCallIDs       []string
 	errMsg                   *interfaces.ErrorMessage
 	err                      error
 	suppressedRetryableError bool
@@ -1340,6 +1401,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 	completed := false
 	sentPayload := false
 	completedOutput := []byte("[]")
+	completedResponseID := ""
+	pendingToolCallIDs := make(map[string]struct{})
 	downstreamSessionKey := ""
 	if c != nil && c.Request != nil {
 		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
@@ -1349,7 +1412,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 		select {
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
-			return responsesWebsocketForwardResult{completedOutput: completedOutput, err: c.Request.Context().Err()}
+			return responsesWebsocketForwardResult{
+				completedOutput:     completedOutput,
+				completedResponseID: completedResponseID,
+				pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+				err:                 c.Request.Context().Err(),
+			}
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
@@ -1360,6 +1428,8 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 					cancel(errMsg.Error)
 					return responsesWebsocketForwardResult{
 						completedOutput:          completedOutput,
+						completedResponseID:      completedResponseID,
+						pendingToolCallIDs:       sortedStringSet(pendingToolCallIDs),
 						errMsg:                   errMsg,
 						suppressedRetryableError: true,
 					}
@@ -1382,7 +1452,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 					// 	errWrite,
 					// )
 					cancel(errMsg.Error)
-					return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: errMsg, err: errWrite}
+					return responsesWebsocketForwardResult{
+						completedOutput:     completedOutput,
+						completedResponseID: completedResponseID,
+						pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+						errMsg:              errMsg,
+						err:                 errWrite,
+					}
 				}
 			}
 			if errMsg != nil {
@@ -1390,7 +1466,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 			} else {
 				cancel(nil)
 			}
-			return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: errMsg}
+			return responsesWebsocketForwardResult{
+				completedOutput:     completedOutput,
+				completedResponseID: completedResponseID,
+				pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+				errMsg:              errMsg,
+			}
 		case chunk, ok := <-data:
 			if !ok {
 				if !completed {
@@ -1416,18 +1497,34 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 							errWrite,
 						)
 						cancel(errMsg.Error)
-						return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: errMsg, err: errWrite}
+						return responsesWebsocketForwardResult{
+							completedOutput:     completedOutput,
+							completedResponseID: completedResponseID,
+							pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+							errMsg:              errMsg,
+							err:                 errWrite,
+						}
 					}
 					cancel(errMsg.Error)
-					return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: errMsg}
+					return responsesWebsocketForwardResult{
+						completedOutput:     completedOutput,
+						completedResponseID: completedResponseID,
+						pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+						errMsg:              errMsg,
+					}
 				}
 				cancel(nil)
-				return responsesWebsocketForwardResult{completedOutput: completedOutput}
+				return responsesWebsocketForwardResult{
+					completedOutput:     completedOutput,
+					completedResponseID: completedResponseID,
+					pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+				}
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
 				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				var payloadErrMsg *interfaces.ErrorMessage
 				if eventType == wsEventTypeError {
@@ -1438,6 +1535,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 				} else if isResponsesWebsocketCompletionEvent(eventType) {
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
+					completedResponseID = responseCompletedIDFromPayload(payloads[i])
 				}
 				markAPIResponseTimestamp(c)
 				// log.Infof(
@@ -1456,11 +1554,21 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocketWithOptions(
 						errWrite,
 					)
 					cancel(errWrite)
-					return responsesWebsocketForwardResult{completedOutput: completedOutput, err: errWrite}
+					return responsesWebsocketForwardResult{
+						completedOutput:     completedOutput,
+						completedResponseID: completedResponseID,
+						pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+						err:                 errWrite,
+					}
 				}
 				if payloadErrMsg != nil {
 					cancel(payloadErrMsg.Error)
-					return responsesWebsocketForwardResult{completedOutput: completedOutput, errMsg: payloadErrMsg}
+					return responsesWebsocketForwardResult{
+						completedOutput:     completedOutput,
+						completedResponseID: completedResponseID,
+						pendingToolCallIDs:  sortedStringSet(pendingToolCallIDs),
+						errMsg:              payloadErrMsg,
+					}
 				}
 			}
 		}
@@ -1491,6 +1599,56 @@ func responseCompletedOutputFromPayload(payload []byte) []byte {
 		return bytes.Clone([]byte(output.Raw))
 	}
 	return []byte("[]")
+}
+
+func responseCompletedIDFromPayload(payload []byte) string {
+	return strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+}
+
+func recordPendingToolCallIDsFromPayload(pending map[string]struct{}, payload []byte) {
+	if pending == nil || len(payload) == 0 {
+		return
+	}
+	updatePendingToolCallIDsFromItem(pending, gjson.GetBytes(payload, "item"))
+	output := gjson.GetBytes(payload, "response.output")
+	if output.IsArray() {
+		for _, item := range output.Array() {
+			updatePendingToolCallIDsFromItem(pending, item)
+		}
+	}
+}
+
+func updatePendingToolCallIDsFromItem(pending map[string]struct{}, item gjson.Result) {
+	if pending == nil || !item.Exists() {
+		return
+	}
+	switch strings.TrimSpace(item.Get("type").String()) {
+	case "function_call", "custom_tool_call":
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID != "" {
+			pending[callID] = struct{}{}
+		}
+	case "function_call_output", "custom_tool_call_output":
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID != "" {
+			delete(pending, callID)
+		}
+	}
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func isResponsesWebsocketCompletionEvent(eventType string) bool {
