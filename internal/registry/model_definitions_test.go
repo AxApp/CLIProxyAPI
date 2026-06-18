@@ -62,6 +62,75 @@ func TestClaudeStaticModelsIncludeOpus48(t *testing.T) {
 	}
 }
 
+func TestClaudeStaticModelsIncludeFable5(t *testing.T) {
+	model := findModelInfo(GetClaudeModels(), "claude-fable-5")
+	if model == nil {
+		t.Fatal("expected Claude static definitions to include claude-fable-5")
+	}
+	if model.OwnedBy != "anthropic" {
+		t.Fatalf("OwnedBy = %q, want anthropic", model.OwnedBy)
+	}
+	if model.Type != "claude" {
+		t.Fatalf("Type = %q, want claude", model.Type)
+	}
+	if model.ContextLength != 1000000 {
+		t.Fatalf("ContextLength = %d, want 1000000", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 128000 {
+		t.Fatalf("MaxCompletionTokens = %d, want 128000", model.MaxCompletionTokens)
+	}
+	assertThinkingLevels(t, "claude-fable-5", model, []string{"low", "medium", "high", "xhigh", "max"})
+
+	if LookupStaticModelInfo("claude-fable-5") == nil {
+		t.Fatal("expected LookupStaticModelInfo to find claude-fable-5")
+	}
+}
+
+func TestKimiStaticModelsIncludeK27Code(t *testing.T) {
+	model := findModelInfo(GetKimiModels(), "kimi-k2.7-code")
+	if model == nil {
+		t.Fatal("expected Kimi static definitions to include kimi-k2.7-code")
+	}
+	if model.OwnedBy != "moonshot" {
+		t.Fatalf("OwnedBy = %q, want moonshot", model.OwnedBy)
+	}
+	if model.Type != "kimi" {
+		t.Fatalf("Type = %q, want kimi", model.Type)
+	}
+	if model.ContextLength != 262144 {
+		t.Fatalf("ContextLength = %d, want 262144", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 65536 {
+		t.Fatalf("MaxCompletionTokens = %d, want 65536", model.MaxCompletionTokens)
+	}
+	if model.Thinking == nil || model.Thinking.Min != 1024 || model.Thinking.Max != 32000 || model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed {
+		t.Fatalf("unexpected thinking support: %+v", model.Thinking)
+	}
+}
+
+func TestXAIStaticModelsIncludeComposer25Fast(t *testing.T) {
+	model := findModelInfo(GetXAIModels(), "grok-composer-2.5-fast")
+	if model == nil {
+		t.Fatal("expected XAI static definitions to include grok-composer-2.5-fast")
+	}
+	if model.OwnedBy != "xai" {
+		t.Fatalf("OwnedBy = %q, want xai", model.OwnedBy)
+	}
+	if model.Type != "xai" {
+		t.Fatalf("Type = %q, want xai", model.Type)
+	}
+	if model.DisplayName != "Composer 2.5 Fast" {
+		t.Fatalf("DisplayName = %q, want Composer 2.5 Fast", model.DisplayName)
+	}
+	if model.ContextLength != 200000 {
+		t.Fatalf("ContextLength = %d, want 200000", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 32768 {
+		t.Fatalf("MaxCompletionTokens = %d, want 32768", model.MaxCompletionTokens)
+	}
+	assertThinkingLevels(t, "grok-composer-2.5-fast", model, []string{"low", "medium", "high"})
+}
+
 func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
 	models := WithXAIBuiltins(nil)
 	found := false
