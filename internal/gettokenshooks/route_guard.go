@@ -17,6 +17,7 @@ const (
 	AccountRouteGuardSourceManualDisabled       = "manual-disabled"
 	AccountRouteGuardSourceRateLimit            = "rate-limit"
 	AccountRouteGuardSourceQuotaEmpty           = "quota-empty"
+	AccountRouteGuardSourceQuotaThreshold       = "quota-threshold"
 	AccountRouteGuardSourceAuthError            = "auth-error"
 	AccountRouteGuardSourceUpstreamRateLimit    = "upstream-rate-limit"
 	AccountRouteGuardSourceUpstreamTransientErr = "upstream-error"

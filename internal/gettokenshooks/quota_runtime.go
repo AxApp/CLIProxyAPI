@@ -2,8 +2,11 @@ package gettokenshooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -125,9 +128,16 @@ func (state QuotaRuntimeState) MarshalJSON() ([]byte, error) {
 }
 
 type QuotaRuntimeStore struct {
-	mu     sync.RWMutex
-	states map[string]QuotaRuntimeState
-	guard  *AccountRouteGuardStore
+	mu           sync.RWMutex
+	states       map[string]QuotaRuntimeState
+	rawStates    map[string]QuotaRuntimeState
+	guard        *AccountRouteGuardStore
+	calibrations []AccountQuotaUsageCalibration
+	ledgerPath   string
+}
+
+type quotaUsageCalibrationLedger struct {
+	Items []AccountQuotaUsageCalibration `json:"items"`
 }
 
 var defaultQuotaRuntimeStore = NewQuotaRuntimeStore(DefaultAccountRouteGuardStore())
@@ -137,13 +147,55 @@ func NewQuotaRuntimeStore(guard *AccountRouteGuardStore) *QuotaRuntimeStore {
 		guard = DefaultAccountRouteGuardStore()
 	}
 	return &QuotaRuntimeStore{
-		states: map[string]QuotaRuntimeState{},
-		guard:  guard,
+		states:    map[string]QuotaRuntimeState{},
+		rawStates: map[string]QuotaRuntimeState{},
+		guard:     guard,
 	}
 }
 
 func DefaultQuotaRuntimeStore() *QuotaRuntimeStore {
 	return defaultQuotaRuntimeStore
+}
+
+func SetQuotaRuntimeCalibrationPathFromConfig(configPath string) error {
+	path, err := quotaRuntimeCalibrationPathFromConfig(configPath)
+	if err != nil {
+		return err
+	}
+	return defaultQuotaRuntimeStore.SetUsageCalibrationLedgerPath(path)
+}
+
+func quotaRuntimeCalibrationPathFromConfig(configPath string) (string, error) {
+	if dir := strings.TrimSpace(configPath); dir != "" {
+		if strings.EqualFold(filepath.Base(dir), "config.yaml") || strings.EqualFold(filepath.Base(dir), "config.yml") {
+			dir = filepath.Dir(dir)
+		}
+		return filepath.Join(dir, "quota-calibrations", "config.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "gettokens-data", "quota-calibrations", "config.json"), nil
+}
+
+func (s *QuotaRuntimeStore) SetUsageCalibrationLedgerPath(path string) error {
+	if s == nil {
+		return fmt.Errorf("quota runtime store is not initialized")
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("quota calibration ledger path is required")
+	}
+	items, err := readQuotaUsageCalibrationLedger(path)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.ledgerPath = path
+	s.calibrations = items
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *QuotaRuntimeStore) Upsert(input QuotaRuntimeState, now time.Time) (QuotaRuntimeState, error) {
@@ -158,13 +210,258 @@ func (s *QuotaRuntimeStore) Upsert(input QuotaRuntimeState, now time.Time) (Quot
 	if err != nil {
 		return QuotaRuntimeState{}, err
 	}
-	s.syncGuard(state, now)
-	state = s.withGuardState(state)
+	rawState := cloneQuotaRuntimeState(state)
+	state = s.effectiveQuotaRuntimeState(rawState, now)
 
 	s.mu.Lock()
+	s.rawStates[state.AccountKey] = cloneQuotaRuntimeState(rawState)
 	s.states[state.AccountKey] = cloneQuotaRuntimeState(state)
 	s.mu.Unlock()
 	return state, nil
+}
+
+func (s *QuotaRuntimeStore) RefreshQuotaThresholdGuards(now time.Time) []QuotaRuntimeState {
+	if s == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.RLock()
+	states := make([]QuotaRuntimeState, 0, len(s.states))
+	for _, state := range s.states {
+		states = append(states, cloneQuotaRuntimeState(state))
+	}
+	s.mu.RUnlock()
+	refreshed := make([]QuotaRuntimeState, 0, len(states))
+	for _, state := range states {
+		accountKey := strings.TrimSpace(state.AccountKey)
+		if accountKey == "" {
+			continue
+		}
+		if s.guard == nil {
+			state = s.withGuardState(state)
+			refreshed = append(refreshed, state)
+			continue
+		}
+		s.guard.ClearAuth(AccountRouteGuardSourceQuotaThreshold, accountKey)
+		if strings.EqualFold(state.Status, QuotaRuntimeStatusSuccess) && !state.Stale && !quotaRuntimeStateIsDegraded(state) {
+			for _, block := range quotaRuntimeQuotaThresholdRouteGuardBlocks(state, now) {
+				s.guard.MarkBlocked(block)
+			}
+		}
+		state = s.withGuardState(state)
+		refreshed = append(refreshed, state)
+		s.mu.Lock()
+		s.states[accountKey] = cloneQuotaRuntimeState(state)
+		s.mu.Unlock()
+	}
+	return refreshed
+}
+
+func (s *QuotaRuntimeStore) RefreshUsageCalibrations(now time.Time) []QuotaRuntimeState {
+	if s == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.RLock()
+	rawStates := make([]QuotaRuntimeState, 0, len(s.rawStates))
+	for _, state := range s.rawStates {
+		rawStates = append(rawStates, cloneQuotaRuntimeState(state))
+	}
+	if len(rawStates) == 0 {
+		for _, state := range s.states {
+			rawStates = append(rawStates, cloneQuotaRuntimeState(state))
+		}
+	}
+	s.mu.RUnlock()
+	refreshed := make([]QuotaRuntimeState, 0, len(rawStates))
+	for _, rawState := range rawStates {
+		state := s.effectiveQuotaRuntimeState(rawState, now)
+		refreshed = append(refreshed, state)
+		s.mu.Lock()
+		s.states[state.AccountKey] = cloneQuotaRuntimeState(state)
+		s.mu.Unlock()
+	}
+	return refreshed
+}
+
+func (s *QuotaRuntimeStore) effectiveQuotaRuntimeState(rawState QuotaRuntimeState, now time.Time) QuotaRuntimeState {
+	state := applyQuotaUsageCalibrationsToRuntimeState(rawState, s.usageCalibrations(), now)
+	s.syncGuard(state, now)
+	return s.withGuardState(state)
+}
+
+func (s *QuotaRuntimeStore) SetUsageCalibrations(calibrations []AccountQuotaUsageCalibration) {
+	if s == nil {
+		return
+	}
+	next := append([]AccountQuotaUsageCalibration(nil), calibrations...)
+	s.mu.Lock()
+	s.calibrations = next
+	_ = s.saveUsageCalibrationsLocked()
+	s.mu.Unlock()
+	s.RefreshUsageCalibrations(time.Now().UTC())
+}
+
+func (s *QuotaRuntimeStore) AddUsageCalibration(input AccountQuotaUsageCalibration, now time.Time) (AccountQuotaUsageCalibration, error) {
+	if s == nil {
+		return AccountQuotaUsageCalibration{}, fmt.Errorf("quota runtime store is not initialized")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	entry := normalizeQuotaUsageCalibration(input, now)
+	if !accountstore.IsAccountKey(entry.AccountKey) {
+		return AccountQuotaUsageCalibration{}, fmt.Errorf("invalid account_key %q", entry.AccountKey)
+	}
+	if entry.WindowKey == "" {
+		return AccountQuotaUsageCalibration{}, fmt.Errorf("window_key is required")
+	}
+	if entry.ID == "" {
+		entry.ID = fmt.Sprintf("cal_%d", now.UnixNano())
+	}
+	s.mu.Lock()
+	previous := append([]AccountQuotaUsageCalibration(nil), s.calibrations...)
+	s.calibrations = append(s.calibrations, entry)
+	if err := s.saveUsageCalibrationsLocked(); err != nil {
+		s.calibrations = previous
+		s.mu.Unlock()
+		return AccountQuotaUsageCalibration{}, err
+	}
+	s.mu.Unlock()
+	s.RefreshUsageCalibrations(now)
+	return entry, nil
+}
+
+func (s *QuotaRuntimeStore) RevokeUsageCalibration(id string, now time.Time) (AccountQuotaUsageCalibration, bool) {
+	if s == nil {
+		return AccountQuotaUsageCalibration{}, false
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return AccountQuotaUsageCalibration{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	for index := range s.calibrations {
+		if strings.TrimSpace(s.calibrations[index].ID) != id {
+			continue
+		}
+		previous := append([]AccountQuotaUsageCalibration(nil), s.calibrations...)
+		s.calibrations[index].RevokedAt = &now
+		if err := s.saveUsageCalibrationsLocked(); err != nil {
+			s.calibrations = previous
+			return AccountQuotaUsageCalibration{}, false
+		}
+		entry := s.calibrations[index]
+		s.mu.Unlock()
+		s.RefreshUsageCalibrations(now)
+		return entry, true
+	}
+	s.mu.Unlock()
+	return AccountQuotaUsageCalibration{}, false
+}
+
+func (s *QuotaRuntimeStore) saveUsageCalibrationsLocked() error {
+	if s == nil || strings.TrimSpace(s.ledgerPath) == "" {
+		return nil
+	}
+	return writeQuotaUsageCalibrationLedger(s.ledgerPath, s.calibrations)
+}
+
+func readQuotaUsageCalibrationLedger(path string) ([]AccountQuotaUsageCalibration, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []AccountQuotaUsageCalibration{}, nil
+		}
+		return nil, err
+	}
+	var ledger quotaUsageCalibrationLedger
+	if err := json.Unmarshal(body, &ledger); err != nil {
+		return nil, err
+	}
+	if ledger.Items == nil {
+		return []AccountQuotaUsageCalibration{}, nil
+	}
+	return append([]AccountQuotaUsageCalibration(nil), ledger.Items...), nil
+}
+
+func writeQuotaUsageCalibrationLedger(path string, items []AccountQuotaUsageCalibration) error {
+	ledger := quotaUsageCalibrationLedger{Items: append([]AccountQuotaUsageCalibration(nil), items...)}
+	if ledger.Items == nil {
+		ledger.Items = []AccountQuotaUsageCalibration{}
+	}
+	body, err := json.MarshalIndent(ledger, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(body, '\n'), 0o600)
+}
+
+func (s *QuotaRuntimeStore) UsageCalibrations(accountKey string) []AccountQuotaUsageCalibration {
+	items := s.usageCalibrations()
+	accountKey = strings.TrimSpace(accountKey)
+	if accountKey != "" {
+		filtered := make([]AccountQuotaUsageCalibration, 0, len(items))
+		for _, item := range items {
+			if strings.TrimSpace(item.AccountKey) == accountKey {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	return items
+}
+
+func (s *QuotaRuntimeStore) usageCalibrations() []AccountQuotaUsageCalibration {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	out := append([]AccountQuotaUsageCalibration(nil), s.calibrations...)
+	s.mu.RUnlock()
+	return out
+}
+
+func normalizeQuotaUsageCalibration(input AccountQuotaUsageCalibration, now time.Time) AccountQuotaUsageCalibration {
+	entry := input
+	entry.ID = strings.TrimSpace(entry.ID)
+	entry.AccountKey = strings.TrimSpace(entry.AccountKey)
+	entry.WindowKey = strings.TrimSpace(entry.WindowKey)
+	entry.Metric = strings.ToLower(strings.TrimSpace(entry.Metric))
+	if entry.Metric == "" {
+		entry.Metric = "tokens"
+	}
+	entry.Mode = normalizeQuotaUsageCalibrationMode(entry.Mode)
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = now
+	} else {
+		entry.CreatedAt = entry.CreatedAt.UTC()
+	}
+	if !entry.ExpiresAt.IsZero() {
+		entry.ExpiresAt = entry.ExpiresAt.UTC()
+	}
+	if entry.RevokedAt != nil && !entry.RevokedAt.IsZero() {
+		revokedAt := entry.RevokedAt.UTC()
+		entry.RevokedAt = &revokedAt
+	}
+	return entry
 }
 
 func (s *QuotaRuntimeStore) StateForAccount(accountKey string) (QuotaRuntimeState, bool) {
@@ -238,6 +535,7 @@ func (s *QuotaRuntimeStore) syncGuard(state QuotaRuntimeState, now time.Time) {
 		return
 	}
 	s.guard.ClearAuth(AccountRouteGuardSourceQuotaEmpty, state.AccountKey)
+	s.guard.ClearAuth(AccountRouteGuardSourceQuotaThreshold, state.AccountKey)
 	blocks := quotaRuntimeRouteGuardBlocks(state, now)
 	for _, block := range blocks {
 		s.guard.MarkBlocked(block)
@@ -277,20 +575,27 @@ func (s *QuotaRuntimeStore) withGuardState(state QuotaRuntimeState) QuotaRuntime
 }
 
 func quotaRuntimeRouteGuardBlocks(state QuotaRuntimeState, now time.Time) []AccountRouteGuardBlock {
+	fact := quotaRuntimeRouteGuardFact(state, now)
+	blocks := QuotaEmptyRouteGuardBlocks([]AccountQuotaRuntimeState{fact}, now)
+	blocks = append(blocks, QuotaThresholdRouteGuardBlocks([]AccountQuotaRuntimeState{fact}, loadQuotaThresholdRulesFromChannelRoutingConfig(), now)...)
+	return blocks
+}
+
+func quotaRuntimeQuotaThresholdRouteGuardBlocks(state QuotaRuntimeState, now time.Time) []AccountRouteGuardBlock {
+	fact := quotaRuntimeRouteGuardFact(state, now)
+	return QuotaThresholdRouteGuardBlocks([]AccountQuotaRuntimeState{fact}, loadQuotaThresholdRulesFromChannelRoutingConfig(), now)
+}
+
+func quotaRuntimeRouteGuardFact(state QuotaRuntimeState, now time.Time) AccountQuotaRuntimeState {
 	windows := make([]AccountQuotaWindowState, 0, len(state.Windows))
 	for _, window := range state.Windows {
-		remaining, ok := quotaRuntimeWindowRemaining(window)
+		windowState, ok := quotaRuntimeWindowState(window)
 		if !ok {
 			continue
 		}
-		windows = append(windows, AccountQuotaWindowState{
-			Key:       quotaRuntimeWindowKey(window),
-			Remaining: remaining,
-			ResetAt:   quotaRuntimeWindowResetAt(window),
-			Exhausted: remaining <= 0,
-		})
+		windows = append(windows, windowState)
 	}
-	return QuotaEmptyRouteGuardBlocks([]AccountQuotaRuntimeState{{
+	return AccountQuotaRuntimeState{
 		AccountKey:     state.AccountKey,
 		Source:         firstNonEmptyQuotaRuntimeString(state.Source, "quota-runtime"),
 		Fresh:          strings.EqualFold(state.Status, QuotaRuntimeStatusSuccess),
@@ -299,7 +604,62 @@ func quotaRuntimeRouteGuardBlocks(state QuotaRuntimeState, now time.Time) []Acco
 		DegradedReason: state.DegradedReason,
 		EvaluatedAt:    parseQuotaRuntimeTimestamp(state.LastEvaluatedAt, now),
 		Windows:        windows,
-	}}, now)
+	}
+}
+
+func applyQuotaUsageCalibrationsToRuntimeState(state QuotaRuntimeState, calibrations []AccountQuotaUsageCalibration, now time.Time) QuotaRuntimeState {
+	if len(calibrations) == 0 || len(state.Windows) == 0 {
+		return state
+	}
+	windows := make([]AccountQuotaWindowState, 0, len(state.Windows))
+	for _, window := range state.Windows {
+		windowState, ok := quotaRuntimeWindowState(window)
+		if !ok {
+			continue
+		}
+		windows = append(windows, windowState)
+	}
+	if len(windows) == 0 {
+		return state
+	}
+	fact := ApplyQuotaUsageCalibrations(AccountQuotaRuntimeState{
+		AccountKey:     state.AccountKey,
+		Source:         firstNonEmptyQuotaRuntimeString(state.Source, "quota-runtime"),
+		Fresh:          strings.EqualFold(state.Status, QuotaRuntimeStatusSuccess),
+		Stale:          state.Stale,
+		Degraded:       quotaRuntimeStateIsDegraded(state),
+		DegradedReason: state.DegradedReason,
+		EvaluatedAt:    parseQuotaRuntimeTimestamp(state.LastEvaluatedAt, now),
+		Windows:        windows,
+	}, calibrations, now)
+	state.Windows = append([]QuotaRuntimeWindow(nil), state.Windows...)
+	for index := range state.Windows {
+		if index >= len(fact.Windows) {
+			continue
+		}
+		state.Windows[index] = applyQuotaRuntimeEffectiveWindow(state.Windows[index], fact.Windows[index])
+	}
+	state.Fact = nil
+	return quotaRuntimeStateWithFact(state, now)
+}
+
+func applyQuotaRuntimeEffectiveWindow(window QuotaRuntimeWindow, effective AccountQuotaWindowState) QuotaRuntimeWindow {
+	if window.LimitTokens != nil {
+		used := effective.Used
+		remaining := effective.Remaining
+		window.UsedTokens = &used
+		window.RemainingTokens = &remaining
+		if effective.Limit > 0 {
+			percent := int((effective.Remaining / effective.Limit) * 100)
+			window.RemainingPercent = &percent
+		}
+		return window
+	}
+	if window.RemainingPercent != nil && effective.Limit > 0 {
+		percent := int((effective.Remaining / effective.Limit) * 100)
+		window.RemainingPercent = &percent
+	}
+	return window
 }
 
 func normalizeQuotaRuntimeState(input QuotaRuntimeState, now time.Time) (QuotaRuntimeState, error) {
@@ -351,6 +711,31 @@ func quotaRuntimeWindowRemaining(window QuotaRuntimeWindow) (float64, bool) {
 		return *window.RemainingTokens, true
 	}
 	return 0, false
+}
+
+func quotaRuntimeWindowState(window QuotaRuntimeWindow) (AccountQuotaWindowState, bool) {
+	remaining, ok := quotaRuntimeWindowRemaining(window)
+	if !ok {
+		return AccountQuotaWindowState{}, false
+	}
+	limit := 100.0
+	if window.LimitTokens != nil && *window.LimitTokens > 0 {
+		limit = *window.LimitTokens
+	} else if window.RemainingPercent == nil {
+		limit = 0
+	}
+	used := 0.0
+	if window.UsedTokens != nil {
+		used = *window.UsedTokens
+	}
+	return AccountQuotaWindowState{
+		Key:       quotaRuntimeWindowKey(window),
+		Used:      used,
+		Remaining: remaining,
+		Limit:     limit,
+		ResetAt:   quotaRuntimeWindowResetAt(window),
+		Exhausted: remaining <= 0,
+	}, true
 }
 
 func quotaRuntimeWindowKey(window QuotaRuntimeWindow) string {
@@ -780,6 +1165,42 @@ func configureQuotaRuntimeRoutes(group *gin.RouterGroup, store *QuotaRuntimeStor
 			return
 		}
 		c.JSON(http.StatusOK, next)
+	})
+	group.GET("/gettokens/quota-calibrations", func(c *gin.Context) {
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota runtime store is not initialized"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"items": store.UsageCalibrations(c.Query("account_key"))})
+	})
+	group.POST("/gettokens/quota-calibrations", func(c *gin.Context) {
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota runtime store is not initialized"})
+			return
+		}
+		var input AccountQuotaUsageCalibration
+		if err := c.ShouldBindJSON(&input); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		entry, err := store.AddUsageCalibration(input, time.Now().UTC())
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, entry)
+	})
+	group.POST("/gettokens/quota-calibrations/:id/revoke", func(c *gin.Context) {
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "quota runtime store is not initialized"})
+			return
+		}
+		entry, ok := store.RevokeUsageCalibration(c.Param("id"), time.Now().UTC())
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "quota calibration not found"})
+			return
+		}
+		c.JSON(http.StatusOK, entry)
 	})
 }
 

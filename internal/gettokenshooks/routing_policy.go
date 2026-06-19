@@ -18,6 +18,12 @@ func InstallRoutingPolicies() {
 func InstallRoutingPoliciesWithConfigPath(configPath string) {
 	SetChannelRoutingPolicyConfigPathFromConfig(configPath)
 	SetProjectCandidatePoolPolicyConfigPathFromConfig(configPath)
+	if err := SetQuotaRuntimeCalibrationPathFromConfig(configPath); err != nil {
+		log.WithError(err).Warn("gettokenshooks: configure quota calibration ledger path failed")
+	}
+	if err := SetBudgetWindowDefinitionPathFromConfig(configPath); err != nil {
+		log.WithError(err).Warn("gettokenshooks: configure budget window definition path failed")
+	}
 	if err := SetRouteResilienceActionLedgerPathFromConfig(configPath); err != nil {
 		log.WithError(err).Warn("gettokenshooks: configure route resilience action ledger path failed")
 	}

@@ -1,6 +1,8 @@
 package gettokenshooks
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -28,10 +30,70 @@ type AccountQuotaRuntimeState struct {
 type AccountQuotaWindowState struct {
 	Key       string
 	Kind      string
+	Used      float64
 	Remaining float64
 	Limit     float64
 	ResetAt   time.Time
 	Exhausted bool
+}
+
+type AccountQuotaThresholdRule struct {
+	ID               string                     `json:"id"`
+	AccountKey       string                     `json:"account_key"`
+	WindowKey        string                     `json:"window_key"`
+	Metric           string                     `json:"metric"`
+	Comparator       string                     `json:"comparator,omitempty"`
+	ThresholdPercent float64                    `json:"threshold_percent"`
+	Condition        *AccountQuotaRuleCondition `json:"condition,omitempty"`
+	Enabled          bool                       `json:"enabled"`
+}
+
+type AccountQuotaRuleCondition struct {
+	All        []AccountQuotaRuleCondition `json:"all,omitempty"`
+	Any        []AccountQuotaRuleCondition `json:"any,omitempty"`
+	Not        *AccountQuotaRuleCondition  `json:"not,omitempty"`
+	Fact       string                      `json:"fact,omitempty"`
+	WindowKey  string                      `json:"window_key,omitempty"`
+	Metric     string                      `json:"metric,omitempty"`
+	Comparator string                      `json:"comparator,omitempty"`
+	Value      float64                     `json:"value,omitempty"`
+}
+
+func (rule *AccountQuotaThresholdRule) UnmarshalJSON(data []byte) error {
+	type alias AccountQuotaThresholdRule
+	var decoded struct {
+		alias
+		AccountKeyCamel       string   `json:"accountKey,omitempty"`
+		WindowKeyCamel        string   `json:"windowKey,omitempty"`
+		ThresholdPercentCamel *float64 `json:"thresholdPercent,omitempty"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	next := AccountQuotaThresholdRule(decoded.alias)
+	if decoded.AccountKeyCamel != "" {
+		next.AccountKey = decoded.AccountKeyCamel
+	}
+	if decoded.WindowKeyCamel != "" {
+		next.WindowKey = decoded.WindowKeyCamel
+	}
+	if decoded.ThresholdPercentCamel != nil {
+		next.ThresholdPercent = *decoded.ThresholdPercentCamel
+	}
+	*rule = next
+	return nil
+}
+
+type AccountQuotaUsageCalibration struct {
+	ID         string     `json:"id"`
+	AccountKey string     `json:"account_key"`
+	WindowKey  string     `json:"window_key"`
+	Metric     string     `json:"metric"`
+	Mode       string     `json:"mode"`
+	Value      float64    `json:"value"`
+	CreatedAt  time.Time  `json:"created_at,omitempty"`
+	ExpiresAt  time.Time  `json:"expires_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
 // QuotaEmptyRouteGuardBlocks converts fresh exhausted quota windows into
@@ -81,6 +143,202 @@ func QuotaEmptyRouteGuardBlocksFromAuths(auths []*coreauth.Auth, now time.Time) 
 		states = append(states, state)
 	}
 	return QuotaEmptyRouteGuardBlocks(states, now)
+}
+
+func QuotaThresholdRouteGuardBlocks(states []AccountQuotaRuntimeState, rules []AccountQuotaThresholdRule, now time.Time) []AccountRouteGuardBlock {
+	if len(states) == 0 || len(rules) == 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	blocks := []AccountRouteGuardBlock{}
+	for _, state := range states {
+		for _, rule := range rules {
+			block, ok := quotaThresholdRouteGuardBlock(state, rule, now)
+			if !ok {
+				continue
+			}
+			blocks = append(blocks, block)
+		}
+	}
+	sort.SliceStable(blocks, func(i, j int) bool {
+		left := accountRouteGuardBlockKey(blocks[i])
+		right := accountRouteGuardBlockKey(blocks[j])
+		if left == right {
+			return blocks[i].Reason < blocks[j].Reason
+		}
+		return left < right
+	})
+	return blocks
+}
+
+func ApplyQuotaUsageCalibrations(state AccountQuotaRuntimeState, calibrations []AccountQuotaUsageCalibration, now time.Time) AccountQuotaRuntimeState {
+	if len(calibrations) == 0 || len(state.Windows) == 0 {
+		return state
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	accountKey := strings.TrimSpace(state.AccountKey)
+	if accountKey == "" {
+		return state
+	}
+	state.Windows = append([]AccountQuotaWindowState(nil), state.Windows...)
+	for windowIndex := range state.Windows {
+		window := state.Windows[windowIndex]
+		if window.Limit <= 0 {
+			continue
+		}
+		observedUsed := quotaWindowObservedUsed(window)
+		effectiveUsed := observedUsed
+		for _, calibration := range calibrations {
+			if !quotaUsageCalibrationApplies(calibration, accountKey, window.Key, now) {
+				continue
+			}
+			switch normalizeQuotaUsageCalibrationMode(calibration.Mode) {
+			case "set-effective":
+				if calibration.Value > effectiveUsed {
+					effectiveUsed = calibration.Value
+				}
+			default:
+				effectiveUsed += calibration.Value
+			}
+		}
+		effectiveUsed = clampQuotaValue(effectiveUsed, 0, window.Limit)
+		window.Used = effectiveUsed
+		window.Remaining = clampQuotaValue(window.Limit-effectiveUsed, 0, window.Limit)
+		window.Exhausted = window.Remaining <= 0
+		state.Windows[windowIndex] = window
+	}
+	return state
+}
+
+func quotaThresholdRouteGuardBlock(state AccountQuotaRuntimeState, rule AccountQuotaThresholdRule, now time.Time) (AccountRouteGuardBlock, bool) {
+	accountKey := strings.TrimSpace(state.AccountKey)
+	if accountKey == "" {
+		return AccountRouteGuardBlock{}, false
+	}
+	decision, match := evaluateQuotaThresholdRuleDecision(state, rule, now)
+	if !decision.Decision.Denied || decision.Decision.Action != "block" || match.Window.ResetAt.IsZero() {
+		return AccountRouteGuardBlock{}, false
+	}
+	updatedAt := state.EvaluatedAt
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	authIDs := normalizeQuotaGuardIDs(state.AuthIDs)
+	return AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceQuotaThreshold,
+		AuthID:     firstQuotaGuardAuthID(authIDs),
+		AccountKey: accountKey,
+		LookupKeys: quotaGuardLookupKeys(authIDs, state.LookupKeys),
+		Reason:     decision.Decision.Reason,
+		ExpiresAt:  match.Window.ResetAt.UTC(),
+		UpdatedAt:  updatedAt.UTC(),
+	}, true
+}
+
+type quotaThresholdRuleEvaluation struct {
+	Window     AccountQuotaWindowState
+	Metric     string
+	Comparator string
+	Actual     float64
+	Threshold  float64
+	Trace      string
+}
+
+func quotaThresholdRuleMatch(state AccountQuotaRuntimeState, rule AccountQuotaThresholdRule, now time.Time) (quotaThresholdRuleEvaluation, bool) {
+	if rule.Condition != nil {
+		return quotaRuleConditionMatched(state, *rule.Condition, now)
+	}
+	window, ok := quotaThresholdWindow(state.Windows, rule.WindowKey, now)
+	if !ok {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	metric := normalizeQuotaRuleMetric(rule.Metric)
+	actual, ok := quotaRuleMetricValue(window, metric)
+	if !ok {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	comparator := normalizeQuotaThresholdComparator(rule.Comparator, metric)
+	threshold := normalizeQuotaRuleThreshold(metric, rule.ThresholdPercent)
+	if !quotaThresholdMatched(actual, comparator, threshold) {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	return quotaThresholdRuleEvaluation{
+		Window:     window,
+		Metric:     metric,
+		Comparator: comparator,
+		Actual:     actual,
+		Threshold:  threshold,
+		Trace:      "legacy-threshold",
+	}, true
+}
+
+func quotaRuleConditionMatched(state AccountQuotaRuntimeState, condition AccountQuotaRuleCondition, now time.Time) (quotaThresholdRuleEvaluation, bool) {
+	if len(condition.All) > 0 {
+		var first quotaThresholdRuleEvaluation
+		for index, child := range condition.All {
+			match, ok := quotaRuleConditionMatched(state, child, now)
+			if !ok {
+				return quotaThresholdRuleEvaluation{}, false
+			}
+			if index == 0 || first.Window.ResetAt.IsZero() && !match.Window.ResetAt.IsZero() {
+				first = match
+			}
+		}
+		if first.Window.ResetAt.IsZero() {
+			return quotaThresholdRuleEvaluation{}, false
+		}
+		first.Trace = "all(" + first.Trace + ")"
+		return first, true
+	}
+	if len(condition.Any) > 0 {
+		for _, child := range condition.Any {
+			match, ok := quotaRuleConditionMatched(state, child, now)
+			if ok && !match.Window.ResetAt.IsZero() {
+				match.Trace = "any(" + match.Trace + ")"
+				return match, true
+			}
+		}
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	if condition.Not != nil {
+		_, ok := quotaRuleConditionMatched(state, *condition.Not, now)
+		if ok {
+			return quotaThresholdRuleEvaluation{}, false
+		}
+		return quotaThresholdRuleEvaluation{Trace: "not"}, true
+	}
+	return quotaRuleLeafConditionMatched(state, condition, now)
+}
+
+func quotaRuleLeafConditionMatched(state AccountQuotaRuntimeState, condition AccountQuotaRuleCondition, now time.Time) (quotaThresholdRuleEvaluation, bool) {
+	window, ok := quotaThresholdWindow(state.Windows, condition.WindowKey, now)
+	if !ok {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	metric := normalizeQuotaRuleMetric(condition.Metric)
+	actual, ok := quotaRuleMetricValue(window, metric)
+	if !ok {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	comparator := normalizeQuotaThresholdComparator(condition.Comparator, metric)
+	threshold := normalizeQuotaRuleThreshold(metric, condition.Value)
+	if !quotaThresholdMatched(actual, comparator, threshold) {
+		return quotaThresholdRuleEvaluation{}, false
+	}
+	return quotaThresholdRuleEvaluation{
+		Window:     window,
+		Metric:     metric,
+		Comparator: comparator,
+		Actual:     actual,
+		Threshold:  threshold,
+		Trace:      fmt.Sprintf("%s %s %.2f", metric, comparator, threshold),
+	}, true
 }
 
 func (s *AccountRouteGuardStore) SyncQuotaEmptyAuth(auth *coreauth.Auth, now time.Time) {
@@ -153,6 +411,189 @@ func quotaEmptyRouteGuardBlock(state AccountQuotaRuntimeState, now time.Time) (A
 		ExpiresAt:  latestReset.UTC(),
 		UpdatedAt:  updatedAt.UTC(),
 	}, true
+}
+
+func quotaUsageCalibrationApplies(calibration AccountQuotaUsageCalibration, accountKey string, windowKey string, now time.Time) bool {
+	if strings.TrimSpace(calibration.AccountKey) != strings.TrimSpace(accountKey) {
+		return false
+	}
+	if strings.TrimSpace(calibration.WindowKey) != strings.TrimSpace(windowKey) {
+		return false
+	}
+	if metric := strings.ToLower(strings.TrimSpace(calibration.Metric)); metric != "" && metric != "tokens" {
+		return false
+	}
+	if calibration.RevokedAt != nil && !calibration.RevokedAt.IsZero() && !calibration.RevokedAt.After(now) {
+		return false
+	}
+	if !calibration.ExpiresAt.IsZero() && !calibration.ExpiresAt.After(now) {
+		return false
+	}
+	if !calibration.CreatedAt.IsZero() && calibration.CreatedAt.After(now) {
+		return false
+	}
+	return true
+}
+
+func normalizeQuotaUsageCalibrationMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "set-effective", "set_effective", "set":
+		return "set-effective"
+	default:
+		return "delta"
+	}
+}
+
+func quotaWindowObservedUsed(window AccountQuotaWindowState) float64 {
+	if window.Used > 0 {
+		return window.Used
+	}
+	if window.Limit > 0 {
+		return clampQuotaValue(window.Limit-window.Remaining, 0, window.Limit)
+	}
+	return 0
+}
+
+func clampQuotaValue(value float64, min float64, max float64) float64 {
+	if value < min {
+		return min
+	}
+	if max > min && value > max {
+		return max
+	}
+	return value
+}
+
+func quotaThresholdWindow(windows []AccountQuotaWindowState, windowKey string, now time.Time) (AccountQuotaWindowState, bool) {
+	windowKey = strings.TrimSpace(windowKey)
+	if windowKey == "" {
+		return AccountQuotaWindowState{}, false
+	}
+	for _, window := range windows {
+		if strings.TrimSpace(window.Key) != windowKey {
+			continue
+		}
+		resetAt := window.ResetAt
+		if resetAt.IsZero() || !resetAt.After(now) {
+			return AccountQuotaWindowState{}, false
+		}
+		window.ResetAt = resetAt.UTC()
+		return window, true
+	}
+	return AccountQuotaWindowState{}, false
+}
+
+func quotaThresholdPercent(window AccountQuotaWindowState, metric string) (float64, bool) {
+	return quotaRuleMetricValue(window, metric)
+}
+
+func quotaRuleMetricValue(window AccountQuotaWindowState, metric string) (float64, bool) {
+	switch normalizeQuotaRuleMetric(metric) {
+	case "remaining-percent":
+		if window.Limit <= 0 {
+			return 0, false
+		}
+		return clampQuotaThresholdPercent((window.Remaining / window.Limit) * 100), true
+	case "used-percent":
+		if window.Limit <= 0 {
+			return 0, false
+		}
+		used := window.Used
+		if used <= 0 {
+			used = window.Limit - window.Remaining
+		}
+		return clampQuotaThresholdPercent((used / window.Limit) * 100), true
+	case "remaining":
+		return window.Remaining, true
+	case "used":
+		used := window.Used
+		if used <= 0 && window.Limit > 0 {
+			used = window.Limit - window.Remaining
+		}
+		return used, true
+	default:
+		return 0, false
+	}
+}
+
+func normalizeQuotaThresholdMetric(metric string) string {
+	return normalizeQuotaRuleMetric(metric)
+}
+
+func normalizeQuotaRuleMetric(metric string) string {
+	switch strings.ToLower(strings.TrimSpace(metric)) {
+	case "used-percent", "used_percent":
+		return "used-percent"
+	case "remaining", "remaining-tokens", "remaining_tokens":
+		return "remaining"
+	case "used", "used-tokens", "used_tokens":
+		return "used"
+	default:
+		return "remaining-percent"
+	}
+}
+
+func normalizeQuotaThresholdComparator(comparator string, metric string) string {
+	comparator = strings.TrimSpace(comparator)
+	if comparator == "<" || comparator == "<=" || comparator == ">" || comparator == ">=" {
+		return comparator
+	}
+	switch normalizeQuotaRuleMetric(metric) {
+	case "used-percent", "used":
+		return ">="
+	default:
+		return "<="
+	}
+}
+
+func normalizeQuotaRuleThreshold(metric string, value float64) float64 {
+	switch normalizeQuotaRuleMetric(metric) {
+	case "remaining-percent", "used-percent":
+		return clampQuotaThresholdPercent(value)
+	default:
+		return value
+	}
+}
+
+func quotaThresholdMatched(actual float64, comparator string, threshold float64) bool {
+	switch comparator {
+	case "<":
+		return actual < threshold
+	case "<=":
+		return actual <= threshold
+	case ">":
+		return actual > threshold
+	case ">=":
+		return actual >= threshold
+	default:
+		return actual <= threshold
+	}
+}
+
+func clampQuotaThresholdPercent(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func quotaThresholdGuardReason(rule AccountQuotaThresholdRule, match quotaThresholdRuleEvaluation) string {
+	ruleID := strings.TrimSpace(rule.ID)
+	if ruleID == "" {
+		ruleID = "quota-threshold"
+	}
+	unit := ""
+	if strings.Contains(match.Metric, "percent") {
+		unit = "%"
+	}
+	trace := strings.TrimSpace(match.Trace)
+	if trace == "" {
+		trace = "threshold"
+	}
+	return fmt.Sprintf("quota threshold: rule=%s window=%s metric=%s actual=%.2f%s %s %.2f%s; trace=%s; reset at %s", ruleID, quotaWindowName(match.Window), match.Metric, match.Actual, unit, match.Comparator, match.Threshold, unit, trace, match.Window.ResetAt.UTC().Format(time.RFC3339))
 }
 
 func quotaRuntimeStateFromAuth(auth *coreauth.Auth, now time.Time) (AccountQuotaRuntimeState, bool) {

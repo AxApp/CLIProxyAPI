@@ -851,6 +851,15 @@ func resetRouteResilienceActionHistoryForTest() {
 
 func useRouteResilienceActionLedgerPathForTest(t *testing.T) string {
 	t.Helper()
+	channelRoutingPolicyConfigPathState.Lock()
+	previousChannelRoutingConfigPath := channelRoutingPolicyConfigPathState.path
+	channelRoutingPolicyConfigPathState.path = ""
+	channelRoutingPolicyConfigPathState.Unlock()
+	t.Cleanup(func() {
+		channelRoutingPolicyConfigPathState.Lock()
+		channelRoutingPolicyConfigPathState.path = previousChannelRoutingConfigPath
+		channelRoutingPolicyConfigPathState.Unlock()
+	})
 	path := filepath.Join(t.TempDir(), "route-actions.jsonl")
 	setRouteResilienceActionLedgerPathForTest(t, path)
 	return path

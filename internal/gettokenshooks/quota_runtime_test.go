@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -49,6 +50,311 @@ func TestQuotaRuntimeStoreUpsertFeedsQuotaEmptyGuard(t *testing.T) {
 		Provider:   "codex",
 	}}); len(got) != 1 || got[0] != "codex-auth-1" {
 		t.Fatalf("guard deny ids = %#v, want quota-empty deny", got)
+	}
+}
+
+func TestQuotaRuntimeStoreUpsertFeedsQuotaThresholdGuardFromConfig(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, "{\n"+
+		"\t\t\"channels\": {},\n"+
+		"\t\t\"quotaThresholdRules\": [{\n"+
+		"\t\t\t\"id\": \"stop-low-tokens\",\n"+
+		"\t\t\t\"accountKey\": \"acct_00000000-0000-4000-8000-000000000121\",\n"+
+		"\t\t\t\"windowKey\": \"tokens_5h\",\n"+
+		"\t\t\t\"metric\": \"remaining-percent\",\n"+
+		"\t\t\t\"comparator\": \"<=\",\n"+
+		"\t\t\t\"thresholdPercent\": 20,\n"+
+		"\t\t\t\"enabled\": true\n"+
+		"\t\t}]\n"+
+		"\t}")
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	remainingTokens := 18.0
+	limitTokens := 100.0
+
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: "acct_00000000-0000-4000-8000-000000000121",
+		Source:     "quota-curl",
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &remainingTokens,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceQuotaThreshold {
+		t.Fatalf("state = %#v, want quota-threshold blocked source", state)
+	}
+	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "auth-threshold",
+		AccountKey: state.AccountKey,
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != "auth-threshold" {
+		t.Fatalf("guard deny ids = %#v, want quota-threshold deny", got)
+	}
+}
+
+func TestQuotaRuntimeStoreFreshRecoveryClearsOnlyQuotaThreshold(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, "{\n"+
+		"\t\t\"channels\": {},\n"+
+		"\t\t\"quotaThresholdRules\": [{\n"+
+		"\t\t\t\"id\": \"stop-low-tokens\",\n"+
+		"\t\t\t\"accountKey\": \"acct_00000000-0000-4000-8000-000000000122\",\n"+
+		"\t\t\t\"windowKey\": \"tokens_5h\",\n"+
+		"\t\t\t\"metric\": \"remaining-percent\",\n"+
+		"\t\t\t\"thresholdPercent\": 20,\n"+
+		"\t\t\t\"enabled\": true\n"+
+		"\t\t}]\n"+
+		"\t}")
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := quotaThresholdRuleTestNow()
+	accountKey := "acct_00000000-0000-4000-8000-000000000122"
+	lowRemaining := 18.0
+	healthyRemaining := 45.0
+	limitTokens := 100.0
+	guard.MarkBlocked(AccountRouteGuardBlock{
+		Source:     AccountRouteGuardSourceRateLimit,
+		AccountKey: accountKey,
+		Reason:     "request window full",
+		ExpiresAt:  time.Now().UTC().Add(time.Hour),
+	})
+
+	if _, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &lowRemaining,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now); err != nil {
+		t.Fatalf("Upsert threshold: %v", err)
+	}
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &healthyRemaining,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("Upsert recovered: %v", err)
+	}
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceRateLimit {
+		t.Fatalf("state = %#v, want only rate-limit after quota-threshold recovery", state)
+	}
+}
+
+func TestQuotaRuntimeStoreAppliesManualCalibrationBeforeQuotaThreshold(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, "{\n"+
+		"\t\t\"channels\": {},\n"+
+		"\t\t\"quotaThresholdRules\": [{\n"+
+		"\t\t\t\"id\": \"stop-low-tokens\",\n"+
+		"\t\t\t\"accountKey\": \"acct_00000000-0000-4000-8000-000000000123\",\n"+
+		"\t\t\t\"windowKey\": \"tokens_5h\",\n"+
+		"\t\t\t\"metric\": \"remaining-percent\",\n"+
+		"\t\t\t\"thresholdPercent\": 20,\n"+
+		"\t\t\t\"enabled\": true\n"+
+		"\t\t}]\n"+
+		"\t}")
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := quotaThresholdRuleTestNow()
+	accountKey := "acct_00000000-0000-4000-8000-000000000123"
+	remainingTokens := 45.0
+	limitTokens := 100.0
+	store.SetUsageCalibrations([]AccountQuotaUsageCalibration{{
+		ID:         "cal_external_30",
+		AccountKey: accountKey,
+		WindowKey:  "tokens_5h",
+		Metric:     "tokens",
+		Mode:       "delta",
+		Value:      30,
+		CreatedAt:  now.Add(-time.Minute),
+		ExpiresAt:  now.Add(2 * time.Hour),
+	}})
+
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &remainingTokens,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceQuotaThreshold {
+		t.Fatalf("state = %#v, want calibration-adjusted quota-threshold block", state)
+	}
+	if state.Windows[0].RemainingTokens == nil || *state.Windows[0].RemainingTokens != 15 {
+		t.Fatalf("window = %#v, want effective remaining tokens 15", state.Windows[0])
+	}
+}
+
+func TestQuotaRuntimeCalibrationRoutesAddListAndRevoke(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, "{\n"+
+		"\t\t\"channels\": {},\n"+
+		"\t\t\"quotaThresholdRules\": [{\n"+
+		"\t\t\t\"id\": \"stop-low-tokens\",\n"+
+		"\t\t\t\"accountKey\": \"acct_00000000-0000-4000-8000-000000000124\",\n"+
+		"\t\t\t\"windowKey\": \"tokens_5h\",\n"+
+		"\t\t\t\"metric\": \"remaining-percent\",\n"+
+		"\t\t\t\"thresholdPercent\": 20,\n"+
+		"\t\t\t\"enabled\": true\n"+
+		"\t\t}]\n"+
+		"\t}")
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+	now := quotaThresholdRuleTestNow()
+	accountKey := "acct_00000000-0000-4000-8000-000000000124"
+	body := strings.NewReader("{\"account_key\":\"" + accountKey + "\",\"window_key\":\"tokens_5h\",\"metric\":\"tokens\",\"mode\":\"delta\",\"value\":30,\"created_at\":\"" + now.Format(time.RFC3339) + "\",\"expires_at\":\"" + now.Add(2*time.Hour).Format(time.RFC3339) + "\"}")
+
+	post := httptest.NewRecorder()
+	router.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-calibrations", body))
+	if post.Code != http.StatusOK {
+		t.Fatalf("post status = %d body=%s", post.Code, post.Body.String())
+	}
+	var created AccountQuotaUsageCalibration
+	if err := json.Unmarshal(post.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created calibration: %v", err)
+	}
+	if created.ID == "" || created.AccountKey != accountKey || created.WindowKey != "tokens_5h" {
+		t.Fatalf("created calibration = %#v, want id/account/window", created)
+	}
+
+	list := httptest.NewRecorder()
+	router.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/quota-calibrations?account_key="+accountKey, nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), created.ID) {
+		t.Fatalf("list status=%d body=%s, want created calibration", list.Code, list.Body.String())
+	}
+
+	remainingTokens := 45.0
+	limitTokens := 100.0
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &remainingTokens,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert calibrated: %v", err)
+	}
+	if !state.Blocked || state.Sources[0].Source != AccountRouteGuardSourceQuotaThreshold {
+		t.Fatalf("state = %#v, want calibration to trigger quota-threshold", state)
+	}
+
+	revoke := httptest.NewRecorder()
+	router.ServeHTTP(revoke, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-calibrations/"+created.ID+"/revoke", nil))
+	if revoke.Code != http.StatusOK {
+		t.Fatalf("revoke status = %d body=%s", revoke.Code, revoke.Body.String())
+	}
+	revokeCheckAt := time.Now().UTC().Add(time.Minute)
+	state, err = store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &remainingTokens,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, revokeCheckAt)
+	if err != nil {
+		t.Fatalf("Upsert after revoke: %v", err)
+	}
+	if state.Blocked {
+		t.Fatalf("state = %#v, want revoked calibration to stop affecting threshold", state)
+	}
+}
+
+func TestQuotaRuntimeStoreRefreshesCurrentStateWhenCalibrationChanges(t *testing.T) {
+	configPath := writeRouteGuardChannelRoutingConfig(t, "{\n"+
+		"\t\t\"channels\": {},\n"+
+		"\t\t\"quotaThresholdRules\": [{\n"+
+		"\t\t\t\"id\": \"stop-low-tokens\",\n"+
+		"\t\t\t\"accountKey\": \"acct_00000000-0000-4000-8000-000000000126\",\n"+
+		"\t\t\t\"windowKey\": \"tokens_5h\",\n"+
+		"\t\t\t\"metric\": \"remaining-percent\",\n"+
+		"\t\t\t\"thresholdPercent\": 20,\n"+
+		"\t\t\t\"enabled\": true\n"+
+		"\t\t}]\n"+
+		"\t}")
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := quotaThresholdRuleTestNow()
+	accountKey := "acct_00000000-0000-4000-8000-000000000126"
+	remainingTokens := 45.0
+	limitTokens := 100.0
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:              "tokens_5h",
+			RemainingTokens: &remainingTokens,
+			LimitTokens:     &limitTokens,
+			ResetAtUnix:     now.Add(2 * time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if state.Blocked {
+		t.Fatalf("state = %#v, want no block before manual calibration", state)
+	}
+
+	entry, err := store.AddUsageCalibration(AccountQuotaUsageCalibration{
+		ID:         "cal_external_30",
+		AccountKey: accountKey,
+		WindowKey:  "tokens_5h",
+		Metric:     "tokens",
+		Mode:       "delta",
+		Value:      30,
+		ExpiresAt:  now.Add(2 * time.Hour),
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("AddUsageCalibration: %v", err)
+	}
+	afterAdd, ok := store.StateForAccount(accountKey)
+	if !ok || !afterAdd.Blocked || len(afterAdd.Sources) != 1 || afterAdd.Sources[0].Source != AccountRouteGuardSourceQuotaThreshold {
+		t.Fatalf("state after add = %#v, want immediate calibration-adjusted threshold block", afterAdd)
+	}
+	if afterAdd.Windows[0].RemainingTokens == nil || *afterAdd.Windows[0].RemainingTokens != 15 {
+		t.Fatalf("window after add = %#v, want effective remaining tokens 15", afterAdd.Windows[0])
+	}
+
+	if _, ok := store.RevokeUsageCalibration(entry.ID, now.Add(2*time.Minute)); !ok {
+		t.Fatalf("RevokeUsageCalibration(%q) not found", entry.ID)
+	}
+	afterRevoke, ok := store.StateForAccount(accountKey)
+	if !ok || afterRevoke.Blocked {
+		t.Fatalf("state after revoke = %#v, want immediate recovery", afterRevoke)
+	}
+	if afterRevoke.Windows[0].RemainingTokens == nil || *afterRevoke.Windows[0].RemainingTokens != 45 {
+		t.Fatalf("window after revoke = %#v, want raw remaining tokens restored", afterRevoke.Windows[0])
 	}
 }
 
@@ -450,6 +756,62 @@ func TestQuotaRuntimeRoutesGetStatusesByCommaKeys(t *testing.T) {
 	}
 	if len(response.Items) != 2 || response.Items[0].AccountKey != key || response.Items[1].Status != QuotaRuntimeStatusStale {
 		t.Fatalf("items = %#v, want stored then stale", response.Items)
+	}
+}
+
+func TestQuotaRuntimeCalibrationLedgerPersistsAcrossStores(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ledgerPath := filepath.Join(t.TempDir(), "profile", "quota-calibrations", "config.json")
+	store := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	if err := store.SetUsageCalibrationLedgerPath(ledgerPath); err != nil {
+		t.Fatalf("SetUsageCalibrationLedgerPath: %v", err)
+	}
+	router := gin.New()
+	configureQuotaRuntimeRoutes(router.Group("/v0/management"), store)
+
+	createBody := "{\n" +
+		"  \"account_key\":\"acct_00000000-0000-4000-8000-000000000301\",\n" +
+		"  \"window_key\":\"tokens_5h\",\n" +
+		"  \"metric\":\"tokens\",\n" +
+		"  \"mode\":\"delta\",\n" +
+		"  \"value\":1200\n" +
+		"}"
+	createRecorder := httptest.NewRecorder()
+	createRequest := httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-calibrations", strings.NewReader(createBody))
+	createRequest.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(createRecorder, createRequest)
+	if createRecorder.Code != http.StatusOK {
+		t.Fatalf("create calibration status = %d body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created AccountQuotaUsageCalibration
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created calibration: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatalf("created calibration missing id: %#v", created)
+	}
+
+	reloaded := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	if err := reloaded.SetUsageCalibrationLedgerPath(ledgerPath); err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	items := reloaded.UsageCalibrations("acct_00000000-0000-4000-8000-000000000301")
+	if len(items) != 1 || items[0].ID != created.ID || items[0].Value != 1200 {
+		t.Fatalf("reloaded calibrations = %#v, want persisted created entry", items)
+	}
+
+	revokeRecorder := httptest.NewRecorder()
+	router.ServeHTTP(revokeRecorder, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-calibrations/"+created.ID+"/revoke", nil))
+	if revokeRecorder.Code != http.StatusOK {
+		t.Fatalf("revoke calibration status = %d body=%s", revokeRecorder.Code, revokeRecorder.Body.String())
+	}
+	reloadedAfterRevoke := NewQuotaRuntimeStore(NewAccountRouteGuardStore())
+	if err := reloadedAfterRevoke.SetUsageCalibrationLedgerPath(ledgerPath); err != nil {
+		t.Fatalf("reload revoked ledger: %v", err)
+	}
+	items = reloadedAfterRevoke.UsageCalibrations("acct_00000000-0000-4000-8000-000000000301")
+	if len(items) != 1 || items[0].RevokedAt == nil {
+		t.Fatalf("reloaded revoked calibrations = %#v, want revoked entry persisted", items)
 	}
 }
 
