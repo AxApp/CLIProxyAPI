@@ -328,21 +328,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			forceTranscriptReplayNextRequest = release.ForceTranscriptReplay
 		}
 
+		// CPA-mediated websocket handling must replay the merged transcript. Incremental
+		// previous_response_id only belongs to raw upstream passthrough, which this fork
+		// does not expose on this path.
 		allowIncrementalInputWithPreviousResponseID := false
-		if pinnedAuthID != "" {
-			if pinnedAuth, ok := sessionAuthByID(pinnedAuthID); ok && pinnedAuth != nil {
-				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth)
-			}
-		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-			}
-			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
-		}
-		if forceTranscriptReplayNextRequest {
-			allowIncrementalInputWithPreviousResponseID = false
-		}
 
 		allowCompactionReplayBypass := false
 		if pinnedAuthID != "" {
