@@ -3,6 +3,7 @@ package accountstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -81,6 +82,51 @@ type AccountBatchMutationError struct {
 	Error      string `json:"error"`
 }
 
+type AccountBatchCreateError struct {
+	Index int    `json:"index"`
+	Title string `json:"title,omitempty"`
+	Error string `json:"error"`
+}
+
+type AccountBatchCreateSkipped struct {
+	Index              int    `json:"index"`
+	Title              string `json:"title,omitempty"`
+	Reason             string `json:"reason"`
+	ExistingAccountKey string `json:"existing_account_key,omitempty"`
+	DedupeKeyKind      string `json:"dedupe_key_kind,omitempty"`
+}
+
+type AccountBatchCreatePreviewItem struct {
+	Index              int    `json:"index"`
+	Title              string `json:"title,omitempty"`
+	Action             string `json:"action"`
+	Reason             string `json:"reason,omitempty"`
+	ExistingAccountKey string `json:"existing_account_key,omitempty"`
+	DedupeKeyKind      string `json:"dedupe_key_kind,omitempty"`
+}
+
+type AccountBatchCreatePreviewResult struct {
+	Items        []AccountBatchCreatePreviewItem `json:"items"`
+	Skipped      []AccountBatchCreateSkipped     `json:"skipped"`
+	Errors       []AccountBatchCreateError       `json:"errors"`
+	WouldCreate  int                             `json:"would_create"`
+	SkippedCount int                             `json:"skipped_count"`
+	Failed       int                             `json:"failed"`
+}
+
+type authFileDedupeKey struct {
+	Key  string
+	Kind string
+}
+
+type accountBatchCreatePlan struct {
+	candidates  []ImportCandidate
+	accountKeys []string
+	items       []AccountBatchCreatePreviewItem
+	skipped     []AccountBatchCreateSkipped
+	failures    []AccountBatchCreateError
+}
+
 func (s *Store) CreateAccount(ctx context.Context, write AccountWrite) (AccountRecord, error) {
 	if s == nil || s.db == nil {
 		return AccountRecord{}, errors.New("account store is not open")
@@ -108,14 +154,198 @@ func (s *Store) CreateAccount(ctx context.Context, write AccountWrite) (AccountR
 			_ = tx.Rollback()
 		}
 	}()
+	if identity, ok := authFileDedupeIdentity(candidate); ok {
+		existing, err := runtimeIdentityAccountKey(ctx, tx, identity.Key)
+		if err != nil {
+			return AccountRecord{}, err
+		}
+		if existing != "" {
+			return AccountRecord{}, fmt.Errorf("auth-file credential already exists as %s", existing)
+		}
+	}
 	if err := insertAccountRows(ctx, tx, candidate, 1); err != nil {
 		return AccountRecord{}, err
+	}
+	if identity, ok := authFileDedupeIdentity(candidate); ok {
+		if err := insertRuntimeIdentityStrict(ctx, tx, accountKey, identity.Key, "auth-dedupe-key", unixMs()); err != nil {
+			return AccountRecord{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return AccountRecord{}, fmt.Errorf("commit create account transaction: %w", err)
 	}
 	tx = nil
 	return s.GetAccount(ctx, accountKey)
+}
+
+func (s *Store) CreateAccounts(ctx context.Context, writes []AccountWrite) ([]AccountRecord, []AccountBatchCreateSkipped, []AccountBatchCreateError, error) {
+	if s == nil || s.db == nil {
+		return nil, nil, nil, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(writes) == 0 {
+		return []AccountRecord{}, []AccountBatchCreateSkipped{}, []AccountBatchCreateError{}, nil
+	}
+	if err := s.EnsureSchema(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("begin create accounts transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	plan, err := planAccountBatchCreates(ctx, tx, writes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	for _, candidate := range plan.candidates {
+		if err := insertAccountRows(ctx, tx, candidate, 1); err != nil {
+			return nil, nil, nil, err
+		}
+		if identity, ok := authFileDedupeIdentity(candidate); ok {
+			if err := insertRuntimeIdentityStrict(ctx, tx, candidate.AccountKey, identity.Key, "auth-dedupe-key", unixMs()); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, nil, fmt.Errorf("commit create accounts transaction: %w", err)
+	}
+	tx = nil
+	accounts, err := s.GetAccounts(ctx, plan.accountKeys)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return accounts, plan.skipped, plan.failures, nil
+}
+
+func (s *Store) PreviewCreateAccounts(ctx context.Context, writes []AccountWrite) (AccountBatchCreatePreviewResult, error) {
+	if s == nil || s.db == nil {
+		return AccountBatchCreatePreviewResult{}, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(writes) == 0 {
+		return AccountBatchCreatePreviewResult{
+			Items:   []AccountBatchCreatePreviewItem{},
+			Skipped: []AccountBatchCreateSkipped{},
+			Errors:  []AccountBatchCreateError{},
+		}, nil
+	}
+	if err := s.EnsureSchema(ctx); err != nil {
+		return AccountBatchCreatePreviewResult{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AccountBatchCreatePreviewResult{}, fmt.Errorf("begin preview create accounts transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	plan, err := planAccountBatchCreates(ctx, tx, writes)
+	if err != nil {
+		return AccountBatchCreatePreviewResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AccountBatchCreatePreviewResult{}, fmt.Errorf("commit preview create accounts transaction: %w", err)
+	}
+	tx = nil
+	return AccountBatchCreatePreviewResult{
+		Items:        plan.items,
+		Skipped:      plan.skipped,
+		Errors:       plan.failures,
+		WouldCreate:  len(plan.candidates),
+		SkippedCount: len(plan.skipped),
+		Failed:       len(plan.failures),
+	}, nil
+}
+
+func planAccountBatchCreates(ctx context.Context, tx *sql.Tx, writes []AccountWrite) (accountBatchCreatePlan, error) {
+	plan := accountBatchCreatePlan{
+		candidates:  make([]ImportCandidate, 0, len(writes)),
+		accountKeys: make([]string, 0, len(writes)),
+		items:       make([]AccountBatchCreatePreviewItem, 0, len(writes)),
+		skipped:     make([]AccountBatchCreateSkipped, 0),
+		failures:    make([]AccountBatchCreateError, 0),
+	}
+	seenDedupeKeys := make(map[string]string)
+	for index, write := range writes {
+		title := strings.TrimSpace(write.Title)
+		accountKey, err := newAccountKey()
+		if err != nil {
+			failure := AccountBatchCreateError{Index: index, Title: title, Error: fmt.Sprintf("generate account key: %v", err)}
+			plan.failures = append(plan.failures, failure)
+			plan.items = append(plan.items, AccountBatchCreatePreviewItem{Index: index, Title: title, Action: "error", Reason: failure.Error})
+			continue
+		}
+		candidate := candidateFromWrite(accountKey, write)
+		if err := validateCandidate(candidate); err != nil {
+			failure := AccountBatchCreateError{Index: index, Title: title, Error: err.Error()}
+			plan.failures = append(plan.failures, failure)
+			plan.items = append(plan.items, AccountBatchCreatePreviewItem{Index: index, Title: title, Action: "error", Reason: failure.Error})
+			continue
+		}
+		if identity, ok := authFileDedupeIdentity(candidate); ok {
+			if existing := seenDedupeKeys[identity.Key]; existing != "" {
+				skip := AccountBatchCreateSkipped{
+					Index:              index,
+					Title:              title,
+					Reason:             "duplicate_in_batch",
+					ExistingAccountKey: existing,
+					DedupeKeyKind:      identity.Kind,
+				}
+				plan.skipped = append(plan.skipped, skip)
+				plan.items = append(plan.items, AccountBatchCreatePreviewItem{
+					Index:              index,
+					Title:              title,
+					Action:             "skip",
+					Reason:             skip.Reason,
+					ExistingAccountKey: skip.ExistingAccountKey,
+					DedupeKeyKind:      skip.DedupeKeyKind,
+				})
+				continue
+			}
+			existing, err := runtimeIdentityAccountKey(ctx, tx, identity.Key)
+			if err != nil {
+				return plan, err
+			}
+			if existing != "" {
+				skip := AccountBatchCreateSkipped{
+					Index:              index,
+					Title:              title,
+					Reason:             "existing_account",
+					ExistingAccountKey: existing,
+					DedupeKeyKind:      identity.Kind,
+				}
+				plan.skipped = append(plan.skipped, skip)
+				plan.items = append(plan.items, AccountBatchCreatePreviewItem{
+					Index:              index,
+					Title:              title,
+					Action:             "skip",
+					Reason:             skip.Reason,
+					ExistingAccountKey: skip.ExistingAccountKey,
+					DedupeKeyKind:      skip.DedupeKeyKind,
+				})
+				continue
+			}
+			seenDedupeKeys[identity.Key] = accountKey
+		}
+		plan.candidates = append(plan.candidates, candidate)
+		plan.accountKeys = append(plan.accountKeys, accountKey)
+		plan.items = append(plan.items, AccountBatchCreatePreviewItem{Index: index, Title: title, Action: "create"})
+	}
+	return plan, nil
 }
 
 func (s *Store) UpdateAccount(ctx context.Context, accountKey string, write AccountWrite) (AccountRecord, error) {
@@ -1497,6 +1727,136 @@ VALUES (?, ?, ?, ?, ?)`, identityKey, accountKey, identityKind, now, now)
 		return fmt.Errorf("insert runtime identity %s: %w", identityKey, err)
 	}
 	return nil
+}
+
+func insertRuntimeIdentityStrict(ctx context.Context, tx *sql.Tx, accountKey string, identityKey string, identityKind string, now int64) error {
+	if strings.TrimSpace(identityKey) == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+DELETE FROM account_runtime_identities
+WHERE identity_key = ?
+  AND account_key IN (SELECT account_key FROM account_cards WHERE deleted_at_unix_ms IS NOT NULL)`, identityKey); err != nil {
+		return fmt.Errorf("delete stale runtime identity %s: %w", identityKey, err)
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO account_runtime_identities(identity_key, account_key, identity_kind, created_at_unix_ms, updated_at_unix_ms)
+VALUES (?, ?, ?, ?, ?)`, identityKey, accountKey, identityKind, now, now)
+	if err != nil {
+		return fmt.Errorf("insert runtime identity %s: %w", identityKey, err)
+	}
+	return nil
+}
+
+func runtimeIdentityAccountKey(ctx context.Context, tx *sql.Tx, identityKey string) (string, error) {
+	if strings.TrimSpace(identityKey) == "" {
+		return "", nil
+	}
+	var accountKey string
+	err := tx.QueryRowContext(ctx, `
+SELECT ri.account_key
+FROM account_runtime_identities ri
+JOIN account_cards ac ON ac.account_key = ri.account_key
+WHERE ri.identity_key = ? AND ac.deleted_at_unix_ms IS NULL
+LIMIT 1`, identityKey).Scan(&accountKey)
+	if err == nil {
+		return accountKey, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return "", fmt.Errorf("query runtime identity %s: %w", identityKey, err)
+}
+
+func authFileDedupeIdentity(candidate ImportCandidate) (authFileDedupeKey, bool) {
+	if candidate.Kind != KindAuthFile || candidate.AuthFile == nil {
+		return authFileDedupeKey{}, false
+	}
+	authJSON := strings.TrimSpace(candidate.AuthFile.AuthJSON)
+	if authJSON == "" {
+		return authFileDedupeKey{}, false
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(authJSON), &payload); err != nil {
+		return authFileDedupeKey{
+			Key:  authDedupeIdentityKey("codex", "normalized-json", authJSON),
+			Kind: "normalized-json",
+		}, true
+	}
+	authType := strings.ToLower(strings.TrimSpace(candidate.AuthFile.AuthType))
+	if authType == "" {
+		authType = strings.ToLower(firstStringField(payload, "type"))
+	}
+	if authType == "" {
+		authType = "codex"
+	}
+	for _, field := range []struct {
+		kind string
+		keys []string
+	}{
+		{kind: "refresh-token", keys: []string{"refresh_token", "refreshToken"}},
+		{kind: "id-token", keys: []string{"id_token", "idToken"}},
+		{kind: "access-token", keys: []string{"access_token", "accessToken"}},
+	} {
+		for _, key := range field.keys {
+			if value := firstStringField(payload, key); value != "" {
+				return authFileDedupeKey{
+					Key:  authDedupeIdentityKey(authType, field.kind, value),
+					Kind: field.kind,
+				}, true
+			}
+		}
+	}
+	email := strings.ToLower(firstStringField(payload, "email"))
+	accountID := firstStringField(payload, "account_id")
+	if accountID == "" {
+		accountID = firstStringField(payload, "chatgpt_account_id")
+	}
+	if email != "" && accountID != "" {
+		return authFileDedupeKey{
+			Key:  authDedupeIdentityKey(authType, "principal", email+"\x00"+accountID),
+			Kind: "principal",
+		}, true
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil {
+		canonical = []byte(authJSON)
+	}
+	return authFileDedupeKey{
+		Key:  authDedupeIdentityKey(authType, "normalized-json", string(canonical)),
+		Kind: "normalized-json",
+	}, true
+}
+
+func authDedupeIdentityKey(authType string, kind string, material string) string {
+	authType = strings.ToLower(strings.TrimSpace(authType))
+	if authType == "" {
+		authType = "codex"
+	}
+	return "auth-file:" + authType + ":" + kind + ":" + fingerprintString(material)
+}
+
+func firstStringField(value any, key string) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		if raw, ok := typed[key]; ok {
+			if str, ok := raw.(string); ok {
+				return strings.TrimSpace(str)
+			}
+		}
+		for _, child := range typed {
+			if found := firstStringField(child, key); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if found := firstStringField(child, key); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
 }
 
 func migrationSourceID(candidate ImportCandidate) string {

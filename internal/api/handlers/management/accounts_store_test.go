@@ -816,6 +816,204 @@ func TestAccountsBatchDeleteEndpointDeletesMultipleAccountsWithOneApply(t *testi
 	}
 }
 
+func TestAccountsBatchCreateEndpointCreatesMultipleAccountsWithOneApply(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+	applyCalls := 0
+	h.SetAccountStoreApplyHook(func(context.Context) error {
+		applyCalls++
+		return nil
+	})
+
+	router := gin.New()
+	router.POST("/v0/management/accounts/batch-create", h.CreateAccountsBatch)
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	createBody := []byte(`{"accounts":[
+		{
+			"kind":"codex-api-key",
+			"title":"first",
+			"provider":"codex",
+			"credential":{"api_key":"sk-first","base_url":"https://api.example.com/v1"}
+		},
+		{
+			"kind":"codex-api-key",
+			"title":"second",
+			"provider":"codex",
+			"credential":{"api_key":"sk-second","base_url":"https://api.example.com/v1"}
+		}
+	]}`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts/batch-create", bytes.NewReader(createBody)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("batch create status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result accountBatchCreateResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal batch create: %v", err)
+	}
+	if result.Succeeded != 2 || result.Failed != 0 || len(result.Accounts) != 2 || len(result.Errors) != 0 {
+		t.Fatalf("batch create result = %#v", result)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want one batch apply", applyCalls)
+	}
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list.Accounts) != 2 {
+		t.Fatalf("accounts after batch create = %#v", list.Accounts)
+	}
+}
+
+func TestAccountsBatchCreateEndpointReportsSkippedDuplicateAuthFiles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+	applyCalls := 0
+	h.SetAccountStoreApplyHook(func(context.Context) error {
+		applyCalls++
+		return nil
+	})
+
+	router := gin.New()
+	router.POST("/v0/management/accounts/batch-create", h.CreateAccountsBatch)
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	createBody := []byte(`{"accounts":[
+		{
+			"kind":"auth-file",
+			"title":"first.json",
+			"provider":"codex",
+			"credential":{"source_file_name":"first.json","auth_json":"{\"type\":\"codex\",\"access_token\":\"access-a\",\"id_token\":\"same-id\",\"account_id\":\"shared\",\"email\":\"first@example.test\"}","auth_type":"codex"}
+		},
+		{
+			"kind":"auth-file",
+			"title":"second.json",
+			"provider":"codex",
+			"credential":{"source_file_name":"second.json","auth_json":"{\"type\":\"codex\",\"access_token\":\"access-b\",\"id_token\":\"same-id\",\"account_id\":\"shared\",\"email\":\"second@example.test\"}","auth_type":"codex"}
+		}
+	]}`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts/batch-create", bytes.NewReader(createBody)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("batch create status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result accountBatchCreateResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal batch create: %v", err)
+	}
+	if result.Succeeded != 1 || result.SkippedCount != 1 || result.Failed != 0 {
+		t.Fatalf("batch create counts = succeeded:%d skipped:%d failed:%d body=%s", result.Succeeded, result.SkippedCount, result.Failed, recorder.Body.String())
+	}
+	if len(result.Accounts) != 1 || len(result.Skipped) != 1 || len(result.Errors) != 0 {
+		t.Fatalf("batch create result = %#v", result)
+	}
+	if result.Skipped[0].Reason != "duplicate_in_batch" || result.Skipped[0].ExistingAccountKey != result.Accounts[0].AccountKey {
+		t.Fatalf("skipped = %#v, want duplicate_in_batch pointing at created account", result.Skipped)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want one batch apply for created account", applyCalls)
+	}
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list.Accounts) != 1 {
+		t.Fatalf("accounts after batch create = %#v", list.Accounts)
+	}
+}
+
+func TestAccountsBatchPreviewEndpointReportsSkippedDuplicateAuthFilesWithoutWriting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "accounts-v1.sqlite")
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(dbPath)
+	applyCalls := 0
+	h.SetAccountStoreApplyHook(func(context.Context) error {
+		applyCalls++
+		return nil
+	})
+
+	router := gin.New()
+	router.POST("/v0/management/accounts/batch-preview", h.PreviewAccountsBatch)
+	router.GET("/v0/management/accounts", h.ListAccounts)
+
+	createBody := []byte(`{"accounts":[
+		{
+			"kind":"auth-file",
+			"title":"first.json",
+			"provider":"codex",
+			"credential":{"source_file_name":"first.json","auth_json":"{\"type\":\"codex\",\"access_token\":\"access-a\",\"id_token\":\"same-id\",\"account_id\":\"shared\",\"email\":\"first@example.test\"}","auth_type":"codex"}
+		},
+		{
+			"kind":"auth-file",
+			"title":"second.json",
+			"provider":"codex",
+			"credential":{"source_file_name":"second.json","auth_json":"{\"type\":\"codex\",\"access_token\":\"access-b\",\"id_token\":\"same-id\",\"account_id\":\"shared\",\"email\":\"second@example.test\"}","auth_type":"codex"}
+		}
+	]}`)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v0/management/accounts/batch-preview", bytes.NewReader(createBody)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("batch preview status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result accountBatchCreatePreviewResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal batch preview: %v", err)
+	}
+	if result.WouldCreate != 1 || result.SkippedCount != 1 || result.Failed != 0 {
+		t.Fatalf("batch preview counts = would_create:%d skipped:%d failed:%d body=%s", result.WouldCreate, result.SkippedCount, result.Failed, recorder.Body.String())
+	}
+	if len(result.Items) != 2 || result.Items[0].Action != "create" || result.Items[1].Action != "skip" {
+		t.Fatalf("batch preview items = %#v, want create then skip", result.Items)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Reason != "duplicate_in_batch" {
+		t.Fatalf("batch preview skipped = %#v, want duplicate_in_batch", result.Skipped)
+	}
+	if applyCalls != 0 {
+		t.Fatalf("apply calls = %d, want none for preview", applyCalls)
+	}
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/accounts", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		Accounts []accountstore.AccountRecord `json:"accounts"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(list.Accounts) != 0 {
+		t.Fatalf("accounts after batch preview = %#v, want none", list.Accounts)
+	}
+}
+
 func countAccountStoreRows(t *testing.T, db *sql.DB, table string, accountKey string) int {
 	t.Helper()
 	switch table {

@@ -42,6 +42,28 @@ type accountBatchDeleteRequest struct {
 	AccountKeys []string `json:"account_keys"`
 }
 
+type accountBatchCreateRequest struct {
+	Accounts []accountWriteRequest `json:"accounts"`
+}
+
+type accountBatchCreateResponse struct {
+	Accounts     []accountstore.AccountRecord             `json:"accounts"`
+	Skipped      []accountstore.AccountBatchCreateSkipped `json:"skipped"`
+	Errors       []accountstore.AccountBatchCreateError   `json:"errors"`
+	Succeeded    int                                      `json:"succeeded"`
+	SkippedCount int                                      `json:"skipped_count"`
+	Failed       int                                      `json:"failed"`
+}
+
+type accountBatchCreatePreviewResponse struct {
+	Items        []accountstore.AccountBatchCreatePreviewItem `json:"items"`
+	Skipped      []accountstore.AccountBatchCreateSkipped     `json:"skipped"`
+	Errors       []accountstore.AccountBatchCreateError       `json:"errors"`
+	WouldCreate  int                                          `json:"would_create"`
+	SkippedCount int                                          `json:"skipped_count"`
+	Failed       int                                          `json:"failed"`
+}
+
 type accountBatchDeleteResponse struct {
 	DeletedAccountKeys []string                                 `json:"deleted_account_keys"`
 	Errors             []accountstore.AccountBatchMutationError `json:"errors"`
@@ -96,6 +118,94 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 	}
 	account = h.applyAccountStoreRuntime(c.Request.Context(), store, account)
 	c.JSON(http.StatusOK, account)
+}
+
+func (h *Handler) CreateAccountsBatch(c *gin.Context) {
+	var body accountBatchCreateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if len(body.Accounts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "accounts is required"})
+		return
+	}
+	writes := make([]accountstore.AccountWrite, 0, len(body.Accounts))
+	for index, req := range body.Accounts {
+		write, err := decodeAccountWriteRequestBody(req)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("account %d: %v", index, err)})
+			return
+		}
+		writes = append(writes, write)
+	}
+	store, err := h.openAccountStore(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	accounts, skipped, failures, err := store.CreateAccounts(c.Request.Context(), writes)
+	if err != nil {
+		writeAccountStoreError(c, err)
+		return
+	}
+	if len(accounts) > 0 {
+		_ = h.applyPendingAccountStoreRuntime(c.Request.Context(), store)
+		accountKeys := make([]string, 0, len(accounts))
+		for _, account := range accounts {
+			accountKeys = append(accountKeys, account.AccountKey)
+		}
+		if refreshed, refreshErr := store.GetAccounts(c.Request.Context(), accountKeys); refreshErr == nil {
+			accounts = refreshed
+		}
+	}
+	c.JSON(http.StatusOK, accountBatchCreateResponse{
+		Accounts:     accounts,
+		Skipped:      skipped,
+		Errors:       failures,
+		Succeeded:    len(accounts),
+		SkippedCount: len(skipped),
+		Failed:       len(failures),
+	})
+}
+
+func (h *Handler) PreviewAccountsBatch(c *gin.Context) {
+	var body accountBatchCreateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if len(body.Accounts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "accounts is required"})
+		return
+	}
+	writes := make([]accountstore.AccountWrite, 0, len(body.Accounts))
+	for index, req := range body.Accounts {
+		write, err := decodeAccountWriteRequestBody(req)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("account %d: %v", index, err)})
+			return
+		}
+		writes = append(writes, write)
+	}
+	store, err := h.openAccountStore(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	result, err := store.PreviewCreateAccounts(c.Request.Context(), writes)
+	if err != nil {
+		writeAccountStoreError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, accountBatchCreatePreviewResponse{
+		Items:        result.Items,
+		Skipped:      result.Skipped,
+		Errors:       result.Errors,
+		WouldCreate:  result.WouldCreate,
+		SkippedCount: result.SkippedCount,
+		Failed:       result.Failed,
+	})
 }
 
 func (h *Handler) PatchAccount(c *gin.Context) {
@@ -399,6 +509,10 @@ func decodeAccountWriteRequest(c *gin.Context) (accountstore.AccountWrite, error
 	if err := c.ShouldBindJSON(&req); err != nil {
 		return accountstore.AccountWrite{}, err
 	}
+	return decodeAccountWriteRequestBody(req)
+}
+
+func decodeAccountWriteRequestBody(req accountWriteRequest) (accountstore.AccountWrite, error) {
 	write := accountstore.AccountWrite{
 		Kind:             req.Kind,
 		Title:            strings.TrimSpace(req.Title),

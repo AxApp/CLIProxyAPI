@@ -1,10 +1,12 @@
 package accountstore
 
 import (
+	"archive/zip"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -624,6 +626,358 @@ func TestUpdateAccountPreservesAccountKeyAndBumpsRevision(t *testing.T) {
 	}
 }
 
+func TestCreateAccountsCreatesMultipleAccountsInOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	accounts, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		{
+			Kind:             KindCodexAPIKey,
+			Title:            "first",
+			Provider:         "codex",
+			CredentialSource: SourceSidecarManagementAPI,
+			CodexAPIKey: &CodexAPIKeyCredential{
+				APIKey:     "sk-first",
+				BaseURL:    "https://api.example.com/v1",
+				Websockets: true,
+			},
+		},
+		{
+			Kind:             KindCodexAPIKey,
+			Title:            "second",
+			Provider:         "codex",
+			CredentialSource: SourceSidecarManagementAPI,
+			CodexAPIKey: &CodexAPIKeyCredential{
+				APIKey:     "sk-second",
+				BaseURL:    "https://api.example.com/v1",
+				Websockets: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %#v, want none", skipped)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %#v, want none", failures)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("accounts = %d, want 2: %#v", len(accounts), accounts)
+	}
+	for _, account := range accounts {
+		if !IsAccountKey(account.AccountKey) {
+			t.Fatalf("account key = %q, want acct_<uuid>", account.AccountKey)
+		}
+		if account.RuntimeApplyStatus != "pending" {
+			t.Fatalf("runtime apply status = %q, want pending", account.RuntimeApplyStatus)
+		}
+		if account.CodexAPIKey == nil || account.CodexAPIKey.BaseURL == "" {
+			t.Fatalf("credential did not round-trip: %+v", account.CodexAPIKey)
+		}
+	}
+
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("stored accounts = %d, want 2", len(list))
+	}
+}
+
+func TestCreateAccountsSkipsDuplicateAuthFileIdentityInBatch(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	accounts, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"same-id-token","account_id":"acct-shared","email":"first@example.test"}`),
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"same-id-token","account_id":"acct-shared","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts: %v", err)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %#v, want none", failures)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("created accounts = %d, want 1: %#v", len(accounts), accounts)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("skipped = %#v, want one duplicate", skipped)
+	}
+	if skipped[0].Index != 1 || skipped[0].Reason != "duplicate_in_batch" || skipped[0].ExistingAccountKey != accounts[0].AccountKey {
+		t.Fatalf("skipped[0] = %#v, want duplicate_in_batch pointing at first account", skipped[0])
+	}
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("stored accounts = %d, want 1", len(list))
+	}
+}
+
+func TestPreviewCreateAccountsDetectsDuplicateAuthFileIdentityWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	preview, err := store.PreviewCreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"same-id-token","account_id":"acct-shared","email":"first@example.test"}`),
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"same-id-token","account_id":"acct-shared","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("PreviewCreateAccounts: %v", err)
+	}
+	if preview.WouldCreate != 1 || preview.SkippedCount != 1 || preview.Failed != 0 {
+		t.Fatalf("preview counts = create:%d skipped:%d failed:%d, want 1/1/0", preview.WouldCreate, preview.SkippedCount, preview.Failed)
+	}
+	if len(preview.Skipped) != 1 || preview.Skipped[0].Reason != "duplicate_in_batch" {
+		t.Fatalf("preview skipped = %#v, want duplicate_in_batch", preview.Skipped)
+	}
+	if len(preview.Items) != 2 || preview.Items[0].Action != "create" || preview.Items[1].Action != "skip" {
+		t.Fatalf("preview items = %#v, want create then skip", preview.Items)
+	}
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("preview wrote %d accounts, want 0", len(list))
+	}
+}
+
+func TestCreateAccountsSkipsExistingAuthFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	first, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"same-existing-id","account_id":"acct-existing","email":"first@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts first: %v", err)
+	}
+	if len(first) != 1 || len(skipped) != 0 || len(failures) != 0 {
+		t.Fatalf("first create = accounts=%#v skipped=%#v failures=%#v", first, skipped, failures)
+	}
+
+	second, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"same-existing-id","account_id":"acct-existing","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts second: %v", err)
+	}
+	if len(second) != 0 {
+		t.Fatalf("second created accounts = %#v, want none", second)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %#v, want none", failures)
+	}
+	if len(skipped) != 1 || skipped[0].Reason != "existing_account" || skipped[0].ExistingAccountKey != first[0].AccountKey {
+		t.Fatalf("skipped = %#v, want existing_account pointing at first account", skipped)
+	}
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("stored accounts = %d, want 1", len(list))
+	}
+}
+
+func TestPreviewCreateAccountsSkipsExistingAuthFileIdentityWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	first, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"same-existing-id","account_id":"acct-existing","email":"first@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts first: %v", err)
+	}
+	if len(first) != 1 || len(skipped) != 0 || len(failures) != 0 {
+		t.Fatalf("first create = accounts=%#v skipped=%#v failures=%#v", first, skipped, failures)
+	}
+
+	preview, err := store.PreviewCreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"same-existing-id","account_id":"acct-existing","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("PreviewCreateAccounts: %v", err)
+	}
+	if preview.WouldCreate != 0 || preview.SkippedCount != 1 || preview.Failed != 0 {
+		t.Fatalf("preview counts = create:%d skipped:%d failed:%d, want 0/1/0", preview.WouldCreate, preview.SkippedCount, preview.Failed)
+	}
+	if len(preview.Skipped) != 1 || preview.Skipped[0].Reason != "existing_account" || preview.Skipped[0].ExistingAccountKey != first[0].AccountKey {
+		t.Fatalf("preview skipped = %#v, want existing_account pointing at first account", preview.Skipped)
+	}
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("preview changed stored accounts to %d, want 1", len(list))
+	}
+}
+
+func TestCreateAccountsDoesNotDeduplicateByAccountIDOnly(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	accounts, skipped, failures, err := store.CreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"id-a","account_id":"acct-shared-k12","email":"first@example.test"}`),
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"id-b","account_id":"acct-shared-k12","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateAccounts: %v", err)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %#v, want none", failures)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %#v, want none", skipped)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("created accounts = %d, want 2: %#v", len(accounts), accounts)
+	}
+}
+
+func TestPreviewCreateAccountsDoesNotDeduplicateByAccountIDOnly(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	preview, err := store.PreviewCreateAccounts(ctx, []AccountWrite{
+		authFileAccountWrite("first.json", `{"type":"codex","access_token":"access-a","id_token":"id-a","account_id":"acct-shared-k12","email":"first@example.test"}`),
+		authFileAccountWrite("second.json", `{"type":"codex","access_token":"access-b","id_token":"id-b","account_id":"acct-shared-k12","email":"second@example.test"}`),
+	})
+	if err != nil {
+		t.Fatalf("PreviewCreateAccounts: %v", err)
+	}
+	if preview.WouldCreate != 2 || preview.SkippedCount != 0 || preview.Failed != 0 {
+		t.Fatalf("preview counts = create:%d skipped:%d failed:%d, want 2/0/0", preview.WouldCreate, preview.SkippedCount, preview.Failed)
+	}
+	list, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("preview wrote %d accounts, want 0", len(list))
+	}
+}
+
+func TestCreateAccountsSkipsRepeatedAuthFileZipWhenEnabled(t *testing.T) {
+	zipPath := strings.TrimSpace(os.Getenv("GETTOKENS_IMPORT_DEDUPE_ZIP"))
+	if zipPath == "" {
+		t.Skip("set GETTOKENS_IMPORT_DEDUPE_ZIP to run real auth-file import dedupe smoke")
+	}
+	writes := authFileAccountWritesFromZip(t, zipPath)
+	if len(writes) == 0 {
+		t.Fatalf("zip %s did not contain json auth files", zipPath)
+	}
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	first, skipped, failures, err := store.CreateAccounts(ctx, writes)
+	if err != nil {
+		t.Fatalf("CreateAccounts first: %v", err)
+	}
+	if len(failures) != 0 || len(skipped) != 0 || len(first) != len(writes) {
+		t.Fatalf("first import counts: created=%d skipped=%d failed=%d want created=%d", len(first), len(skipped), len(failures), len(writes))
+	}
+
+	preview, err := store.PreviewCreateAccounts(ctx, writes)
+	if err != nil {
+		t.Fatalf("PreviewCreateAccounts after first import: %v", err)
+	}
+	if preview.WouldCreate != 0 || preview.SkippedCount != len(writes) || preview.Failed != 0 {
+		t.Fatalf("preview repeated import counts: would_create=%d skipped=%d failed=%d want skipped=%d", preview.WouldCreate, preview.SkippedCount, preview.Failed, len(writes))
+	}
+	for _, item := range preview.Skipped {
+		if item.Reason != "existing_account" {
+			t.Fatalf("preview skip reason = %q, want existing_account", item.Reason)
+		}
+	}
+
+	second, skipped, failures, err := store.CreateAccounts(ctx, writes)
+	if err != nil {
+		t.Fatalf("CreateAccounts second: %v", err)
+	}
+	if len(failures) != 0 || len(second) != 0 || len(skipped) != len(writes) {
+		t.Fatalf("second import counts: created=%d skipped=%d failed=%d want skipped=%d", len(second), len(skipped), len(failures), len(writes))
+	}
+	for _, item := range skipped {
+		if item.Reason != "existing_account" {
+			t.Fatalf("skip reason = %q, want existing_account", item.Reason)
+		}
+	}
+}
+
 func TestGetAccountUsesSingleAccountQueryInsteadOfFullList(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
@@ -1222,6 +1576,47 @@ func countAccountCardRows(t *testing.T, store *Store, accountKey string) int {
 		t.Fatalf("count account_cards for %s: %v", accountKey, err)
 	}
 	return count
+}
+
+func authFileAccountWrite(name string, authJSON string) AccountWrite {
+	return AccountWrite{
+		Kind:             KindAuthFile,
+		Title:            name,
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		AuthFile: &AuthFileCredential{
+			SourceFileName: name,
+			AuthJSON:       authJSON,
+			AuthType:       "codex",
+			SizeBytes:      int64(len(authJSON)),
+		},
+	}
+}
+
+func authFileAccountWritesFromZip(t *testing.T, zipPath string) []AccountWrite {
+	t.Helper()
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer reader.Close()
+	writes := make([]AccountWrite, 0, len(reader.File))
+	for _, entry := range reader.File {
+		if entry.FileInfo().IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name), ".json") {
+			continue
+		}
+		rc, err := entry.Open()
+		if err != nil {
+			t.Fatalf("open zip entry %s: %v", entry.Name, err)
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatalf("read zip entry %s: %v", entry.Name, err)
+		}
+		writes = append(writes, authFileAccountWrite(filepath.Base(entry.Name), string(data)))
+	}
+	return writes
 }
 
 func countCodexAPIKeyRows(t *testing.T, store *Store, accountKey string) int {

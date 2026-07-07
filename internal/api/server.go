@@ -760,6 +760,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/accounts", s.mgmt.ListAccounts)
 		mgmt.GET("/accounts/:account_key", s.mgmt.GetAccount)
 		mgmt.POST("/accounts", s.mgmt.CreateAccount)
+		mgmt.POST("/accounts/batch-preview", s.mgmt.PreviewAccountsBatch)
+		mgmt.POST("/accounts/batch-create", s.mgmt.CreateAccountsBatch)
 		mgmt.PATCH("/accounts/:account_key", s.mgmt.PatchAccount)
 		mgmt.DELETE("/accounts/:account_key", s.mgmt.DeleteAccount)
 		mgmt.POST("/accounts/batch-delete", s.mgmt.DeleteAccountsBatch)
