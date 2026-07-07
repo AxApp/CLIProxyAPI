@@ -520,12 +520,20 @@ func (e *RateLimitEvaluator) admitRequestWindow(ctx context.Context, auth *corea
 }
 
 func (e *RateLimitEvaluator) createRequestWindowReservations(ctx context.Context, accountKey string, requestID string, now time.Time) ([]string, string, error) {
+	rules, err := e.store.listEnabledRequestWindowBlockRulesForAccount(accountKey)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(rules) == 0 {
+		return nil, "", nil
+	}
+
 	e.reservationMu.Lock()
 	defer e.reservationMu.Unlock()
 	if err := e.store.expireReservations(ctx, now); err != nil {
 		return nil, "", err
 	}
-	rules, err := e.store.listEnabledRequestWindowBlockRulesForAccount(accountKey)
+	rules, err = e.store.listEnabledRequestWindowBlockRulesForAccount(accountKey)
 	if err != nil {
 		return nil, "", err
 	}

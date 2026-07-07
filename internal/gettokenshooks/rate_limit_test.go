@@ -2,6 +2,7 @@ package gettokenshooks
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -138,6 +139,73 @@ func TestRateLimitAdmissionReservationDeniesConcurrentRequestWindow(t *testing.T
 		t.Fatalf("recovered admission = %#v, want allow after reservation release", recovered)
 	}
 	recovered.Lease.Release(context.Background())
+}
+
+func TestRateLimitAdmissionNoopsWithoutRequestWindowRulesBeforeReservationWrite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite")
+	store, err := newRateLimitStore(dbPath)
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	if err := store.upsertRule(RateLimitRule{
+		ID:         "rule-token-only",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyTokenWindow,
+		Window:     "24h",
+		LimitValue: 1000,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now); err != nil {
+		t.Fatalf("upsert token rule: %v", err)
+	}
+
+	lockDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open lock db: %v", err)
+	}
+	defer lockDB.Close()
+	lockConn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("lock conn: %v", err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	evaluator := NewRateLimitEvaluator(store, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return now.Add(30 * time.Minute) },
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	decision := evaluator.admitRequestWindow(ctx, &coreauth.Auth{
+		ID:         "auth-a",
+		AccountKey: accountKey,
+		Provider:   "codex",
+	})
+	if decision.Active {
+		t.Fatalf("admission = %#v, want no-op when no request-window rules exist", decision)
+	}
+
+	if _, err := lockConn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatalf("rollback lock transaction: %v", err)
+	}
+	locked = false
+	var reservations int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM rate_limit_reservations`).Scan(&reservations); err != nil {
+		t.Fatalf("count reservations: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("reservations = %d, want 0 for token-window-only admission", reservations)
+	}
 }
 
 func TestRateLimitAdmissionReservationCleanupExpiresOrphan(t *testing.T) {
