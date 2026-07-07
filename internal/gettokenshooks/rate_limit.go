@@ -631,7 +631,7 @@ func ensureParentDir(path string) error {
 }
 
 func (s *rateLimitStore) insertUsageAttributionEvent(event usageAttributionEvent) error {
-	return (&usageAttributionStore{db: s.db}).insert(event)
+	return (&usageAttributionStore{db: s.db, disablePrune: true}).insert(event)
 }
 
 func (s *rateLimitStore) upsertRule(rule RateLimitRule, now time.Time) error {

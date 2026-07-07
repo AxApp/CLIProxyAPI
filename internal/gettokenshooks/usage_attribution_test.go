@@ -222,6 +222,51 @@ func TestUsageAttributionStoreSummaryAggregatesBuckets(t *testing.T) {
 	}
 }
 
+func TestUsageAttributionStorePrunesEventsOlderThanRetention(t *testing.T) {
+	store, err := newUsageAttributionStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	oldEvent := usageAttributionEvent{
+		ID:                "event-old-retention",
+		CompletedAtUnixMs: now.Add(-45 * 24 * time.Hour).UnixMilli(),
+		AttributionKey:    "auth-id:codex:apikey:retention",
+		AttributionKind:   "auth_id",
+		AccountKey:        "codex-api-key:retention-001",
+		Provider:          "codex",
+		RequestedModel:    "gpt-5.4",
+		LatencyMs:         120,
+		InputTokens:       40,
+		OutputTokens:      10,
+		TotalTokens:       50,
+		EvidenceKind:      "auth_id",
+	}
+	recentEvent := oldEvent
+	recentEvent.ID = "event-recent-retention"
+	recentEvent.CompletedAtUnixMs = now.UnixMilli()
+	recentEvent.TotalTokens = 7
+
+	if err := store.insert(oldEvent); err != nil {
+		t.Fatalf("insert old event: %v", err)
+	}
+	if err := store.insert(recentEvent); err != nil {
+		t.Fatalf("insert recent event: %v", err)
+	}
+
+	summary, err := store.summary(60*24*time.Hour, time.Hour, false)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if len(summary.Items) != 1 {
+		t.Fatalf("items = %d, want only retained account: %#v", len(summary.Items), summary.Items)
+	}
+	item := summary.Items[0]
+	if item.RequestCount != 1 || item.TotalTokens != 7 {
+		t.Fatalf("retained usage = requests:%d tokens:%d, want 1/7", item.RequestCount, item.TotalTokens)
+	}
+}
+
 func TestUsageAttributionStoreSummarySupportsAllWindow(t *testing.T) {
 	store, err := newUsageAttributionStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {
@@ -230,7 +275,7 @@ func TestUsageAttributionStoreSummarySupportsAllWindow(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	oldEvent := usageAttributionEvent{
 		ID:                "event-old",
-		CompletedAtUnixMs: now.Add(-90 * 24 * time.Hour).UnixMilli(),
+		CompletedAtUnixMs: now.Add(-5 * 24 * time.Hour).UnixMilli(),
 		AttributionKey:    "auth-id:codex:apikey:old",
 		AttributionKind:   "auth_id",
 		AccountKey:        "codex-api-key:old-001",

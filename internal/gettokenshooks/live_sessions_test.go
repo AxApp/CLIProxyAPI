@@ -596,6 +596,55 @@ func TestLiveSessionsHistoryPersistsTrimmedRequests(t *testing.T) {
 	}
 }
 
+func TestLiveSessionsHistoryPrunesRequestsOlderThanRetention(t *testing.T) {
+	store, err := newLiveSessionHistoryStore(filepath.Join(t.TempDir(), "live-sessions-v1.sqlite"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	now := time.Now().UTC()
+	oldAt := now.Add(-20 * 24 * time.Hour)
+	recentAt := now.Add(-1 * time.Hour)
+	session := LiveSession{
+		SessionID:   "conv-retention",
+		StartedAt:   formatLiveTime(now.Add(-2 * time.Hour)),
+		LastEventAt: formatLiveTime(recentAt),
+	}
+	oldRequest := LiveRequest{
+		RequestID:   "req-old",
+		SessionID:   session.SessionID,
+		Sequence:    1,
+		Status:      "completed",
+		StartedAt:   formatLiveTime(oldAt),
+		CompletedAt: formatLiveTime(oldAt.Add(time.Second)),
+	}
+	recentRequest := LiveRequest{
+		RequestID:   "req-recent",
+		SessionID:   session.SessionID,
+		Sequence:    2,
+		Status:      "completed",
+		StartedAt:   formatLiveTime(recentAt),
+		CompletedAt: formatLiveTime(recentAt.Add(time.Second)),
+	}
+
+	if err := store.upsert(session, oldRequest); err != nil {
+		t.Fatalf("insert old request: %v", err)
+	}
+	if err := store.upsert(session, recentRequest); err != nil {
+		t.Fatalf("insert recent request: %v", err)
+	}
+
+	history, err := store.history(30*24*time.Hour, 10, 0, session.SessionID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history.Items) != 1 {
+		t.Fatalf("history items = %d, want only retained request: %#v", len(history.Items), history.Items)
+	}
+	if history.Items[0].RequestID != "req-recent" {
+		t.Fatalf("retained request = %q, want req-recent", history.Items[0].RequestID)
+	}
+}
+
 func TestLiveSessionsTimingSummaryAveragesRetainedRequests(t *testing.T) {
 	now := time.Date(2026, 5, 27, 15, 30, 0, 0, time.UTC)
 	requests := []LiveRequest{

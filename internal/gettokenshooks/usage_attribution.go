@@ -68,6 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_usage_attribution_auth_index_time
 
 	defaultUsageAttributionWindow = 24 * time.Hour
 	defaultUsageAttributionBucket = time.Hour
+	usageAttributionRetention     = 30 * 24 * time.Hour
+	usageAttributionPruneInterval = 5 * time.Minute
 )
 
 type UsageAttributionOptions struct {
@@ -180,7 +182,10 @@ type UsageAttributionBucket struct {
 }
 
 type usageAttributionStore struct {
-	db *sql.DB
+	db           *sql.DB
+	pruneMu      sync.Mutex
+	lastPrunedAt time.Time
+	disablePrune bool
 }
 
 var (
@@ -237,7 +242,12 @@ func newUsageAttributionStore(path string) (*usageAttributionStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &usageAttributionStore{db: db}, nil
+	store := &usageAttributionStore{db: db}
+	if err := store.pruneExpired(time.Now().UTC(), true); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
 func (s *usageAttributionStore) insert(event usageAttributionEvent) error {
@@ -281,7 +291,36 @@ func (s *usageAttributionStore) insert(event usageAttributionEvent) error {
 		event.EvidenceKind,
 		event.EvidenceRef,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if s.disablePrune {
+		return nil
+	}
+	return s.pruneExpired(time.Now().UTC(), false)
+}
+
+func (s *usageAttributionStore) pruneExpired(now time.Time, force bool) error {
+	if s == nil || s.db == nil || usageAttributionRetention <= 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	s.pruneMu.Lock()
+	defer s.pruneMu.Unlock()
+	if !force && !s.lastPrunedAt.IsZero() && now.Sub(s.lastPrunedAt) < usageAttributionPruneInterval {
+		return nil
+	}
+	cutoff := now.Add(-usageAttributionRetention).UnixMilli()
+	if _, err := s.db.Exec(`DELETE FROM usage_attribution_events WHERE completed_at_unix_ms < ?`, cutoff); err != nil {
+		return err
+	}
+	if !force {
+		s.lastPrunedAt = now
+	}
+	return nil
 }
 
 func (s *usageAttributionStore) summary(window, bucket time.Duration, includeUnresolved bool) (UsageAttributionSummaryResponse, error) {

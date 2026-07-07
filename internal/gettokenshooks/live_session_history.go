@@ -37,6 +37,11 @@ CREATE INDEX IF NOT EXISTS idx_live_session_requests_session_time
 CREATE INDEX IF NOT EXISTS idx_live_session_requests_time
   ON live_session_requests(last_event_unix_ms);`
 
+const (
+	liveSessionHistoryRetention     = 14 * 24 * time.Hour
+	liveSessionHistoryPruneInterval = 5 * time.Minute
+)
+
 type LiveSessionHistoryOptions struct {
 	ConfigFilePath string
 	WritableBase   string
@@ -51,7 +56,9 @@ type LiveSessionHistoryResponse struct {
 }
 
 type liveSessionHistoryStore struct {
-	db *sql.DB
+	db           *sql.DB
+	pruneMu      sync.Mutex
+	lastPrunedAt time.Time
 }
 
 var (
@@ -106,7 +113,12 @@ func newLiveSessionHistoryStore(path string) (*liveSessionHistoryStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &liveSessionHistoryStore{db: db}, nil
+	store := &liveSessionHistoryStore{db: db}
+	if err := store.pruneExpired(time.Now().UTC(), true); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
 func currentLiveSessionHistoryStore() *liveSessionHistoryStore {
@@ -187,7 +199,33 @@ func (s *liveSessionHistoryStore) upsert(session LiveSession, request LiveReques
 		request.UpstreamTransport,
 		string(payload),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.pruneExpired(time.Now().UTC(), false)
+}
+
+func (s *liveSessionHistoryStore) pruneExpired(now time.Time, force bool) error {
+	if s == nil || s.db == nil || liveSessionHistoryRetention <= 0 {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	s.pruneMu.Lock()
+	defer s.pruneMu.Unlock()
+	if !force && !s.lastPrunedAt.IsZero() && now.Sub(s.lastPrunedAt) < liveSessionHistoryPruneInterval {
+		return nil
+	}
+	cutoff := now.Add(-liveSessionHistoryRetention).UnixMilli()
+	if _, err := s.db.Exec(`DELETE FROM live_session_requests WHERE last_event_unix_ms < ?`, cutoff); err != nil {
+		return err
+	}
+	if !force {
+		s.lastPrunedAt = now
+	}
+	return nil
 }
 
 func (s *liveSessionHistoryStore) history(window time.Duration, limit int, offset int, sessionID string) (LiveSessionHistoryResponse, error) {
