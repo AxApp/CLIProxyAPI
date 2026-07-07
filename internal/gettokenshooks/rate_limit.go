@@ -36,8 +36,9 @@ const (
 	RateLimitActionBlock = "block"
 	RateLimitActionWarn  = "warn"
 
-	defaultRateLimitEvaluationInterval = 30 * time.Second
-	defaultRateLimitReservationTTL     = 30 * time.Minute
+	defaultRateLimitEvaluationInterval  = 30 * time.Second
+	defaultRateLimitReservationTTL      = 30 * time.Minute
+	postUsageRateLimitCompletionTimeout = 5 * time.Second
 
 	rateLimitReservationStatusPending   = "pending"
 	rateLimitReservationStatusCommitted = "committed"
@@ -412,13 +413,14 @@ func completeRateLimitAfterUsage(ctx context.Context, event usageAttributionEven
 	if evaluator == nil {
 		return nil
 	}
-	if err := evaluator.releaseReservationsForUsage(context.Background(), event); err != nil {
+	// Usage hooks run after the client request has completed, so the request context
+	// may already be canceled while local reservation cleanup still needs to finish.
+	postUsageCtx, cancel := context.WithTimeout(context.Background(), postUsageRateLimitCompletionTimeout)
+	defer cancel()
+	if err := evaluator.releaseReservationsForUsage(postUsageCtx, event); err != nil {
 		return err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return evaluator.EvaluateAccountNow(ctx, accountKey)
+	return evaluator.EvaluateAccountNow(postUsageCtx, accountKey)
 }
 
 func rateLimitAdmissionPolicy(evaluator *RateLimitEvaluator) gettokensrouting.AdmissionPolicy {

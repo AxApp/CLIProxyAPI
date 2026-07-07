@@ -161,6 +161,76 @@ func TestUsageAttributionPluginRefreshesRateLimitGuardAfterPersist(t *testing.T)
 	}
 }
 
+func TestUsageAttributionPluginRefreshesRateLimitGuardWithCanceledRequestContext(t *testing.T) {
+	ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit)
+	t.Cleanup(func() { ClearAccountRouteGuardSource(AccountRouteGuardSourceRateLimit) })
+
+	dbPath := filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite")
+	rateStore, err := newRateLimitStore(dbPath)
+	if err != nil {
+		t.Fatalf("new rate limit store: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	accountKey := "acct_00000000-0000-4000-8000-000000000004"
+	authID := "codex:apikey:canceled-context"
+	if err := rateStore.upsertRule(RateLimitRule{
+		ID:         "canceled-context-token-rule",
+		AccountKey: accountKey,
+		Strategy:   RateLimitStrategyTokenWindow,
+		Window:     "1h",
+		LimitValue: 100,
+		Action:     RateLimitActionBlock,
+		Enabled:    true,
+	}, now); err != nil {
+		t.Fatalf("upsert token rule: %v", err)
+	}
+	evaluator := NewRateLimitEvaluator(rateStore, RateLimitEvaluatorOptions{
+		Now: func() time.Time { return now.Add(5 * time.Minute) },
+	})
+
+	rateLimitMu.Lock()
+	previousStore := defaultRateLimitStore
+	previousEval := defaultRateLimitEval
+	defaultRateLimitStore = rateStore
+	defaultRateLimitEval = evaluator
+	rateLimitMu.Unlock()
+	t.Cleanup(func() {
+		rateLimitMu.Lock()
+		defaultRateLimitStore = previousStore
+		defaultRateLimitEval = previousEval
+		rateLimitMu.Unlock()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	plugin := usageAttributionPlugin{store: &usageAttributionStore{db: rateStore.db}}
+	plugin.HandleUsage(ctx, coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		AuthID:      authID,
+		AccountKey:  accountKey,
+		AuthType:    "api-key",
+		RequestedAt: now.Add(time.Minute),
+		Latency:     time.Second,
+		Detail: coreusage.Detail{
+			TotalTokens: 100,
+		},
+	})
+
+	state, ok := evaluator.StateForAccount(accountKey)
+	if !ok || !state.Blocked {
+		t.Fatalf("rate limit state = %#v, exists=%v, want post-usage refresh despite canceled request context", state, ok)
+	}
+	if got := DefaultAccountRouteGuardStore().DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         authID,
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != authID {
+		t.Fatalf("route guard deny ids = %#v, want immediate rate-limit deny after canceled-context usage", got)
+	}
+}
+
 func TestUsageAttributionStoreSummaryAggregatesBuckets(t *testing.T) {
 	store, err := newUsageAttributionStore(filepath.Join(t.TempDir(), "usage-attribution-v1.sqlite"))
 	if err != nil {
