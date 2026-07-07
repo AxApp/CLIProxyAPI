@@ -15,7 +15,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 )
 
-const quotaRefreshBenchmarkAccountCount = 1652
+const (
+	quotaRefreshBenchmarkAccountCount      = 1652
+	quotaRefreshScaleBenchmarkAccountCount = 4000
+)
 
 func BenchmarkQuotaRefreshBatch1652Accounts(b *testing.B) {
 	gin.SetMode(gin.TestMode)
@@ -36,11 +39,34 @@ func BenchmarkQuotaRefreshBatch1652Accounts(b *testing.B) {
 	}
 }
 
+func BenchmarkQuotaRefreshBatch4000Accounts(b *testing.B) {
+	gin.SetMode(gin.TestMode)
+	h, keys := setupQuotaRefreshBenchmarkStore(b, quotaRefreshScaleBenchmarkAccountCount)
+	router := gin.New()
+	router.POST("/v0/management/gettokens/quota-refresh-batch", h.RefreshAccountQuotaBatch)
+	body := mustQuotaRefreshBatchBody(b, keys)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-refresh-batch", bytes.NewReader(body))
+		router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			b.Fatalf("batch refresh status = %d body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
 func BenchmarkQuotaRefreshBatchTargetAccounts(b *testing.B) {
-	for _, targetCount := range []int{1, 10, 100, quotaRefreshBenchmarkAccountCount} {
-		b.Run(fmt.Sprintf("targets_%d_total_%d", targetCount, quotaRefreshBenchmarkAccountCount), func(b *testing.B) {
+	for _, targetCount := range []int{1, 10, 100, quotaRefreshBenchmarkAccountCount, quotaRefreshScaleBenchmarkAccountCount} {
+		totalCount := quotaRefreshBenchmarkAccountCount
+		if targetCount > quotaRefreshBenchmarkAccountCount {
+			totalCount = quotaRefreshScaleBenchmarkAccountCount
+		}
+		b.Run(fmt.Sprintf("targets_%d_total_%d", targetCount, totalCount), func(b *testing.B) {
 			gin.SetMode(gin.TestMode)
-			h, keys := setupQuotaRefreshBenchmarkStore(b, quotaRefreshBenchmarkAccountCount)
+			h, keys := setupQuotaRefreshBenchmarkStore(b, totalCount)
 			router := gin.New()
 			router.POST("/v0/management/gettokens/quota-refresh-batch", h.RefreshAccountQuotaBatch)
 			body := mustQuotaRefreshBatchBody(b, keys[:targetCount])

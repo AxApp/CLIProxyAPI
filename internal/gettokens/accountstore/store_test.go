@@ -1029,6 +1029,58 @@ func TestGetAccountUsesSingleAccountQueryInsteadOfFullList(t *testing.T) {
 	}
 }
 
+func TestAccountExistsUsesLightweightActiveCardQuery(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	account, err := store.CreateAccount(ctx, AccountWrite{
+		Kind:             KindCodexAPIKey,
+		Title:            "Target",
+		Provider:         "codex",
+		CredentialSource: SourceSidecarManagementAPI,
+		CodexAPIKey: &CodexAPIKeyCredential{
+			APIKey:  "sk-target",
+			BaseURL: "https://api.example.com/v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	exists, err := store.AccountExists(ctx, account.AccountKey)
+	if err != nil {
+		t.Fatalf("AccountExists active: %v", err)
+	}
+	if !exists {
+		t.Fatal("AccountExists active = false, want true")
+	}
+	missing, err := store.AccountExists(ctx, "acct_00000000-0000-0000-0000-000000000001")
+	if err != nil {
+		t.Fatalf("AccountExists missing: %v", err)
+	}
+	if missing {
+		t.Fatal("AccountExists missing = true, want false")
+	}
+	if err := store.DeleteAccount(ctx, account.AccountKey); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+	deleted, err := store.AccountExists(ctx, account.AccountKey)
+	if err != nil {
+		t.Fatalf("AccountExists deleted: %v", err)
+	}
+	if deleted {
+		t.Fatal("AccountExists deleted = true, want false")
+	}
+}
+
 func TestGetAccountsUsesKeyScopedQueryWithMissingDuplicatesAndBrokenSibling(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")

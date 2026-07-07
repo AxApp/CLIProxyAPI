@@ -91,8 +91,9 @@ type DecisionStep struct {
 }
 
 type RouteResult struct {
-	Candidates []RouteCandidate
-	Trace      []DecisionStep
+	Candidates     []RouteCandidate
+	CandidateCount int
+	Trace          []DecisionStep
 }
 
 type Engine struct {

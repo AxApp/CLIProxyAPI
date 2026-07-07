@@ -513,6 +513,27 @@ WHERE c.account_key = ? AND c.deleted_at_unix_ms IS NULL`, accountKey).Scan(
 	return account, nil
 }
 
+func (s *Store) AccountExists(ctx context.Context, accountKey string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("account store is not open")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !IsAccountKey(accountKey) {
+		return false, fmt.Errorf("invalid account key %q", accountKey)
+	}
+	var exists int
+	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM account_cards WHERE account_key = ? AND deleted_at_unix_ms IS NULL LIMIT 1", accountKey).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("query account existence %s: %w", accountKey, err)
+	}
+	return exists == 1, nil
+}
+
 func (s *Store) GetAccounts(ctx context.Context, accountKeys []string) ([]AccountRecord, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("account store is not open")

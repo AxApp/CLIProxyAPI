@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,7 @@ const (
 	quotaRefreshBatchJobStatusSucceeded = "succeeded"
 	quotaRefreshBatchJobStatusFailed    = "failed"
 	quotaRefreshBatchJobStatusCanceled  = "canceled"
+	quotaRefreshBatchJobHistoryLimit    = 20
 )
 
 type quotaRefreshBatchJob struct {
@@ -197,10 +199,36 @@ func (s *quotaRefreshBatchJobStore) markRunning(jobID string, now time.Time) (qu
 		return cloneQuotaRefreshBatchJob(job), false
 	}
 	job.Status = quotaRefreshBatchJobStatusRunning
-	job.Pending = 0
-	job.Running = job.Total
+	job.Running = quotaRefreshBatchJobRunningCount(job, 0)
+	job.Pending = quotaRefreshBatchJobPendingCount(job, 0)
 	job.UpdatedAt = now
 	return cloneQuotaRefreshBatchJob(job), true
+}
+
+func (s *quotaRefreshBatchJobStore) recordResult(jobID string, result quotaRefreshBatchWorkResult, now time.Time) (quotaRefreshBatchJobResponse, bool) {
+	if s == nil {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok || isQuotaRefreshBatchJobTerminal(job.Status) {
+		return quotaRefreshBatchJobResponse{}, false
+	}
+	if result.ok {
+		job.Items = append(job.Items, result.state)
+	} else {
+		job.Errors = append(job.Errors, result.err)
+	}
+	completed := len(job.Items) + len(job.Errors)
+	job.Running = quotaRefreshBatchJobRunningCount(job, completed)
+	job.Pending = quotaRefreshBatchJobPendingCount(job, completed)
+	job.UpdatedAt = now
+	return quotaRefreshBatchJobSnapshot(job), true
 }
 
 func (s *quotaRefreshBatchJobStore) complete(jobID string, items []gettokenshooks.QuotaRuntimeState, errors []quotaRefreshBatchError, now time.Time) (quotaRefreshBatchJobResponse, bool) {
@@ -234,7 +262,9 @@ func (s *quotaRefreshBatchJobStore) complete(jobID string, items []gettokenshook
 	if job.Cancel != nil {
 		job.Cancel()
 	}
-	return quotaRefreshBatchJobSnapshot(job), true
+	snapshot := quotaRefreshBatchJobSnapshot(job)
+	s.pruneTerminalJobsLocked()
+	return snapshot, true
 }
 
 func (s *quotaRefreshBatchJobStore) cancelForAccountKeys(accountKeys []string, reason string, now time.Time) int {
@@ -266,6 +296,7 @@ func (s *quotaRefreshBatchJobStore) cancelForAccountKeys(accountKeys []string, r
 		cancelQuotaRefreshBatchJobLocked(job, reason, now, keySet)
 		canceled++
 	}
+	s.pruneTerminalJobsLocked()
 	return canceled
 }
 
@@ -287,6 +318,7 @@ func (s *quotaRefreshBatchJobStore) cancelAll(reason string, now time.Time) int 
 		cancelQuotaRefreshBatchJobLocked(job, reason, now, nil)
 		canceled++
 	}
+	s.pruneTerminalJobsLocked()
 	return canceled
 }
 
@@ -320,6 +352,74 @@ func isQuotaRefreshBatchJobTerminal(status string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func quotaRefreshBatchJobRunningCount(job *quotaRefreshBatchJob, completed int) int {
+	if job == nil {
+		return 0
+	}
+	remaining := job.Total - completed
+	if remaining <= 0 {
+		return 0
+	}
+	return normalizeQuotaRefreshBatchConcurrency(job.Concurrency, remaining)
+}
+
+func quotaRefreshBatchJobPendingCount(job *quotaRefreshBatchJob, completed int) int {
+	if job == nil {
+		return 0
+	}
+	remaining := job.Total - completed
+	if remaining <= 0 {
+		return 0
+	}
+	pending := remaining - quotaRefreshBatchJobRunningCount(job, completed)
+	if pending < 0 {
+		return 0
+	}
+	return pending
+}
+
+func (s *quotaRefreshBatchJobStore) pruneTerminalJobsLocked() {
+	if s == nil || len(s.jobs) <= quotaRefreshBatchJobHistoryLimit {
+		return
+	}
+	type terminalJob struct {
+		jobID       string
+		completedAt time.Time
+		createdAt   time.Time
+	}
+	terminal := make([]terminalJob, 0, len(s.jobs))
+	for jobID, job := range s.jobs {
+		if job == nil || !isQuotaRefreshBatchJobTerminal(job.Status) {
+			continue
+		}
+		terminal = append(terminal, terminalJob{
+			jobID:       jobID,
+			completedAt: job.CompletedAt,
+			createdAt:   job.CreatedAt,
+		})
+	}
+	if len(terminal) <= quotaRefreshBatchJobHistoryLimit {
+		return
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		left := terminal[i]
+		right := terminal[j]
+		if left.completedAt.Equal(right.completedAt) {
+			return left.createdAt.Before(right.createdAt)
+		}
+		if left.completedAt.IsZero() {
+			return true
+		}
+		if right.completedAt.IsZero() {
+			return false
+		}
+		return left.completedAt.Before(right.completedAt)
+	})
+	for _, item := range terminal[:len(terminal)-quotaRefreshBatchJobHistoryLimit] {
+		delete(s.jobs, item.jobID)
 	}
 }
 
@@ -543,7 +643,9 @@ func (h *Handler) runAccountQuotaBatchRefreshJob(jobID string) {
 		h.quotaRefreshBatchJobStore().complete(jobID, []gettokenshooks.QuotaRuntimeState{}, []quotaRefreshBatchError{{Error: err.Error()}}, time.Now().UTC())
 		return
 	}
-	items, errors := h.refreshAccountQuotaBatch(jobCtx, targets, job.IncludeBilling, job.Concurrency)
+	items, errors := h.refreshAccountQuotaBatchWithProgress(jobCtx, targets, job.IncludeBilling, job.Concurrency, func(result quotaRefreshBatchWorkResult) {
+		h.quotaRefreshBatchJobStore().recordResult(jobID, result, time.Now().UTC())
+	})
 	errors = append(missing, errors...)
 	h.quotaRefreshBatchJobStore().complete(jobID, items, errors, time.Now().UTC())
 }
@@ -637,6 +739,10 @@ func (h *Handler) resolveQuotaRefreshBatchTargets(ctx context.Context, accountKe
 }
 
 func (h *Handler) refreshAccountQuotaBatch(ctx context.Context, accounts []accountstore.AccountRecord, includeBilling bool, concurrency int) ([]gettokenshooks.QuotaRuntimeState, []quotaRefreshBatchError) {
+	return h.refreshAccountQuotaBatchWithProgress(ctx, accounts, includeBilling, concurrency, nil)
+}
+
+func (h *Handler) refreshAccountQuotaBatchWithProgress(ctx context.Context, accounts []accountstore.AccountRecord, includeBilling bool, concurrency int, progress func(quotaRefreshBatchWorkResult)) ([]gettokenshooks.QuotaRuntimeState, []quotaRefreshBatchError) {
 	if len(accounts) == 0 {
 		return []gettokenshooks.QuotaRuntimeState{}, []quotaRefreshBatchError{}
 	}
@@ -701,6 +807,9 @@ func (h *Handler) refreshAccountQuotaBatch(ctx context.Context, accounts []accou
 			orderedErrors[result.index] = result.err
 			errorOK[result.index] = true
 		}
+		if progress != nil {
+			progress(result)
+		}
 	}
 	items := make([]gettokenshooks.QuotaRuntimeState, 0, len(accounts))
 	for index, ok := range stateOK {
@@ -737,8 +846,12 @@ func (h *Handler) ensureQuotaRefreshAccountStillActive(ctx context.Context, acco
 	if err != nil {
 		return err
 	}
-	if _, err := store.GetAccount(ctx, accountKey); err != nil {
+	exists, err := store.AccountExists(ctx, accountKey)
+	if err != nil {
 		return err
+	}
+	if !exists {
+		return fmt.Errorf("account %s not found", accountKey)
 	}
 	return nil
 }

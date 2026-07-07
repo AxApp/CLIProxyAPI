@@ -819,6 +819,10 @@ func BenchmarkQuotaRuntimeStatusSnapshot1652Accounts(b *testing.B) {
 	benchmarkQuotaRuntimeStatusSnapshot(b, 1652)
 }
 
+func BenchmarkQuotaRuntimeStatusSnapshot4000Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusSnapshot(b, 4000)
+}
+
 func BenchmarkQuotaRuntimeStatusTarget1Of1652Accounts(b *testing.B) {
 	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 1)
 }
@@ -833,6 +837,14 @@ func BenchmarkQuotaRuntimeStatusTarget100Of1652Accounts(b *testing.B) {
 
 func BenchmarkQuotaRuntimeStatusTarget1652Of1652Accounts(b *testing.B) {
 	benchmarkQuotaRuntimeStatusByKeys(b, 1652, 1652)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget200Of4000Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 4000, 200)
+}
+
+func BenchmarkQuotaRuntimeStatusTarget4000Of4000Accounts(b *testing.B) {
+	benchmarkQuotaRuntimeStatusByKeys(b, 4000, 4000)
 }
 
 func benchmarkQuotaRuntimeStatusSnapshot(b *testing.B, totalAccounts int) {

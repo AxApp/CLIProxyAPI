@@ -313,7 +313,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		recordRouteDecision(req, "scheduler-routing-policy", result, nil, err)
 		return nil, err
 	}
-	defaultResult := routeResultFromScheduledEntries(shard.readyCandidatesLocked(preferWebsocket, predicate))
+	defaultResult := shard.defaultRouteResultLocked(preferWebsocket, predicate)
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		s.sessionAffinity.bindRouteResult(req, picked)
 		recordRouteDecision(req, "scheduler-default", defaultResult, picked, nil)
@@ -371,7 +371,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		defaultResult := routeResultFromScheduledEntries(shard.readyCandidatesLocked(false, predicate))
+		defaultResult := shard.defaultRouteResultLocked(false, predicate)
 		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
 			recordRouteDecision(routeRequest{
 				Provider:  "mixed",
@@ -614,6 +614,10 @@ func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, provid
 	if s == nil || len(shards) == 0 {
 		return nil, "", gettokensrouting.RouteResult{}, false
 	}
+	extraPolicies := []gettokensrouting.Policy{s.sessionAffinity.routingPolicy()}
+	if len(routeRewritePolicies(extraPolicies)) == 0 {
+		return nil, "", gettokensrouting.RouteResult{}, false
+	}
 	entries := make([]*scheduledAuth, 0)
 	providerByAuthID := make(map[string]string)
 	for index, shard := range shards {
@@ -637,7 +641,7 @@ func (s *authScheduler) pickMixedRoutingPolicyLocked(ctx context.Context, provid
 		Tried:     tried,
 		Now:       time.Now(),
 	}
-	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, []gettokensrouting.Policy{s.sessionAffinity.routingPolicy()})
+	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, extraPolicies)
 	if !active {
 		return nil, "", result, false
 	}
@@ -832,8 +836,11 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		if meta == nil || !meta.supportsModel(modelKey) {
 			continue
 		}
-		shard.upsertEntryLocked(meta, now)
+		entry := &scheduledAuth{}
+		shard.entries[meta.auth.ID] = entry
+		shard.applyEntryMetaLocked(entry, meta, now)
 	}
+	shard.rebuildIndexesLocked()
 	p.modelShards[modelKey] = shard
 	return shard
 }
@@ -872,6 +879,18 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		previousWebsocketEnabled = entry.meta.websocketEnabled
 	}
 
+	m.applyEntryMetaLocked(entry, meta, now)
+
+	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousParent == meta.virtualParent && previousWebsocketEnabled == meta.websocketEnabled {
+		return
+	}
+	m.rebuildIndexesLocked()
+}
+
+func (m *modelScheduler) applyEntryMetaLocked(entry *scheduledAuth, meta *scheduledAuthMeta, now time.Time) {
+	if m == nil || entry == nil || meta == nil || meta.auth == nil {
+		return
+	}
 	entry.meta = meta
 	entry.auth = meta.auth
 	entry.nextRetryAt = time.Time{}
@@ -888,11 +907,6 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.state = scheduledStateBlocked
 		entry.nextRetryAt = next
 	}
-
-	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousParent == meta.virtualParent && previousWebsocketEnabled == meta.websocketEnabled {
-		return
-	}
-	m.rebuildIndexesLocked()
 }
 
 // removeEntryLocked deletes one auth entry and rebuilds the shard indexes if needed.
@@ -1014,6 +1028,9 @@ func (m *modelScheduler) pickRoutingPolicyLocked(ctx context.Context, req routeR
 	if m == nil {
 		return nil, gettokensrouting.RouteResult{}, false
 	}
+	if len(routeRewritePolicies(extraPolicies)) == 0 {
+		return nil, gettokensrouting.RouteResult{}, false
+	}
 	entries := m.readyCandidatesLocked(preferWebsocket, predicate)
 	rewritten, result, active := rewriteScheduledAuthsWithPolicies(ctx, req, entries, extraPolicies)
 	if !active {
@@ -1026,14 +1043,24 @@ func (m *modelScheduler) pickRoutingPolicyLocked(ctx context.Context, req routeR
 }
 
 func getMixedDefaultRouteResult(shards []*modelScheduler, providers []string, tried map[string]struct{}) gettokensrouting.RouteResult {
-	entries := make([]*scheduledAuth, 0)
+	result := gettokensrouting.RouteResult{
+		Trace: []gettokensrouting.DecisionStep{},
+	}
+	predicate := triedPredicate(tried)
 	for index, shard := range shards {
 		if shard == nil || index >= len(providers) {
 			continue
 		}
-		entries = append(entries, shard.readyCandidatesLocked(false, triedPredicate(tried))...)
+		shardResult := shard.defaultRouteResultLocked(false, predicate)
+		result.CandidateCount += shardResult.CandidateCount
+		for _, candidate := range shardResult.Candidates {
+			if len(result.Candidates) >= routeDecisionSnapshotSampleLimit {
+				break
+			}
+			result.Candidates = append(result.Candidates, candidate)
+		}
 	}
-	return routeResultFromScheduledEntries(entries)
+	return result
 }
 
 func (m *modelScheduler) readyCandidatesLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) []*scheduledAuth {
@@ -1076,6 +1103,74 @@ func (m *modelScheduler) readyCandidatesLocked(preferWebsocket bool, predicate f
 		appendView(bucket.all)
 	}
 	return out
+}
+
+func (m *modelScheduler) defaultRouteResultLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) gettokensrouting.RouteResult {
+	result := gettokensrouting.RouteResult{
+		Trace: []gettokensrouting.DecisionStep{},
+	}
+	if m == nil {
+		return result
+	}
+	m.promoteExpiredLocked(time.Now())
+	seen := map[string]struct{}(nil)
+	appendView := func(view readyView) {
+		for _, entry := range view.flat {
+			if entry == nil || entry.auth == nil {
+				continue
+			}
+			if predicate != nil && !predicate(entry) {
+				continue
+			}
+			id := strings.TrimSpace(entry.auth.ID)
+			if id == "" {
+				continue
+			}
+			if seen != nil {
+				if _, ok := seen[id]; ok {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			result.CandidateCount++
+			if len(result.Candidates) >= routeDecisionSnapshotSampleLimit {
+				continue
+			}
+			candidate, ok := routeDiagnosticCandidateFromScheduled(entry)
+			if !ok {
+				continue
+			}
+			result.Candidates = append(result.Candidates, candidate)
+		}
+	}
+	if preferWebsocket {
+		seen = make(map[string]struct{})
+		for _, priority := range m.priorityOrder {
+			bucket := m.readyByPriority[priority]
+			if bucket == nil {
+				continue
+			}
+			appendView(bucket.ws)
+		}
+	}
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+		appendView(bucket.all)
+	}
+	return result
+}
+
+func routeDiagnosticCandidateFromScheduled(entry *scheduledAuth) (gettokensrouting.RouteCandidate, bool) {
+	if entry == nil || entry.auth == nil || strings.TrimSpace(entry.auth.ID) == "" {
+		return gettokensrouting.RouteCandidate{}, false
+	}
+	return gettokensrouting.RouteCandidate{
+		ID:    strings.TrimSpace(entry.auth.ID),
+		Value: entry.auth,
+	}, true
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.

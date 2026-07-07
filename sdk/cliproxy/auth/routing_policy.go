@@ -23,20 +23,25 @@ func rewriteScheduledAuthsWithPolicies(ctx context.Context, req routeRequest, en
 	if len(entries) == 0 {
 		return entries, gettokensrouting.RouteResult{Candidates: []gettokensrouting.RouteCandidate{}, Trace: []gettokensrouting.DecisionStep{}}, false
 	}
-	policies := gettokensrouting.PolicySnapshot()
-	for _, policy := range extraPolicies {
-		if policy.Rewrite != nil {
-			policies = append(policies, policy)
-		}
-	}
+	policies := routeRewritePolicies(extraPolicies)
 	if len(policies) == 0 {
-		return entries, routeResultFromScheduledEntries(entries), false
+		return entries, gettokensrouting.RouteResult{}, false
 	}
 	result := gettokensrouting.NewEngine(policies...).Route(ctx, routeContextFromRouteRequest(req, routeCandidatesFromScheduled(entries)))
 	if !routeResultActive(result) {
 		return entries, result, false
 	}
 	return scheduledFromRouteCandidates(result.Candidates, entries), result, true
+}
+
+func routeRewritePolicies(extraPolicies []gettokensrouting.Policy) []gettokensrouting.Policy {
+	policies := gettokensrouting.PolicySnapshot()
+	for _, policy := range extraPolicies {
+		if policy.Rewrite != nil {
+			policies = append(policies, policy)
+		}
+	}
+	return policies
 }
 
 func routeResultActive(result gettokensrouting.RouteResult) bool {
@@ -147,6 +152,16 @@ func routeCandidatesFromScheduled(entries []*scheduledAuth) []gettokensrouting.R
 	return out
 }
 
+func routeCandidateFromScheduled(entry *scheduledAuth) (gettokensrouting.RouteCandidate, bool) {
+	if entry == nil || entry.auth == nil || strings.TrimSpace(entry.auth.ID) == "" {
+		return gettokensrouting.RouteCandidate{}, false
+	}
+	return gettokensrouting.RouteCandidate{
+		ID:    strings.TrimSpace(entry.auth.ID),
+		Value: entry.auth.Clone(),
+	}, true
+}
+
 func routeCandidatesFromAuths(auths []*Auth) []gettokensrouting.RouteCandidate {
 	out := make([]gettokensrouting.RouteCandidate, 0, len(auths))
 	for _, auth := range auths {
@@ -162,9 +177,21 @@ func routeCandidatesFromAuths(auths []*Auth) []gettokensrouting.RouteCandidate {
 }
 
 func routeResultFromScheduledEntries(entries []*scheduledAuth) gettokensrouting.RouteResult {
+	candidates := make([]gettokensrouting.RouteCandidate, 0, min(len(entries), routeDecisionSnapshotSampleLimit))
+	for _, entry := range entries {
+		candidate, ok := routeCandidateFromScheduled(entry)
+		if !ok {
+			continue
+		}
+		if len(candidates) >= routeDecisionSnapshotSampleLimit {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
 	return gettokensrouting.RouteResult{
-		Candidates: routeCandidatesFromScheduled(entries),
-		Trace:      []gettokensrouting.DecisionStep{},
+		Candidates:     candidates,
+		CandidateCount: len(entries),
+		Trace:          []gettokensrouting.DecisionStep{},
 	}
 }
 

@@ -11,7 +11,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 )
 
-const routeDecisionHistoryLimit = 200
+const (
+	routeDecisionHistoryLimit        = 200
+	routeDecisionSnapshotSampleLimit = 100
+)
 
 type RouteDecisionCandidateSnapshot struct {
 	AuthID     string
@@ -73,8 +76,8 @@ func recordRouteDecision(req routeRequest, source string, result gettokensroutin
 		Providers:          append([]string(nil), req.Providers...),
 		Model:              strings.TrimSpace(req.Model),
 		Source:             strings.TrimSpace(source),
-		CandidateCount:     len(result.Candidates),
-		Candidates:         routeDecisionCandidatesFromRouteResult(result),
+		CandidateCount:     routeResultCandidateCount(result),
+		Candidates:         routeDecisionCandidatesFromRouteResult(result, selected),
 		Trace:              cloneRouteDecisionTrace(result.Trace),
 		SelectedAuthID:     routeDecisionSelectedAuthID(selected),
 		SelectedAccountKey: routeDecisionSelectedAccountKey(selected),
@@ -95,6 +98,13 @@ func recordRouteDecision(req routeRequest, source string, result gettokensroutin
 	if len(routeDecisionHistory.items) > routeDecisionHistoryLimit {
 		routeDecisionHistory.items = append([]RouteDecisionSnapshot(nil), routeDecisionHistory.items[len(routeDecisionHistory.items)-routeDecisionHistoryLimit:]...)
 	}
+}
+
+func routeResultCandidateCount(result gettokensrouting.RouteResult) int {
+	if result.CandidateCount > 0 {
+		return result.CandidateCount
+	}
+	return len(result.Candidates)
 }
 
 func RecentRouteDecisionSnapshots(provider string, limit int) []RouteDecisionSnapshot {
@@ -160,9 +170,9 @@ func cloneRouteDecisionTrace(trace []gettokensrouting.DecisionStep) []gettokensr
 	out := make([]gettokensrouting.DecisionStep, 0, len(trace))
 	for _, step := range trace {
 		cloned := step
-		cloned.AllowIDs = append([]string(nil), step.AllowIDs...)
-		cloned.DenyIDs = append([]string(nil), step.DenyIDs...)
-		cloned.OrderIDs = append([]string(nil), step.OrderIDs...)
+		cloned.AllowIDs = routeDecisionSampleIDs(step.AllowIDs)
+		cloned.DenyIDs = routeDecisionSampleIDs(step.DenyIDs)
+		cloned.OrderIDs = routeDecisionSampleIDs(step.OrderIDs)
 		if step.Fallback != nil {
 			value := *step.Fallback
 			cloned.Fallback = &value
@@ -172,23 +182,78 @@ func cloneRouteDecisionTrace(trace []gettokensrouting.DecisionStep) []gettokensr
 	return out
 }
 
-func routeDecisionCandidatesFromRouteResult(result gettokensrouting.RouteResult) []RouteDecisionCandidateSnapshot {
+func routeDecisionCandidatesFromRouteResult(result gettokensrouting.RouteResult, selected *Auth) []RouteDecisionCandidateSnapshot {
 	if len(result.Candidates) == 0 {
 		return []RouteDecisionCandidateSnapshot{}
 	}
-	out := make([]RouteDecisionCandidateSnapshot, 0, len(result.Candidates))
-	for _, candidate := range result.Candidates {
-		item := RouteDecisionCandidateSnapshot{AuthID: strings.TrimSpace(candidate.ID)}
-		if auth, ok := candidate.Value.(*Auth); ok && auth != nil {
-			item.AccountKey = strings.TrimSpace(auth.AccountKey)
-			item.Provider = strings.TrimSpace(strings.ToLower(auth.Provider))
-			if item.AuthID == "" {
-				item.AuthID = strings.TrimSpace(auth.ID)
+	limit := routeDecisionSnapshotSampleLimit
+	if len(result.Candidates) < limit {
+		limit = len(result.Candidates)
+	}
+	selectedAuthID := routeDecisionSelectedAuthID(selected)
+	out := make([]RouteDecisionCandidateSnapshot, 0, limit)
+	selectedIncluded := selectedAuthID == ""
+	var selectedCandidate *gettokensrouting.RouteCandidate
+	for index := range result.Candidates {
+		candidate := result.Candidates[index]
+		if selectedAuthID != "" && strings.TrimSpace(candidate.ID) == selectedAuthID {
+			selectedCandidate = &candidate
+			if len(out) < limit {
+				selectedIncluded = true
 			}
 		}
-		out = append(out, item)
+		if len(out) >= limit {
+			continue
+		}
+		out = append(out, routeDecisionCandidateSnapshot(candidate))
+	}
+	if !selectedIncluded && selectedCandidate != nil {
+		if len(out) >= routeDecisionSnapshotSampleLimit {
+			out = out[:routeDecisionSnapshotSampleLimit-1]
+		}
+		out = append(out, routeDecisionCandidateSnapshot(*selectedCandidate))
+	}
+	if !selectedIncluded && selectedCandidate == nil && selected != nil {
+		if len(out) >= routeDecisionSnapshotSampleLimit {
+			out = out[:routeDecisionSnapshotSampleLimit-1]
+		}
+		out = append(out, routeDecisionCandidateSnapshotFromAuth(selected))
 	}
 	return out
+}
+
+func routeDecisionCandidateSnapshot(candidate gettokensrouting.RouteCandidate) RouteDecisionCandidateSnapshot {
+	item := RouteDecisionCandidateSnapshot{AuthID: strings.TrimSpace(candidate.ID)}
+	if auth, ok := candidate.Value.(*Auth); ok && auth != nil {
+		item.AccountKey = strings.TrimSpace(auth.AccountKey)
+		item.Provider = strings.TrimSpace(strings.ToLower(auth.Provider))
+		if item.AuthID == "" {
+			item.AuthID = strings.TrimSpace(auth.ID)
+		}
+	}
+	return item
+}
+
+func routeDecisionCandidateSnapshotFromAuth(auth *Auth) RouteDecisionCandidateSnapshot {
+	if auth == nil {
+		return RouteDecisionCandidateSnapshot{}
+	}
+	return RouteDecisionCandidateSnapshot{
+		AuthID:     strings.TrimSpace(auth.ID),
+		AccountKey: strings.TrimSpace(auth.AccountKey),
+		Provider:   strings.TrimSpace(strings.ToLower(auth.Provider)),
+	}
+}
+
+func routeDecisionSampleIDs(values []string) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	limit := routeDecisionSnapshotSampleLimit
+	if len(values) < limit {
+		limit = len(values)
+	}
+	return append([]string(nil), values[:limit]...)
 }
 
 func routeDecisionDroppedReasonsFromTrace(trace []gettokensrouting.DecisionStep, candidates []gettokensrouting.RouteCandidate, model string, recordedAt time.Time) []RouteDecisionDroppedReasonSnapshot {
@@ -232,6 +297,9 @@ func routeDecisionDroppedReasonsFromTrace(trace []gettokensrouting.DecisionStep,
 				}
 				seen[key] = struct{}{}
 				out = append(out, item)
+				if len(out) >= routeDecisionSnapshotSampleLimit {
+					return out
+				}
 			}
 		}
 	}

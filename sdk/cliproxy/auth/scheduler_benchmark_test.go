@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -115,6 +116,67 @@ func BenchmarkManagerPickNext1000(b *testing.B) {
 		auth, exec, errPick := manager.pickNext(ctx, "gemini", model, opts, tried)
 		if errPick != nil || auth == nil || exec == nil {
 			b.Fatalf("pickNext failed: auth=%v exec=%v err=%v", auth, exec, errPick)
+		}
+	}
+}
+
+func BenchmarkManagerPickNext4000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 4000, false, false)
+	ctx := context.Background()
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, errWarm := manager.pickNext(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNext error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		auth, exec, errPick := manager.pickNext(ctx, "gemini", model, opts, tried)
+		if errPick != nil || auth == nil || exec == nil {
+			b.Fatalf("pickNext failed: auth=%v exec=%v err=%v", auth, exec, errPick)
+		}
+	}
+}
+
+func BenchmarkSchedulerPickSingle4000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 4000, false, false)
+	ctx := context.Background()
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, errWarm := manager.scheduler.pickSingle(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickSingle error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		auth, errPick := manager.scheduler.pickSingle(ctx, "gemini", model, opts, tried)
+		if errPick != nil || auth == nil {
+			b.Fatalf("pickSingle failed: auth=%v err=%v", auth, errPick)
+		}
+	}
+}
+
+func BenchmarkSchedulerBuildModelShard4000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 4000, false, false)
+	modelKey := canonicalModelKey(model)
+	manager.scheduler.mu.Lock()
+	providerState := manager.scheduler.providers["gemini"]
+	manager.scheduler.mu.Unlock()
+	if providerState == nil {
+		b.Fatalf("provider scheduler not found")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		manager.scheduler.mu.Lock()
+		delete(providerState.modelShards, modelKey)
+		shard := providerState.ensureModelLocked(modelKey, time.Now())
+		manager.scheduler.mu.Unlock()
+		if shard == nil || len(shard.entries) != 4000 {
+			b.Fatalf("ensureModelLocked shard entries = %d, want 4000", len(shard.entries))
 		}
 	}
 }

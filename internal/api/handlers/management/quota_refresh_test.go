@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -637,6 +638,142 @@ func TestQuotaRefreshBatchJobStartDoesNotWaitForSlowUpstream(t *testing.T) {
 	}
 	if snapshot.Status != quotaRefreshBatchJobStatusSucceeded || snapshot.Succeeded != 1 || len(snapshot.Items) != 1 {
 		t.Fatalf("job snapshot after release = %#v, want success", snapshot)
+	}
+}
+
+func TestQuotaRefreshBatchJobReportsIncrementalProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var slowStartedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseSlow)
+		})
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer sk-progress-slow" {
+			slowStartedOnce.Do(func() {
+				close(slowStarted)
+			})
+			<-releaseSlow
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_at":` + jsonInt(time.Now().Add(time.Hour).Unix()) + `}}}`))
+	}))
+	defer upstream.Close()
+	defer release()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	h.SetAccountStorePath(filepath.Join(t.TempDir(), "accounts-v1.sqlite"))
+
+	router := gin.New()
+	router.POST("/v0/management/accounts", h.CreateAccount)
+	router.POST("/v0/management/gettokens/quota-refresh-batch/jobs", h.StartAccountQuotaBatchRefreshJob)
+	router.GET("/v0/management/gettokens/quota-refresh-batch/jobs/:job_id", h.GetAccountQuotaBatchRefreshJob)
+
+	fastKey := createQuotaRefreshTestAccount(t, router, "progress-fast", upstream.URL)
+	slowKey := createQuotaRefreshTestAccount(t, router, "progress-slow", upstream.URL)
+
+	startRecorder := httptest.NewRecorder()
+	startBody := []byte(`{"account_keys":["` + fastKey + `","` + slowKey + `"],"include_billing":false,"concurrency":1}`)
+	router.ServeHTTP(startRecorder, httptest.NewRequest(http.MethodPost, "/v0/management/gettokens/quota-refresh-batch/jobs", bytes.NewReader(startBody)))
+	if startRecorder.Code != http.StatusAccepted {
+		t.Fatalf("start job status = %d body=%s", startRecorder.Code, startRecorder.Body.String())
+	}
+	var started quotaRefreshBatchJobResponse
+	if err := json.Unmarshal(startRecorder.Body.Bytes(), &started); err != nil {
+		t.Fatalf("unmarshal start job: %v", err)
+	}
+
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background job did not finish the first account and start the slow account")
+	}
+
+	var snapshot quotaRefreshBatchJobResponse
+	for attempt := 0; attempt < 50; attempt++ {
+		getRecorder := httptest.NewRecorder()
+		router.ServeHTTP(getRecorder, httptest.NewRequest(http.MethodGet, "/v0/management/gettokens/quota-refresh-batch/jobs/"+started.JobID, nil))
+		if getRecorder.Code != http.StatusOK {
+			t.Fatalf("get job status = %d body=%s", getRecorder.Code, getRecorder.Body.String())
+		}
+		if err := json.Unmarshal(getRecorder.Body.Bytes(), &snapshot); err != nil {
+			t.Fatalf("unmarshal get job: %v", err)
+		}
+		if snapshot.Status == quotaRefreshBatchJobStatusRunning && snapshot.Succeeded == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snapshot.Status != quotaRefreshBatchJobStatusRunning || snapshot.Succeeded != 1 || len(snapshot.Items) != 1 {
+		t.Fatalf("running job snapshot = %#v, want one completed item before full batch completion", snapshot)
+	}
+	if snapshot.Running != 1 || snapshot.Pending != 0 {
+		t.Fatalf("running job counters = running:%d pending:%d, want one in-flight slow account", snapshot.Running, snapshot.Pending)
+	}
+
+	release()
+	completed := waitForQuotaRefreshJobStatus(t, router, started.JobID, quotaRefreshBatchJobStatusSucceeded)
+	if completed.Succeeded != 2 || len(completed.Items) != 2 || completed.Failed != 0 {
+		t.Fatalf("completed job = %#v, want two successes", completed)
+	}
+}
+
+func TestQuotaRefreshBatchJobStorePrunesTerminalHistory(t *testing.T) {
+	store := newQuotaRefreshBatchJobStore()
+	now := time.Now().UTC()
+	active := store.create(quotaRefreshBatchRequest{
+		AccountKeys: []string{"acct_99999999-0000-4000-8000-000000000001"},
+		Concurrency: 1,
+	}, []string{"acct_99999999-0000-4000-8000-000000000001"}, now)
+	if _, ok := store.markRunning(active.JobID, now); !ok {
+		t.Fatalf("mark active running failed")
+	}
+
+	var firstTerminal quotaRefreshBatchJobResponse
+	var lastTerminal quotaRefreshBatchJobResponse
+	for index := 0; index < quotaRefreshBatchJobHistoryLimit+3; index++ {
+		accountKey := fmt.Sprintf("acct_00000000-0000-4000-8000-%012d", index+1)
+		created := store.create(quotaRefreshBatchRequest{
+			AccountKeys: []string{accountKey},
+			Concurrency: 1,
+		}, []string{accountKey}, now.Add(time.Duration(index+1)*time.Second))
+		completed, ok := store.complete(created.JobID, []gettokenshooks.QuotaRuntimeState{{
+			AccountKey: accountKey,
+			Status:     gettokenshooks.QuotaRuntimeStatusSuccess,
+		}}, nil, now.Add(time.Duration(index+1)*time.Second))
+		if !ok {
+			t.Fatalf("complete job %d failed", index)
+		}
+		if index == 0 {
+			firstTerminal = completed
+		}
+		lastTerminal = completed
+	}
+
+	if _, ok := store.get(firstTerminal.JobID); ok {
+		t.Fatalf("oldest terminal job %s still retained", firstTerminal.JobID)
+	}
+	if _, ok := store.get(lastTerminal.JobID); !ok {
+		t.Fatalf("newest terminal job %s was pruned", lastTerminal.JobID)
+	}
+	if got, ok := store.get(active.JobID); !ok || got.Status != quotaRefreshBatchJobStatusRunning {
+		t.Fatalf("active job retained = (%#v, %v), want running active job", got, ok)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	terminalCount := 0
+	for _, job := range store.jobs {
+		if job != nil && isQuotaRefreshBatchJobTerminal(job.Status) {
+			terminalCount++
+		}
+	}
+	if terminalCount != quotaRefreshBatchJobHistoryLimit {
+		t.Fatalf("terminal job count = %d, want %d", terminalCount, quotaRefreshBatchJobHistoryLimit)
 	}
 }
 
