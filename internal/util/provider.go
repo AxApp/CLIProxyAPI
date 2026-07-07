@@ -4,6 +4,7 @@
 package util
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -263,6 +264,15 @@ func MaskSensitiveQuery(raw string) string {
 		if err != nil {
 			decodedKey = keyPart
 		}
+		if shouldSummarizeQueryParam(decodedKey) {
+			decodedValue, err := url.QueryUnescape(valuePart)
+			if err != nil {
+				decodedValue = valuePart
+			}
+			parts[i] = keyPart + "=" + url.QueryEscape(fmt.Sprintf("[redacted:%d]", countDelimitedQueryValues(decodedValue)))
+			changed = true
+			continue
+		}
 		if !shouldMaskQueryParam(decodedKey) {
 			continue
 		}
@@ -278,6 +288,22 @@ func MaskSensitiveQuery(raw string) string {
 		return raw
 	}
 	return strings.Join(parts, "&")
+}
+
+func shouldSummarizeQueryParam(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.TrimSuffix(key, "[]")
+	return key == "account_key" || key == "account_keys"
+}
+
+func countDelimitedQueryValues(value string) int {
+	count := 0
+	for _, part := range strings.Split(value, ",") {
+		if strings.TrimSpace(part) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func shouldMaskQueryParam(key string) bool {
