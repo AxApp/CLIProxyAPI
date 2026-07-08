@@ -310,8 +310,11 @@ func isNonRetryableRefreshErr(err error) bool {
 	raw := strings.ToLower(err.Error())
 	return strings.Contains(raw, "refresh_token_reused") ||
 		strings.Contains(raw, "app_session_terminated") ||
+		strings.Contains(raw, "invalid_refresh_token") ||
 		strings.Contains(raw, "invalid_grant") ||
+		strings.Contains(raw, "could not validate your refresh token") ||
 		strings.Contains(raw, "session has ended") ||
+		strings.Contains(raw, "please try signing in again") ||
 		strings.Contains(raw, "please log in again")
 }
 

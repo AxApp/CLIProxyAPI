@@ -531,11 +531,23 @@ func (s *QuotaRuntimeStore) syncGuard(state QuotaRuntimeState, now time.Time) {
 	if s == nil || s.guard == nil || strings.TrimSpace(state.AccountKey) == "" {
 		return
 	}
+	accountKey := strings.TrimSpace(state.AccountKey)
+	if reason := quotaRuntimeFactReason(state); quotaRuntimeFactDenied(state, reason) {
+		s.guard.MarkBlocked(AccountRouteGuardBlock{
+			Source:       AccountRouteGuardSourceAuthError,
+			FailureScope: RouteResilienceScopeAccount,
+			AccountKey:   accountKey,
+			Reason:       defaultAccountRouteGuardReason(reason, "auth error"),
+			UpdatedAt:    now,
+		})
+		return
+	}
 	if !strings.EqualFold(state.Status, QuotaRuntimeStatusSuccess) || state.Stale || quotaRuntimeStateIsDegraded(state) {
 		return
 	}
-	s.guard.ClearAuth(AccountRouteGuardSourceQuotaEmpty, state.AccountKey)
-	s.guard.ClearAuth(AccountRouteGuardSourceQuotaThreshold, state.AccountKey)
+	s.guard.ClearAuth(AccountRouteGuardSourceAuthError, accountKey)
+	s.guard.ClearAuth(AccountRouteGuardSourceQuotaEmpty, accountKey)
+	s.guard.ClearAuth(AccountRouteGuardSourceQuotaThreshold, accountKey)
 	blocks := quotaRuntimeRouteGuardBlocks(state, now)
 	for _, block := range blocks {
 		s.guard.MarkBlocked(block)
@@ -956,9 +968,16 @@ func quotaRuntimeFactDenied(state QuotaRuntimeState, reason string) bool {
 		strings.Contains(text, "permission denied") ||
 		strings.Contains(text, "access denied") ||
 		strings.Contains(text, "not authorized") ||
+		strings.Contains(text, "invalid_refresh_token") ||
 		strings.Contains(text, "invalid_grant") ||
+		strings.Contains(text, "refresh_token_reused") ||
+		strings.Contains(text, "app_session_terminated") ||
+		strings.Contains(text, "could not validate your refresh token") ||
 		strings.Contains(text, "invalid auth") ||
 		strings.Contains(text, "token_invalidated") ||
+		strings.Contains(text, "session has ended") ||
+		strings.Contains(text, "please try signing in again") ||
+		strings.Contains(text, "please log in again") ||
 		strings.Contains(text, "deactivated_workspace")
 }
 

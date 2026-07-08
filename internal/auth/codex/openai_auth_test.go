@@ -73,6 +73,35 @@ func TestRefreshTokensWithRetry_AppSessionTerminatedOnlyAttemptsOnce(t *testing.
 	}
 }
 
+func TestRefreshTokensWithRetry_InvalidRefreshTokenOnlyAttemptsOnce(t *testing.T) {
+	var calls int32
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				atomic.AddInt32(&calls, 1)
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_refresh_token","message":"Could not validate your refresh token. Please try signing in again.","param":null,"type":"invalid_request_error"}}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := auth.RefreshTokensWithRetry(context.Background(), "dummy_refresh_token", 3)
+	if err == nil {
+		t.Fatalf("expected error for invalid refresh token failure")
+	}
+	lowerErr := strings.ToLower(err.Error())
+	if !strings.Contains(lowerErr, "invalid_refresh_token") || !strings.Contains(lowerErr, "please try signing in again") {
+		t.Fatalf("expected invalid_refresh_token relogin evidence in error, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	}
+}
+
 func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "direct")

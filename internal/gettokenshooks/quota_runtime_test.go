@@ -441,6 +441,128 @@ func TestQuotaRuntimeStoreRecoveryClearsAuthScopedQuotaEmptyByAccountKey(t *test
 	}
 }
 
+func TestQuotaRuntimeStoreTokenInvalidatedFeedsAuthErrorGuardUntilRecovery(t *testing.T) {
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := time.Now().UTC()
+	accountKey := "acct_00000000-0000-4000-8000-000000000106"
+	remainingCached := 74
+
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey:     accountKey,
+		Source:         "auth-file-usage",
+		Status:         QuotaRuntimeStatusStale,
+		Stale:          true,
+		DegradedReason: "ChatGPT usage request failed (401): Your authentication token has been invalidated. Please try signing in again. (token_invalidated)",
+		Windows: []QuotaRuntimeWindow{{
+			ID:               "five-hour",
+			Label:            "5H",
+			RemainingPercent: &remainingCached,
+			ResetAtUnix:      now.Add(time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert invalidated: %v", err)
+	}
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("state = %#v, want auth-error block for token_invalidated", state)
+	}
+	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "codex-auth-invalidated",
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != "codex-auth-invalidated" {
+		t.Fatalf("guard deny ids = %#v, want invalidated auth excluded", got)
+	}
+
+	remainingHealthy := 92
+	state, err = store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Source:     "auth-file-usage",
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:               "five-hour",
+			Label:            "5H",
+			RemainingPercent: &remainingHealthy,
+			ResetAtUnix:      now.Add(time.Hour).Unix(),
+		}},
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("Upsert recovered: %v", err)
+	}
+	if state.Blocked || len(state.Sources) != 0 {
+		t.Fatalf("state = %#v, want auth-error cleared after fresh success", state)
+	}
+	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "codex-auth-invalidated",
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 0 {
+		t.Fatalf("guard deny ids = %#v, want recovered auth selectable", got)
+	}
+}
+
+func TestQuotaRuntimeStoreInvalidRefreshTokenFeedsAuthErrorGuardUntilRecovery(t *testing.T) {
+	guard := NewAccountRouteGuardStore()
+	store := NewQuotaRuntimeStore(guard)
+	now := time.Now().UTC()
+	accountKey := "acct_00000000-0000-4000-8000-000000000107"
+	remainingCached := 61
+
+	state, err := store.Upsert(QuotaRuntimeState{
+		AccountKey:     accountKey,
+		Source:         "auth-file-usage",
+		Status:         QuotaRuntimeStatusStale,
+		Stale:          true,
+		DegradedReason: "OpenAI OAuth token refresh failed (400): Could not validate your refresh token. Please try signing in again. (invalid_refresh_token)",
+		Windows: []QuotaRuntimeWindow{{
+			ID:               "five-hour",
+			Label:            "5H",
+			RemainingPercent: &remainingCached,
+			ResetAtUnix:      now.Add(time.Hour).Unix(),
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("Upsert invalid_refresh_token: %v", err)
+	}
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("state = %#v, want auth-error block for invalid_refresh_token", state)
+	}
+	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "codex-auth-invalid-refresh-token",
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 1 || got[0] != "codex-auth-invalid-refresh-token" {
+		t.Fatalf("guard deny ids = %#v, want invalid_refresh_token auth excluded", got)
+	}
+
+	remainingHealthy := 92
+	state, err = store.Upsert(QuotaRuntimeState{
+		AccountKey: accountKey,
+		Source:     "auth-file-usage",
+		Status:     QuotaRuntimeStatusSuccess,
+		Windows: []QuotaRuntimeWindow{{
+			ID:               "five-hour",
+			Label:            "5H",
+			RemainingPercent: &remainingHealthy,
+			ResetAtUnix:      now.Add(time.Hour).Unix(),
+		}},
+	}, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("Upsert recovered: %v", err)
+	}
+	if state.Blocked || len(state.Sources) != 0 {
+		t.Fatalf("state = %#v, want auth-error cleared after fresh success", state)
+	}
+	if got := guard.DenyIDsForCandidates([]*coreauth.Auth{{
+		ID:         "codex-auth-invalid-refresh-token",
+		AccountKey: accountKey,
+		Provider:   "codex",
+	}}); len(got) != 0 {
+		t.Fatalf("guard deny ids = %#v, want recovered auth selectable", got)
+	}
+}
+
 func TestQuotaRuntimeStoreStaleStateDoesNotClearFreshQuotaEmptyGuard(t *testing.T) {
 	guard := NewAccountRouteGuardStore()
 	store := NewQuotaRuntimeStore(guard)
