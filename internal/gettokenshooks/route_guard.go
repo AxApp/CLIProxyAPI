@@ -117,6 +117,9 @@ func (h AccountRouteGuardResultHook) OnAuthUpdated(_ context.Context, auth *core
 	if store == nil {
 		store = defaultAccountRouteGuardStore
 	}
+	if block, ok := accountRouteGuardBlockForAuthState(auth, time.Now().UTC()); ok {
+		store.MarkBlocked(block)
+	}
 	store.SyncQuotaEmptyAuth(auth, time.Now().UTC())
 }
 
@@ -550,6 +553,9 @@ func normalizeAccountRouteGuardBlock(block AccountRouteGuardBlock) AccountRouteG
 		add("auth-id:" + block.AuthID)
 	}
 	add(block.AccountKey)
+	for _, key := range accountRouteGuardAccountStoreKeysForAccountKey(block.AccountKey) {
+		add(key)
+	}
 	for _, key := range block.LookupKeys {
 		add(key)
 	}
@@ -605,6 +611,32 @@ func accountRouteGuardBlockForResult(result coreauth.Result) (AccountRouteGuardB
 	return block, true
 }
 
+func accountRouteGuardBlockForAuthState(auth *coreauth.Auth, now time.Time) (AccountRouteGuardBlock, bool) {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" || auth.LastError == nil {
+		return AccountRouteGuardBlock{}, false
+	}
+	if auth.LastError.StatusCode() != http.StatusUnauthorized && !strings.EqualFold(auth.LastError.Code, "unauthorized") {
+		return AccountRouteGuardBlock{}, false
+	}
+	reason := strings.TrimSpace(auth.LastError.Message)
+	if reason == "" {
+		reason = strings.TrimSpace(auth.StatusMessage)
+	}
+	reason = defaultAccountRouteGuardReason(reason, "auth error")
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return AccountRouteGuardBlock{
+		Source:       AccountRouteGuardSourceAuthError,
+		FailureScope: RouteResilienceScopeAccount,
+		AuthID:       strings.TrimSpace(auth.ID),
+		AccountKey:   firstNonEmptyRouteGuardString(auth.AccountKey, "auth-id:"+strings.TrimSpace(auth.ID)),
+		LookupKeys:   accountRouteGuardIdentityKeysForAuth(auth),
+		Reason:       reason,
+		UpdatedAt:    now.UTC(),
+	}, true
+}
+
 func defaultAccountRouteGuardReason(reason string, fallback string) string {
 	reason = strings.TrimSpace(reason)
 	if reason != "" {
@@ -649,6 +681,13 @@ func (s *AccountRouteGuardStore) blocksForAuthLocked(source string, authID strin
 			}
 		}
 	}
+	for _, lookupKey := range accountRouteGuardAccountStoreKeysForAccountKey(authID) {
+		for _, block := range s.lookup[lookupKey] {
+			if strings.TrimSpace(block.Source) == source {
+				add(block)
+			}
+		}
+	}
 	return out
 }
 
@@ -678,6 +717,12 @@ func accountRouteGuardKeysForAuth(auth *coreauth.Auth) []string {
 	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
 		add("auth-file:" + filepath.Base(fileName))
 	}
+	for _, key := range accountRouteGuardIdentityKeysFromAuthMetadata(auth) {
+		add(key)
+	}
+	for _, key := range accountRouteGuardAccountStoreKeysForAccountKey(auth.AccountKey) {
+		add(key)
+	}
 	return keys
 }
 
@@ -704,6 +749,45 @@ func accountRouteGuardIdentityKeysForAuth(auth *coreauth.Auth) []string {
 	add("auth-index:" + auth.Index)
 	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
 		add("auth-file:" + filepath.Base(fileName))
+	}
+	for _, key := range accountRouteGuardIdentityKeysFromAuthMetadata(auth) {
+		add(key)
+	}
+	for _, key := range accountRouteGuardAccountStoreKeysForAccountKey(auth.AccountKey) {
+		add(key)
+	}
+	return keys
+}
+
+func accountRouteGuardIdentityKeysFromAuthMetadata(auth *coreauth.Auth) []string {
+	if auth == nil {
+		return nil
+	}
+	values := []string{}
+	if auth.Attributes != nil {
+		values = append(values,
+			auth.Attributes["account_id"],
+			auth.Attributes["chatgpt_account_id"],
+			auth.Attributes["openai_account_id"],
+		)
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"account_id", "chatgpt_account_id", "openai_account_id"} {
+			if value, ok := auth.Metadata[key].(string); ok {
+				values = append(values, value)
+			}
+		}
+	}
+	keys := []string{}
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		for _, key := range accountRouteGuardOpenAIAccountIdentityKeys(value) {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
 	}
 	return keys
 }

@@ -642,9 +642,11 @@ func SetChannelRoutingPolicyConfigPathFromConfig(configPath string) {
 	if err != nil {
 		return
 	}
+	setAccountRouteGuardAccountStorePathFromConfig(configPath)
 	channelRoutingPolicyConfigPathState.Lock()
 	channelRoutingPolicyConfigPathState.path = path
 	channelRoutingPolicyConfigPathState.Unlock()
+	_ = hydrateAccountRouteGuardStoreFromPersistedRuntimeStates(defaultAccountRouteGuardStore, time.Now().UTC())
 }
 
 func channelRoutingPolicyConfigPath() (string, error) {

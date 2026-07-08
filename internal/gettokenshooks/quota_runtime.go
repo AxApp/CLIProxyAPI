@@ -562,6 +562,7 @@ func (s *QuotaRuntimeStore) withGuardState(state QuotaRuntimeState) QuotaRuntime
 		return quotaRuntimeStateWithExistingFact(state, time.Now().UTC())
 	}
 	blocks := s.guard.ActiveBlocksForAuth(accountRouteGuardAuthForAccountKey(state.AccountKey))
+	seenSources := map[string]struct{}{}
 	for _, block := range blocks {
 		source := QuotaRuntimeSourceState{
 			Source: strings.TrimSpace(block.Source),
@@ -571,6 +572,11 @@ func (s *QuotaRuntimeStore) withGuardState(state QuotaRuntimeState) QuotaRuntime
 			source.ExpiresAt = block.ExpiresAt.UTC().Format(time.RFC3339)
 			source.NextReset = source.ExpiresAt
 		}
+		sourceKey := source.Source + "\x00" + source.Reason + "\x00" + source.ExpiresAt
+		if _, ok := seenSources[sourceKey]; ok {
+			continue
+		}
+		seenSources[sourceKey] = struct{}{}
 		state.Sources = append(state.Sources, source)
 	}
 	state.Blocked = len(state.Sources) > 0

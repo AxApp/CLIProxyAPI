@@ -123,6 +123,44 @@ func accountRouteGuardBlocksFromPersistedState(key string, state persistedChanne
 	return out
 }
 
+func hydrateAccountRouteGuardStoreFromPersistedRuntimeStates(store *AccountRouteGuardStore, now time.Time) error {
+	if store == nil {
+		return nil
+	}
+	states, err := loadPersistedChannelRuntimeStates()
+	if err != nil || len(states) == 0 {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	blocks := make([]AccountRouteGuardBlock, 0, len(states))
+	for key, state := range states {
+		blocks = append(blocks, accountRouteGuardBlocksFromPersistedState(key, state, now)...)
+	}
+	if len(blocks) == 0 {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, block := range blocks {
+		block = normalizeAccountRouteGuardBlock(block)
+		blockKey := accountRouteGuardBlockKey(block)
+		if block.Source == "" || blockKey == "" {
+			continue
+		}
+		store.removeLocked(block.Source, blockKey)
+		if store.blocks[block.Source] == nil {
+			store.blocks[block.Source] = map[string]AccountRouteGuardBlock{}
+		}
+		store.blocks[block.Source][blockKey] = block
+		store.indexLocked(block)
+	}
+	return nil
+}
+
 func persistAccountRouteGuardBlock(block AccountRouteGuardBlock) {
 	block = normalizeAccountRouteGuardBlock(block)
 	accountID := persistedAccountRuntimeIDForBlock(block)

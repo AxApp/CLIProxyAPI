@@ -4492,6 +4492,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
 		shouldReschedule := false
+		var authSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
@@ -4508,10 +4509,14 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
+			authSnapshot = current.Clone()
 		}
 		m.mu.Unlock()
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
+		}
+		if authSnapshot != nil {
+			m.hook.OnAuthUpdated(ctx, authSnapshot)
 		}
 		return
 	}

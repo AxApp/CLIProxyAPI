@@ -74,6 +74,18 @@ func (e *refreshRecoveryTestExecutor) Refresh(ctx context.Context, auth *Auth) (
 	return auth, nil
 }
 
+type refreshHookRecorder struct {
+	NoopHook
+	updated []*Auth
+}
+
+func (h *refreshHookRecorder) OnAuthUpdated(_ context.Context, auth *Auth) {
+	if auth == nil {
+		return
+	}
+	h.updated = append(h.updated, auth.Clone())
+}
+
 func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
@@ -208,6 +220,44 @@ func TestManager_RefreshAuthInvalidRefreshTokenStopsAutoRefreshRetry(t *testing.
 	}
 	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
 		t.Fatal("expected invalid refresh token failure to be removed from the auto-refresh schedule")
+	}
+}
+
+func TestManager_RefreshAuthInvalidRefreshTokenNotifiesAuthUpdatedHook(t *testing.T) {
+	ctx := context.Background()
+	hook := &refreshHookRecorder{}
+	manager := NewManager(nil, &RoundRobinSelector{}, hook)
+	manager.RegisterExecutor(invalidRefreshTokenTestExecutor{
+		schedulerProviderTestExecutor: schedulerProviderTestExecutor{provider: "codex"},
+	})
+
+	auth := &Auth{
+		ID:         "invalid-refresh-token-hook",
+		AccountKey: "acct_00000000-0000-4000-8000-000000000001",
+		Provider:   "codex",
+		Metadata: map[string]any{
+			"email":         "x@example.com",
+			"refresh_token": "refresh-token",
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	if len(hook.updated) == 0 {
+		t.Fatal("expected refresh failure to notify OnAuthUpdated")
+	}
+	latest := hook.updated[len(hook.updated)-1]
+	if latest.ID != auth.ID || latest.AccountKey != auth.AccountKey {
+		t.Fatalf("hook auth = %#v, want failed auth snapshot", latest)
+	}
+	if latest.LastError == nil || latest.LastError.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("hook LastError = %#v, want unauthorized refresh failure", latest.LastError)
+	}
+	if !latest.Unavailable || latest.Status != StatusError {
+		t.Fatalf("hook auth state = status=%q unavailable=%v, want error unavailable", latest.Status, latest.Unavailable)
 	}
 }
 

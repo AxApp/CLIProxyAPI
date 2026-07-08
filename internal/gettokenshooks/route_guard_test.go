@@ -3,6 +3,7 @@ package gettokenshooks
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokens/accountstore"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/gettokensrouting"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -263,6 +265,52 @@ func TestRouteResilienceStatesFromPersistedRuntimeState(t *testing.T) {
 	}
 }
 
+func TestHydratedAuthErrorBlocksSiblingAccountWithSharedOpenAIAccountID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	first := createRouteGuardAuthFileAccount(t, dbPath, "first.json", `{"type":"codex","access_token":"token-a","account_id":"openai-shared-account","email":"first@example.test"}`)
+	second := createRouteGuardAuthFileAccount(t, dbPath, "second.json", `{"type":"codex","access_token":"token-b","account_id":"openai-shared-account","email":"second@example.test"}`)
+	setRouteGuardAccountStorePathForTest(t, dbPath)
+
+	configPath := writeRouteGuardChannelRoutingConfig(t, fmt.Sprintf(`{
+  "channels": {},
+  "runtimeStates": {
+    %q: {
+      "accountID": %q,
+      "updatedAt": "2026-07-08T00:00:00Z",
+      "sources": {
+        "auth-error": {
+          "source": "auth-error",
+          "scope": "account",
+          "reason": "token_invalidated",
+          "updatedAt": "2026-07-08T00:00:00Z"
+        }
+      }
+    }
+  }
+}`, first.AccountKey, first.AccountKey))
+	setRouteGuardChannelRoutingConfigPathForTest(t, configPath)
+
+	guard := NewAccountRouteGuardStore()
+	if err := hydrateAccountRouteGuardStoreFromPersistedRuntimeStates(guard, time.Date(2026, 7, 8, 0, 1, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("hydrate route guard: %v", err)
+	}
+
+	state := NewQuotaRuntimeStore(guard).StatesForAccounts([]string{second.AccountKey})[0]
+	if !state.Blocked || len(state.Sources) != 1 || state.Sources[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("sibling quota state = %#v, want shared auth-error block", state)
+	}
+
+	decision := accountRouteGuardPolicy{store: guard}.RewriteCandidates(context.Background(), gettokensrouting.RouteContext{
+		Provider: "codex",
+		Candidates: []gettokensrouting.RouteCandidate{
+			{ID: "auth-sibling", Value: &coreauth.Auth{ID: "auth-sibling", AccountKey: second.AccountKey, Provider: "codex"}},
+		},
+	})
+	if len(decision.DenyIDs) != 1 || decision.DenyIDs[0] != "auth-sibling" {
+		t.Fatalf("DenyIDs = %#v, want shared account sibling denied", decision.DenyIDs)
+	}
+}
+
 func TestAccountRouteGuardResultHookBlocksAndClearsTransientFailure(t *testing.T) {
 	store := NewAccountRouteGuardStore()
 	hook := AccountRouteGuardResultHook{Store: store}
@@ -290,6 +338,37 @@ func TestAccountRouteGuardResultHookBlocksAndClearsTransientFailure(t *testing.T
 
 	if got := store.DenyIDsForCandidates([]*coreauth.Auth{{ID: "codex-auth-1", Provider: "codex"}}); len(got) != 0 {
 		t.Fatalf("DenyIDs after success = %#v, want transient block cleared", got)
+	}
+}
+
+func TestAccountRouteGuardResultHookBlocksTerminalOAuthRefreshFailureOnAuthUpdated(t *testing.T) {
+	store := NewAccountRouteGuardStore()
+	hook := AccountRouteGuardResultHook{Store: store}
+	auth := &coreauth.Auth{
+		ID:          "codex-auth-refresh-failed",
+		AccountKey:  "acct_00000000-0000-4000-8000-000000000001",
+		Provider:    "codex",
+		Status:      coreauth.StatusError,
+		Unavailable: true,
+		LastError: &coreauth.Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Code:       "unauthorized",
+			Message:    `token refresh failed with status 400: {"error":{"code":"invalid_refresh_token","message":"Could not validate your refresh token. Please try signing in again."}}`,
+			Retryable:  false,
+		},
+	}
+
+	hook.OnAuthUpdated(context.Background(), auth)
+
+	states := NewQuotaRuntimeStore(store).StatesForAccounts([]string{auth.AccountKey})
+	if len(states) != 1 || !states[0].Blocked {
+		t.Fatalf("quota states = %#v, want auth-error block from refresh failure", states)
+	}
+	if len(states[0].Sources) != 1 || states[0].Sources[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("sources = %#v, want auth-error", states[0].Sources)
+	}
+	if !strings.Contains(states[0].Sources[0].Reason, "invalid_refresh_token") {
+		t.Fatalf("reason = %q, want invalid_refresh_token evidence", states[0].Sources[0].Reason)
 	}
 }
 
@@ -376,6 +455,63 @@ func TestAccountRouteGuardPolicyDeniesCandidatesFromPersistedRuntimeStates(t *te
 	}
 	if !strings.Contains(decision.Reason, "auth-error") {
 		t.Fatalf("Reason = %q, want persisted auth-error source", decision.Reason)
+	}
+}
+
+func TestSetChannelRoutingPolicyConfigPathHydratesPersistedRuntimeStatesForQuotaStatus(t *testing.T) {
+	const accountKey = "acct_00000000-0000-4000-8000-000000000001"
+	configPath := writeRouteGuardChannelRoutingConfig(t, `{
+  "channels": {
+    "codex": {
+      "channel": "codex",
+      "routeMode": "sequential",
+      "orderedAccountIDs": [],
+      "channelGroupStates": {}
+    }
+  },
+  "runtimeStates": {
+    "acct_00000000-0000-4000-8000-000000000001": {
+      "accountID": "acct_00000000-0000-4000-8000-000000000001",
+      "updatedAt": "2026-06-09T10:00:00Z",
+      "sources": {
+        "auth-error": {
+          "source": "auth-error",
+          "scope": "account",
+          "reason": "token_invalidated",
+          "updatedAt": "2026-06-09T10:00:00Z"
+        }
+      }
+    }
+  }
+}`)
+
+	channelRoutingPolicyConfigPathState.Lock()
+	previousPath := channelRoutingPolicyConfigPathState.path
+	channelRoutingPolicyConfigPathState.Unlock()
+	previousDefaultGuard := defaultAccountRouteGuardStore
+	defaultAccountRouteGuardStore = NewAccountRouteGuardStore()
+	t.Cleanup(func() {
+		defaultAccountRouteGuardStore = previousDefaultGuard
+		channelRoutingPolicyConfigPathState.Lock()
+		channelRoutingPolicyConfigPathState.path = previousPath
+		channelRoutingPolicyConfigPathState.Unlock()
+	})
+
+	SetChannelRoutingPolicyConfigPathFromConfig(configPath)
+
+	store := NewQuotaRuntimeStore(DefaultAccountRouteGuardStore())
+	states := store.StatesForAccounts([]string{accountKey})
+	if len(states) != 1 {
+		t.Fatalf("StatesForAccounts len = %d, want 1", len(states))
+	}
+	if !states[0].Blocked {
+		t.Fatalf("blocked = false, want true for persisted auth-error: %#v", states[0])
+	}
+	if len(states[0].Sources) != 1 || states[0].Sources[0].Source != AccountRouteGuardSourceAuthError {
+		t.Fatalf("sources = %#v, want persisted auth-error", states[0].Sources)
+	}
+	if states[0].Sources[0].Reason != "token_invalidated" {
+		t.Fatalf("source reason = %q, want token_invalidated", states[0].Sources[0].Reason)
 	}
 }
 
@@ -622,6 +758,50 @@ func setRouteGuardChannelRoutingConfigPathForTest(t *testing.T, configPath strin
 		channelRoutingPolicyConfigPathState.path = previous
 		channelRoutingPolicyConfigPathState.Unlock()
 	})
+}
+
+func setRouteGuardAccountStorePathForTest(t *testing.T, dbPath string) {
+	t.Helper()
+	accountRouteGuardAccountStorePathState.Lock()
+	previousPath := accountRouteGuardAccountStorePathState.path
+	previousCache := accountRouteGuardAccountStorePathState.cache
+	accountRouteGuardAccountStorePathState.path = strings.TrimSpace(dbPath)
+	accountRouteGuardAccountStorePathState.cache = nil
+	accountRouteGuardAccountStorePathState.Unlock()
+	t.Cleanup(func() {
+		accountRouteGuardAccountStorePathState.Lock()
+		accountRouteGuardAccountStorePathState.path = previousPath
+		accountRouteGuardAccountStorePathState.cache = previousCache
+		accountRouteGuardAccountStorePathState.Unlock()
+	})
+}
+
+func createRouteGuardAuthFileAccount(t *testing.T, dbPath string, sourceFileName string, authJSON string) accountstore.AccountRecord {
+	t.Helper()
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("ensure account store schema: %v", err)
+	}
+	account, err := store.CreateAccount(context.Background(), accountstore.AccountWrite{
+		Kind:             accountstore.KindAuthFile,
+		Title:            sourceFileName,
+		Provider:         "codex",
+		CredentialSource: accountstore.SourceSidecarManagementAPI,
+		AuthFile: &accountstore.AuthFileCredential{
+			SourceFileName: sourceFileName,
+			AuthJSON:       authJSON,
+			AuthType:       "codex",
+			SizeBytes:      int64(len(authJSON)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("create auth-file account: %v", err)
+	}
+	return account
 }
 
 func readRouteGuardChannelRoutingConfig(t *testing.T, configPath string) routeGuardChannelRoutingConfig {
