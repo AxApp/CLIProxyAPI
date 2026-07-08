@@ -76,10 +76,11 @@ type deleteLegacySourcesRequest struct {
 }
 
 type accountStoreDiagnosticsResponse struct {
-	PathBasename string                              `json:"path_basename"`
-	Configured   bool                                `json:"configured"`
-	Open         bool                                `json:"open"`
-	ReadRecovery accountStoreReadRecoveryDiagnostics `json:"read_recovery"`
+	PathBasename               string                                  `json:"path_basename"`
+	Configured                 bool                                    `json:"configured"`
+	Open                       bool                                    `json:"open"`
+	ReadRecovery               accountStoreReadRecoveryDiagnostics     `json:"read_recovery"`
+	KnownOpenAICompatibleAudit accountstore.KnownOpenAICompatibleAudit `json:"known_openai_compatible_audit"`
 }
 
 type accountStoreReadRecoveryDiagnostics struct {
@@ -456,7 +457,7 @@ func isRecoverableAccountStoreReadError(err error) bool {
 }
 
 func (h *Handler) GetAccountStoreDiagnostics(c *gin.Context) {
-	diagnostics, err := h.accountStoreDiagnostics()
+	diagnostics, err := h.accountStoreDiagnostics(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -464,13 +465,28 @@ func (h *Handler) GetAccountStoreDiagnostics(c *gin.Context) {
 	c.JSON(http.StatusOK, diagnostics)
 }
 
-func (h *Handler) accountStoreDiagnostics() (accountStoreDiagnosticsResponse, error) {
+func (h *Handler) accountStoreDiagnostics(ctx context.Context) (accountStoreDiagnosticsResponse, error) {
 	if h == nil {
 		return accountStoreDiagnosticsResponse{}, fmt.Errorf("management handler is nil")
 	}
 	path, err := h.resolveAccountStorePath()
 	if err != nil {
 		return accountStoreDiagnosticsResponse{}, err
+	}
+	audit := accountstore.KnownOpenAICompatibleAudit{
+		ByProvider:                          map[string]int{},
+		MisclassifiedKnownOpenAICompatCards: []accountstore.KnownOpenAICompatibleMisclassifiedAccount{},
+	}
+	if strings.TrimSpace(path) != "" {
+		store, openErr := accountstore.Open(path)
+		if openErr == nil {
+			if ensureErr := store.EnsureSchema(ctx); ensureErr == nil {
+				if result, auditErr := store.AuditKnownOpenAICompatibleMisclassifications(ctx); auditErr == nil {
+					audit = result
+				}
+			}
+			_ = store.Close()
+		}
 	}
 
 	h.accountStoreMu.Lock()
@@ -486,6 +502,7 @@ func (h *Handler) accountStoreDiagnostics() (accountStoreDiagnosticsResponse, er
 			LastError:         h.accountStoreLastReadError,
 			LastRecoveredUnix: h.accountStoreLastReadRecoveredAt,
 		},
+		KnownOpenAICompatibleAudit: audit,
 	}, nil
 }
 
@@ -811,6 +828,9 @@ func (h *Handler) evaluateAccountStoreRouteabilityWithWait(ctx context.Context, 
 }
 
 func (h *Handler) evaluateAccountStoreRouteability(account accountstore.AccountRecord) (string, string, string, int, bool) {
+	if misclassified, ok := accountstore.MisclassifiedKnownOpenAICompatibleCodexAPIKey(account); ok {
+		return "degraded", fmt.Sprintf("known openai-compatible provider %q is stored as codex-api-key; %s", misclassified.CompatProvider, misclassified.Remediation), "misclassified_openai_compatible_provider", 0, true
+	}
 	auth := h.findAccountStoreRuntimeAuth(account.AccountKey)
 	if auth == nil {
 		return "applied_not_registered", "runtime auth missing from registry", "runtime_auth_missing", 0, false

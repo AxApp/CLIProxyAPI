@@ -1188,6 +1188,56 @@ func TestConfigSynthesizer_AccountStoreOpenAICompat_DeepSeekDefaultsMaterialized
 	}
 }
 
+func TestConfigSynthesizer_AccountStoreMisclassifiedOpenRouterCodexKeyIsSkipped(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "accounts-v1.sqlite")
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	seedLegacyMisclassifiedCodexAPIKey(t, dbPath, "acct_00000000-0000-4000-8000-000000000001", "OpenRouter", "https://openrouter.ai/api")
+
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{AccountStoreDB: dbPath},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("auths len = %d, want 0 for misclassified known openai-compatible codex-api-key", len(auths))
+	}
+}
+
+func TestConfigSynthesizer_ConfigMisclassifiedOpenRouterCodexKeyIsSkipped(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{
+			CodexKey: []config.CodexKey{{
+				LocalID: "codex-api-key:openrouter-legacy",
+				APIKey:  "sk-openrouter-config",
+				BaseURL: "https://openrouter.ai/api",
+				Models: []config.CodexModel{
+					{Name: "tencent/hy3:free"},
+				},
+			}},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if len(auths) != 0 {
+		t.Fatalf("auths len = %d, want 0 for misclassified known openai-compatible config codex-api-key", len(auths))
+	}
+}
+
 func TestConfigSynthesizer_OpenAICompat_FallbackWithModels(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{
@@ -1220,6 +1270,44 @@ func TestConfigSynthesizer_OpenAICompat_FallbackWithModels(t *testing.T) {
 	}
 	if auths[0].Attributes["header:X-API"] != "header-value" {
 		t.Errorf("expected header:X-API=header-value, got %s", auths[0].Attributes["header:X-API"])
+	}
+}
+
+func seedLegacyMisclassifiedCodexAPIKey(t *testing.T, dbPath string, accountKey string, title string, baseURL string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seed db: %v", err)
+	}
+	defer db.Close()
+	now := time.Now().UnixMilli()
+	if _, err := db.Exec(`
+INSERT INTO account_cards(account_key, kind, title, provider, credential_source, priority, disabled, revision, metadata_json, created_at_unix_ms, updated_at_unix_ms)
+VALUES (?, 'codex-api-key', ?, 'codex', 'sidecar-management-api', 0, 0, 1, '{}', ?, ?)`,
+		accountKey,
+		title,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy account card: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO codex_api_key_accounts(account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms)
+VALUES (?, 'sk-legacy-openrouter', 'fingerprint', ?, '', '', 1, '', 0, '', 0, '', '{}', '{"openai_chat":"https://openrouter.ai/api"}', '{}', '[{"name":"tencent/hy3:free","alias":""}]', '[]', ?)`,
+		accountKey,
+		baseURL,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy codex api key: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO account_runtime_apply_state(account_key, revision, status, last_error, applied_at_unix_ms, updated_at_unix_ms)
+VALUES (?, 1, 'applied', '', ?, ?)`,
+		accountKey,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy runtime apply state: %v", err)
 	}
 }
 

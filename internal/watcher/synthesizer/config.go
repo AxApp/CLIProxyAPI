@@ -243,6 +243,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		if key == "" {
 			continue
 		}
+		if accountstore.KnownOpenAICompatibleProviderFromBaseURL(ck.BaseURL) != "" {
+			continue
+		}
 		prefix := strings.TrimSpace(ck.Prefix)
 		id, token := idGen.Next("codex:apikey", key, ck.BaseURL)
 		attrs := map[string]string{
@@ -302,7 +305,11 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreCodexKey(ctx *SynthesisContext
 		return nil
 	}
 	base := strings.TrimSpace(account.CodexAPIKey.BaseURL)
+	if _, ok := accountstore.MisclassifiedKnownOpenAICompatibleCodexAPIKey(account); ok {
+		return nil
+	}
 	id, token := ctx.IDGenerator.Next("codex:apikey", key, base, account.AccountKey)
+	models := decodeCodexModels(account.CodexAPIKey.ModelsJSON)
 	attrs := map[string]string{
 		"source":      fmt.Sprintf("account-store:codex[%s]", token),
 		"api_key":     key,
@@ -318,7 +325,7 @@ func (s *ConfigSynthesizer) synthesizeAccountStoreCodexKey(ctx *SynthesisContext
 	if account.CodexAPIKey.Websockets {
 		attrs["websockets"] = "true"
 	}
-	if models := decodeCodexModels(account.CodexAPIKey.ModelsJSON); len(models) > 0 {
+	if len(models) > 0 {
 		if hash := diff.ComputeCodexModelsHash(models); hash != "" {
 			attrs["models_hash"] = hash
 		}
@@ -448,31 +455,7 @@ func normalizeOpenAICompatProviderKeyCandidate(value string) string {
 }
 
 func normalizeOpenAICompatProviderKeyFromBaseURL(baseURL string) string {
-	lower := strings.ToLower(strings.TrimSpace(baseURL))
-	switch {
-	case strings.Contains(lower, "xiaomimimo.com"):
-		return "xiaomimimo"
-	case strings.Contains(lower, "api.deepseek.com"):
-		return "deepseek"
-	case strings.Contains(lower, "openrouter.ai"):
-		return "openrouter"
-	case strings.Contains(lower, "siliconflow"):
-		return "siliconflow"
-	case strings.Contains(lower, "bigmodel.cn"):
-		return "zhipu"
-	case strings.Contains(lower, "moonshot.cn"):
-		return "moonshot"
-	case strings.Contains(lower, "dashscope.aliyuncs.com"):
-		return "dashscope"
-	case strings.Contains(lower, "groq.com"):
-		return "groq"
-	case strings.Contains(lower, "together.xyz"):
-		return "together"
-	case strings.Contains(lower, "volces.com"):
-		return "doubao"
-	default:
-		return ""
-	}
+	return accountstore.KnownOpenAICompatibleProviderFromBaseURL(baseURL)
 }
 
 func normalizeKnownOpenAICompatProviderKey(value string) string {

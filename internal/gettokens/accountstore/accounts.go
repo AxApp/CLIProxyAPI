@@ -1529,6 +1529,9 @@ func validateCandidate(candidate ImportCandidate) error {
 		if candidate.CodexAPIKey == nil || candidate.CodexAPIKey.APIKey == "" || candidate.CodexAPIKey.BaseURL == "" {
 			return fmt.Errorf("codex-api-key candidate %s missing credential", candidate.AccountKey)
 		}
+		if provider := KnownOpenAICompatibleProviderFromBaseURL(candidate.CodexAPIKey.BaseURL); provider != "" {
+			return fmt.Errorf("codex-api-key candidate %s uses known openai-compatible provider %q; %s", candidate.AccountKey, provider, MisclassifiedKnownOpenAICompatibleRemediation)
+		}
 	case KindOpenAICompatible:
 		if candidate.OpenAICompatible == nil || candidate.OpenAICompatible.BaseURL == "" {
 			return fmt.Errorf("openai-compatible candidate %s missing credential", candidate.AccountKey)

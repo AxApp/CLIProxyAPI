@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,6 +166,90 @@ func TestServiceRefreshAccountStoreAuthsWithoutWatcherRegistersCodexAPIKeyModels
 	}
 	if refreshed.RuntimeRegisteredModelsCount == 0 {
 		t.Fatalf("runtime registered models count = %d, want > 0", refreshed.RuntimeRegisteredModelsCount)
+	}
+}
+
+func TestServiceReconcileAccountStoreRouteabilityIsolatesMisclassifiedOpenRouterCodexKey(t *testing.T) {
+	ctx := context.Background()
+	dbPath := t.TempDir() + "/accounts-v1.sqlite"
+	store, err := accountstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open account store: %v", err)
+	}
+	defer store.Close()
+	if err := store.EnsureSchema(ctx); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	accountKey := "acct_00000000-0000-4000-8000-000000000001"
+	seedLegacyMisclassifiedCodexAPIKeyForService(t, dbPath, accountKey)
+
+	service := &Service{
+		cfg:         &config.Config{AccountStoreDB: dbPath},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+
+	if err := service.refreshAccountStoreAuths(ctx); err != nil {
+		t.Fatalf("refresh account-store auths: %v", err)
+	}
+	for _, auth := range service.coreManager.List() {
+		if auth != nil && auth.AccountKey == accountKey {
+			t.Fatalf("misclassified known openai-compatible codex-api-key should not be registered, got auth %+v", auth)
+		}
+	}
+	if err := service.reconcileAccountStoreRouteability(ctx); err != nil {
+		t.Fatalf("reconcile account-store routeability: %v", err)
+	}
+	refreshed, err := store.GetAccount(ctx, accountKey)
+	if err != nil {
+		t.Fatalf("get account after refresh: %v", err)
+	}
+	if refreshed.RuntimeRouteabilityStatus != "degraded" {
+		t.Fatalf("runtime routeability status = %q, want degraded", refreshed.RuntimeRouteabilityStatus)
+	}
+	if refreshed.RuntimeFailureClass != "misclassified_openai_compatible_provider" {
+		t.Fatalf("runtime failure class = %q, want misclassified_openai_compatible_provider", refreshed.RuntimeFailureClass)
+	}
+	if !strings.Contains(refreshed.RuntimeRouteabilityReason, "delete and recreate") {
+		t.Fatalf("routeability reason = %q, want remediation", refreshed.RuntimeRouteabilityReason)
+	}
+	if refreshed.RuntimeRegisteredModelsCount != 0 {
+		t.Fatalf("registered models count = %d, want 0", refreshed.RuntimeRegisteredModelsCount)
+	}
+}
+
+func seedLegacyMisclassifiedCodexAPIKeyForService(t *testing.T, dbPath string, accountKey string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seed db: %v", err)
+	}
+	defer db.Close()
+	now := time.Now().UnixMilli()
+	if _, err := db.Exec(`
+INSERT INTO account_cards(account_key, kind, title, provider, credential_source, priority, disabled, revision, metadata_json, created_at_unix_ms, updated_at_unix_ms)
+VALUES (?, 'codex-api-key', 'OpenRouter', 'codex', 'sidecar-management-api', 0, 0, 1, '{}', ?, ?)`,
+		accountKey,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy account card: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO codex_api_key_accounts(account_key, api_key, api_key_fingerprint, base_url, prefix, proxy_url, websockets, quota_curl, quota_enabled, billing_curl, billing_enabled, platform_cookie, curl_variables_json, format_base_urls_json, headers_json, models_json, excluded_models_json, updated_at_unix_ms)
+VALUES (?, 'sk-legacy-openrouter', 'fingerprint', 'https://openrouter.ai/api', '', '', 1, '', 0, '', 0, '', '{}', '{"openai_chat":"https://openrouter.ai/api"}', '{}', '[{"name":"tencent/hy3:free","alias":""}]', '[]', ?)`,
+		accountKey,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy codex api key: %v", err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO account_runtime_apply_state(account_key, revision, status, last_error, applied_at_unix_ms, updated_at_unix_ms)
+VALUES (?, 1, 'applied', '', ?, ?)`,
+		accountKey,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("insert legacy runtime apply state: %v", err)
 	}
 }
 

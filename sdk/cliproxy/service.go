@@ -433,6 +433,9 @@ func (s *Service) evaluateAccountStoreRouteability(account accountstore.AccountR
 	if account.Disabled {
 		return "pending", "", "", 0
 	}
+	if misclassified, ok := accountstore.MisclassifiedKnownOpenAICompatibleCodexAPIKey(account); ok {
+		return "degraded", fmt.Sprintf("known openai-compatible provider %q is stored as codex-api-key; %s", misclassified.CompatProvider, misclassified.Remediation), "misclassified_openai_compatible_provider", 0
+	}
 	auth := s.findAccountStoreRuntimeAuth(account.AccountKey)
 	if auth == nil {
 		return "applied_not_registered", "runtime auth missing from registry", "runtime_auth_missing", 0
